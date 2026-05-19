@@ -1,23 +1,25 @@
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import mlflow
 import pandas as pd
 import torch
+from PIL import Image
 from transformers import AutoImageProcessor
 
+from src.models.dinov3_loader import get_image_processor
+
 CONFIG: Dict[str, Any] = {
-    "mode": "csv",          # csv | dir | interactive | single
+    "mode": "csv",
     "model_uri": "runs:/RUN_ID/model",
     "tracking_uri": "sqlite:///mlflow.db",
     "input_csv": None,
     "output_csv": "predictions.csv",
     "input_dir": None,
     "image_col": "image_path",
-    "max_length": 224,
     "batch_size": 32,
     "threshold": 0.5,
-    "text": None,
+    "image": None,
 }
 
 
@@ -38,14 +40,12 @@ def load_model(model_uri: str, tracking_uri: str = "sqlite:///mlflow.db"):
 
     if processor is None:
         model_name = getattr(model, "model_name", "google/vit-base-patch16-224")
-        processor = AutoImageProcessor.from_pretrained(model_name)
+        processor = get_image_processor(model_name)
 
     return model, processor
 
 
 def predict_images(model: Any, processor: Any, image_paths: List[str], batch_size: int = 32) -> Dict[str, Any]:
-    from PIL import Image
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     if args.output_csv:
         CONFIG["output_csv"] = args.output_csv
     if args.image:
-        CONFIG["text"] = args.image
+        CONFIG["image"] = args.image
 
     mode = CONFIG["mode"]
     uri, tracking = CONFIG["model_uri"], CONFIG["tracking_uri"]
@@ -143,6 +143,6 @@ if __name__ == "__main__":
     elif mode == "dir":
         predict_dir(uri, CONFIG["input_dir"], CONFIG["output_csv"], tracking, CONFIG["batch_size"])
     elif mode == "single":
-        predict_single(uri, CONFIG["text"], tracking)
+        predict_single(uri, CONFIG["image"], tracking)
     elif mode == "interactive":
         predict_interactive(uri, tracking)

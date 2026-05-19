@@ -5,10 +5,7 @@ import yaml
 
 INT_KEYS = {
     "warmup_steps",
-    "num_epochs",
     "num_train_epochs",
-    "train_batch_size",
-    "eval_batch_size",
     "per_device_train_batch_size",
     "per_device_eval_batch_size",
     "gradient_accumulation_steps",
@@ -16,21 +13,14 @@ INT_KEYS = {
     "min",
     "max",
     "num_labels",
-    "max_length",
     "image_size",
     "save_total_limit",
     "dataloader_num_workers",
     "seed",
-    "synthetic_seed",
     "early_stopping_patience",
-    "num_layers",
-    "num_heads",
-    "cross_attention_heads",
-    "size",
     "projection_size",
-    "extra_transformer_num_layers",
-    "extra_transformer_num_heads",
     "min_aug_per_class",
+    "ema_warmup_steps",
 }
 FLOAT_KEYS = {
     "learning_rate",
@@ -43,6 +33,9 @@ FLOAT_KEYS = {
     "label_smoothing_factor",
     "adam_beta1",
     "adam_beta2",
+    "ema_decay",
+    "aug_rebalance_ratio",
+    "focal_loss_gamma",
 }
 
 

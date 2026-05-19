@@ -9,13 +9,20 @@ from typing import Any, Dict, Optional
 
 import optuna
 import torch
-import torch.distributed as dist
 import yaml
 from mlflow.tracking import MlflowClient
 from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID
 
 from src.train import train
+from src.utils.distributed import (
+    barrier,
+    broadcast,
+    cleanup_distributed,
+    is_main,
+    setup_distributed,
+)
 from src.utils.environment import setup_environment
+from src.utils.mlflow_utils import get_or_create_experiment
 
 setup_environment()
 
@@ -32,46 +39,27 @@ CONFIG: Dict[str, Any] = {
     "test_data_csv": None,
 }
 
-# ── Distributed helpers ───────────────────────────────────────────────────────
-
-def setup_distributed() -> int:
-    rank = int(os.environ.get("LOCAL_RANK", -1))
-    if rank != -1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(rank)
-    return rank
-
-
-def cleanup_distributed() -> None:
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def is_main() -> bool:
-    return int(os.environ.get("LOCAL_RANK", -1)) in [-1, 0]
-
-
-def barrier() -> None:
-    if dist.is_initialized():
-        dist.barrier()
-
-
-def broadcast(value: Any, src: int = 0) -> Any:
-    if not dist.is_initialized():
-        return value
-    lst = [value]
-    dist.broadcast_object_list(lst, src=src)
-    return lst[0]
-
-# ─────────────────────────────────────────────────────────────────────────────
-
 _TRAINING_KEYS = {
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "label_smoothing_factor", "aug_rebalance_ratio", "use_class_weights",
     "use_balanced_sampler", "focal_loss_gamma", "min_aug_per_class",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
+    "augmentation_level", "ema_decay",
 }
 _MODEL_KEYS = {"hidden_dropout_prob", "pooling", "projection_size"}
+
+
+def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
+    """Route a single hyperparameter into the right section of the YAML config."""
+    if name == "rebalancing_strategy":
+        cfg["training"]["use_class_weights"] = value in ("class_weights", "both")
+        cfg["training"]["use_balanced_sampler"] = value in ("balanced_sampler", "both")
+    elif name in _TRAINING_KEYS:
+        cfg["training"][name] = value
+        if name == "per_device_train_batch_size":
+            cfg["training"]["per_device_eval_batch_size"] = value
+    elif name in _MODEL_KEYS:
+        cfg["model"][name] = value
 
 
 def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int) -> str:
@@ -92,16 +80,7 @@ def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int
             v = trial.suggest_categorical(name, spec["choices"])
         else:
             continue
-
-        if name == "rebalancing_strategy":
-            cfg["training"]["use_class_weights"] = v in ("class_weights", "both")
-            cfg["training"]["use_balanced_sampler"] = v in ("balanced_sampler", "both")
-        elif name in _TRAINING_KEYS:
-            cfg["training"][name] = v
-            if name == "per_device_train_batch_size":
-                cfg["training"]["per_device_eval_batch_size"] = v
-        elif name in _MODEL_KEYS:
-            cfg["model"][name] = v
+        _apply_trial_param(cfg, name, v)
 
     cfg["name"] = f"{cfg['name']}_trial{n}"
     out = Path("configs/architectures/optuna_trials") / f"trial_{n}.yaml"
@@ -112,6 +91,20 @@ def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int
 
 def _best_pareto(study: optuna.Study) -> optuna.trial.FrozenTrial:
     return max(study.best_trials, key=lambda t: t.values[0] - 0.3 * t.values[1])
+
+
+def _make_child_run(
+    client: MlflowClient, experiment_id: str, parent_run_id: Optional[str], base_arch: str, trial: optuna.Trial,
+) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run = client.create_run(
+        experiment_id=experiment_id,
+        run_name=f"{base_arch}_trial{trial.number}_{ts}",
+        tags={MLFLOW_PARENT_RUN_ID: parent_run_id} if parent_run_id else {},
+    )
+    for k, v in trial.params.items():
+        client.log_param(run.info.run_id, k, v)
+    return run.info.run_id
 
 
 def objective(
@@ -137,21 +130,16 @@ def objective(
     if is_main():
         arch_name = create_trial_config(base_config, trial, trial.number)
         val_seed = (seed + trial.number * 13) if rotate_val_seed else None
-        if client:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run = client.create_run(
-                experiment_id=experiment_id,
-                run_name=f"{base_arch}_trial{trial.number}_{ts}",
-                tags={MLFLOW_PARENT_RUN_ID: parent_run_id} if parent_run_id else {},
-            )
-            run_id = run.info.run_id
-            for k, v in trial.params.items():
-                client.log_param(run_id, k, v)
+        if client and experiment_id:
+            run_id = _make_child_run(client, experiment_id, parent_run_id, base_arch, trial)
         trial_data = {"arch": arch_name, "run_id": run_id, "seed": seed, "val_seed": val_seed, "n": trial.number}
 
     trial_data = broadcast(trial_data)
     assert trial_data is not None
-    arch_name, run_id, seed, val_seed = trial_data["arch"], trial_data["run_id"], trial_data["seed"], trial_data["val_seed"]
+    arch_name = trial_data["arch"]
+    run_id = trial_data["run_id"]
+    seed = trial_data["seed"]
+    val_seed = trial_data["val_seed"]
 
     if run_id:
         os.environ["MLFLOW_RUN_ID"] = run_id
@@ -173,10 +161,11 @@ def objective(
                 client.log_metric(run_id, k, v)
             client.set_terminated(run_id, "FINISHED")
             print(f"Trial {trial_data['n']}: F1={f1:.4f} gap={gap:.4f}")
-    except Exception as e:
+    except Exception:
         eval_loss, f1, gap = float("inf"), 0.0, 1.0
         if is_main():
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             if client and run_id:
                 client.set_terminated(run_id, "FAILED")
     finally:
@@ -192,16 +181,7 @@ def objective(
 def _save_best_config(arch: str, base: Dict[str, Any], trial: optuna.trial.FrozenTrial, mode: str) -> None:
     cfg = copy.deepcopy(base)
     for k, v in trial.params.items():
-        if k == "rebalancing_strategy":
-            cfg["training"]["use_class_weights"] = v in ("class_weights", "both")
-            cfg["training"]["use_balanced_sampler"] = v in ("balanced_sampler", "both")
-        elif k in _TRAINING_KEYS:
-            cfg["training"][k] = v
-            if k == "per_device_train_batch_size":
-                cfg["training"]["per_device_eval_batch_size"] = v
-        elif k in _MODEL_KEYS:
-            cfg["model"][k] = v
-
+        _apply_trial_param(cfg, k, v)
     name = f"{arch}_optuna_best"
     cfg["name"] = name
     out = f"configs/architectures/{name}.yaml"
@@ -210,13 +190,36 @@ def _save_best_config(arch: str, base: Dict[str, Any], trial: optuna.trial.Froze
 
 
 class _MaxTrials:
-    def __init__(self, n: int):
+    def __init__(self, n: int) -> None:
         self.n = n
 
     def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
         done = [optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED]
         if sum(1 for t in study.trials if t.state in done) >= self.n:
             study.stop()
+
+
+def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna.Study:
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+    for _ in range(10):
+        try:
+            if mode == "pareto":
+                return optuna.create_study(
+                    study_name=study_name, directions=["maximize", "minimize"],
+                    storage=storage, load_if_exists=True,
+                    sampler=optuna.samplers.NSGAIISampler(),
+                )
+            direction = "maximize" if mode == "f1" else "minimize"
+            return optuna.create_study(
+                study_name=study_name, direction=direction,
+                storage=storage, load_if_exists=True, pruner=pruner,
+            )
+        except Exception as e:
+            if "locked" in str(e) or "already exists" in str(e):
+                time.sleep(random.uniform(1, 3))
+            else:
+                raise
+    raise RuntimeError(f"Could not create study {study_name} after retries")
 
 
 def optimize_hyperparameters(
@@ -236,10 +239,10 @@ def optimize_hyperparameters(
     with open(f"configs/architectures/{architecture}.yaml") as f:
         base_config = yaml.safe_load(f)
 
-    objective_mode = base_config.get("optuna", {}).get("objective_mode", objective_mode)
-    rotate_val_seed = base_config.get("optuna", {}).get("rotate_val_seed", rotate_val_seed)
-    n_trials = base_config.get("optuna", {}).get("n_trials", n_trials)
-
+    optuna_cfg = base_config.get("optuna", {})
+    objective_mode = optuna_cfg.get("objective_mode", objective_mode)
+    rotate_val_seed = optuna_cfg.get("rotate_val_seed", rotate_val_seed)
+    n_trials = optuna_cfg.get("n_trials", n_trials)
     if study_name is None:
         study_name = f"optuna-{architecture}-{datetime.now().strftime('%Y%m%d')}"
 
@@ -248,40 +251,19 @@ def optimize_hyperparameters(
     experiment_id: Optional[str] = None
 
     if is_main():
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
-        for _ in range(10):
-            try:
-                if objective_mode == "pareto":
-                    study = optuna.create_study(study_name=study_name, directions=["maximize", "minimize"],
-                                                storage=storage, load_if_exists=True,
-                                                sampler=optuna.samplers.NSGAIISampler())
-                else:
-                    direction = "maximize" if objective_mode == "f1" else "minimize"
-                    study = optuna.create_study(study_name=study_name, direction=direction,
-                                                storage=storage, load_if_exists=True, pruner=pruner)
-                break
-            except Exception as e:
-                if "locked" in str(e) or "already exists" in str(e):
-                    time.sleep(random.uniform(1, 3))
-                else:
-                    raise
-
-        assert study is not None
+        study = _create_study_with_retry(study_name, storage, objective_mode)
         print(f"Study={study_name} | Trials={n_trials} | Mode={objective_mode} | Dist={local_rank != -1}")
-
         if use_mlflow:
             client = MlflowClient(tracking_uri=tracking_uri)
-            try:
-                experiment_id = client.create_experiment(f"optuna-{architecture}")
-            except Exception:
-                exp = client.get_experiment_by_name(f"optuna-{architecture}")
-                experiment_id = exp.experiment_id if exp else client.create_experiment(f"optuna-{architecture}")
+            experiment_id = get_or_create_experiment(client, f"optuna-{architecture}")
             if parent_run_id is None:
                 parent_run_id = client.create_run(experiment_id=experiment_id, run_name=study_name).info.run_id
                 print(f"MLflow parent: {parent_run_id}")
 
     barrier()
-    study, parent_run_id, experiment_id = broadcast(study), broadcast(parent_run_id), broadcast(experiment_id)
+    study = broadcast(study)
+    parent_run_id = broadcast(parent_run_id)
+    experiment_id = broadcast(experiment_id)
 
     if is_main():
         assert study is not None

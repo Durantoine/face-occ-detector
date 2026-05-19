@@ -1,8 +1,28 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers import AutoModel
+
+from src.models.dinov3_loader import hidden_size_of, load_dinov3
+
+
+def _is_dinov3(model_name: str) -> bool:
+    return model_name.startswith("dinov3_")
+
+
+def _build_backbone(model_name: str) -> Tuple[nn.Module, int]:
+    if _is_dinov3(model_name):
+        backbone = load_dinov3(model_name)
+        return backbone, hidden_size_of(model_name)
+    backbone = AutoModel.from_pretrained(model_name)
+    return backbone, backbone.config.hidden_size
+
+
+def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
+    if hasattr(backbone, "get_intermediate_layers"):
+        return backbone.get_intermediate_layers(pixel_values, n=1)[0]
+    return backbone(pixel_values=pixel_values).last_hidden_state
 
 
 class FaceOccClassifier(nn.Module):
@@ -21,8 +41,7 @@ class FaceOccClassifier(nn.Module):
         self.hidden_dropout_prob = hidden_dropout_prob
         self.pooling = pooling
 
-        self.backbone = AutoModel.from_pretrained(model_name)
-        hidden_size: int = self.backbone.config.hidden_size
+        self.backbone, hidden_size = _build_backbone(model_name)
 
         if class_weights is not None:
             self.register_buffer("class_weights", class_weights)
@@ -45,6 +64,19 @@ class FaceOccClassifier(nn.Module):
         self.dropout = nn.Dropout(hidden_dropout_prob)
         self.classifier = nn.Linear(final_size, num_labels)
 
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in (self.classifier, self.attention_pool):
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+        if self.projection is not None:
+            for m in self.projection.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.trunc_normal_(m.weight, std=0.02)
+                    nn.init.zeros_(m.bias)
+
     def _pool(self, hidden: torch.Tensor) -> torch.Tensor:
         if self.pooling == "mean":
             return hidden.mean(dim=1)
@@ -57,10 +89,12 @@ class FaceOccClassifier(nn.Module):
         return hidden[:, 0, :]
 
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
-        self.backbone.gradient_checkpointing_enable(**kwargs)
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable(**kwargs)
 
     def gradient_checkpointing_disable(self) -> None:
-        self.backbone.gradient_checkpointing_disable()
+        if hasattr(self.backbone, "gradient_checkpointing_disable"):
+            self.backbone.gradient_checkpointing_disable()
 
     def forward(
         self,
@@ -68,7 +102,7 @@ class FaceOccClassifier(nn.Module):
         labels: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        hidden = self.backbone(pixel_values=pixel_values).last_hidden_state
+        hidden = _forward_backbone(self.backbone, pixel_values)
         pooled = self._pool(hidden)
         if self.projection is not None:
             pooled = self.projection(pooled)

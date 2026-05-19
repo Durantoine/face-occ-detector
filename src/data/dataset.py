@@ -46,18 +46,6 @@ def load_image_folder(
     split_ratio: float = 0.2,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load images from a folder hierarchy.
-
-    Layout A (pre-split):
-        data_dir/train/<class>/*.jpg
-        data_dir/val/<class>/*.jpg   (or valid / validation / test)
-
-    Layout B (single folder, will be split):
-        data_dir/<class>/*.jpg
-
-    label_map: {"class_name": int_label}. Auto-assigned alphabetically if None.
-    Returns (train_df, val_df) with columns [image_path, label].
-    """
     root = Path(data_dir)
     train_sub = root / "train"
     val_sub = next((root / d for d in ("val", "valid", "validation", "test") if (root / d).is_dir()), None)
@@ -91,12 +79,6 @@ def load_csv_data(
     split_ratio: float = 0.2,
     seed: int = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load from a CSV annotation file.
-
-    CSV must have: image_path, <label_col>.
-    The label column is always renamed to 'label' in the returned DataFrames.
-    Returns (train_df, val_df) with columns [image_path, label].
-    """
     df = pd.read_csv(data_csv)
     df = df.dropna(subset=["image_path", label_col])
     df = df[df["image_path"].astype(str).str.strip() != ""]
@@ -132,6 +114,21 @@ def _load_data(path: str, **kwargs: Any) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return load_csv_data(path, **kwargs) if path.endswith(".csv") else load_image_folder(path, **kwargs)
 
 
+def _open_rgb(path: str, base: Optional[Path]) -> Image.Image:
+    p = Path(path)
+    full = base / p if (base and not p.is_absolute()) else p
+    return Image.open(full).convert("RGB")
+
+
+def _encode(processor: Any, image: Image.Image, label: int, transform: Optional[Any] = None) -> Dict[str, Any]:
+    if transform is not None:
+        image = transform(image)
+    enc = processor(images=image, return_tensors="pt")
+    item = {k: v.squeeze(0) for k, v in enc.items()}
+    item["labels"] = torch.tensor(label, dtype=torch.long)
+    return item
+
+
 class FaceOccDataset(Dataset):
     def __init__(
         self,
@@ -139,32 +136,23 @@ class FaceOccDataset(Dataset):
         labels: List[int],
         processor: Any,
         image_base_dir: Optional[str] = None,
+        transform: Optional[Any] = None,
     ) -> None:
         self.image_paths = image_paths
         self.labels = labels
         self.processor = processor
+        self.transform = transform
         self.base = Path(image_base_dir) if image_base_dir else None
-
-    def _open(self, path: str) -> Image.Image:
-        p = Path(path)
-        return Image.open(self.base / p if (self.base and not p.is_absolute()) else p).convert("RGB")
 
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        enc = self.processor(images=self._open(self.image_paths[idx]), return_tensors="pt")
-        item = {k: v.squeeze(0) for k, v in enc.items()}
-        item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
-        return item
+        img = _open_rgb(self.image_paths[idx], self.base)
+        return _encode(self.processor, img, self.labels[idx], self.transform)
 
 
 class DynamicAugDataset(Dataset):
-    """Real images + augmented pool, resampled each epoch.
-
-    aug_pool must be a DataFrame with columns [image_path, label] (already normalized).
-    """
-
     def __init__(
         self,
         real_paths: List[str],
@@ -175,10 +163,12 @@ class DynamicAugDataset(Dataset):
         seed: int = 42,
         min_aug_per_class: int = 0,
         image_base_dir: Optional[str] = None,
+        transform: Optional[Any] = None,
     ) -> None:
         self.real_paths = real_paths
         self.real_labels = real_labels
         self.processor = processor
+        self.transform = transform
         self.base = Path(image_base_dir) if image_base_dir else None
 
         self._aug_paths = aug_pool["image_path"].astype(str).tolist()
@@ -222,17 +212,10 @@ class DynamicAugDataset(Dataset):
     def __len__(self) -> int:
         return len(self.real_paths) + len(self._current)
 
-    def _open(self, path: str) -> Image.Image:
-        p = Path(path)
-        return Image.open(self.base / p if (self.base and not p.is_absolute()) else p).convert("RGB")
-
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if idx < len(self.real_paths):
             path, label = self.real_paths[idx], self.real_labels[idx]
         else:
             i = self._current[idx - len(self.real_paths)]
             path, label = self._aug_paths[i], self._aug_labels[i]
-        enc = self.processor(images=self._open(path), return_tensors="pt")
-        item = {k: v.squeeze(0) for k, v in enc.items()}
-        item["labels"] = torch.tensor(label, dtype=torch.long)
-        return item
+        return _encode(self.processor, _open_rgb(path, self.base), label, self.transform)

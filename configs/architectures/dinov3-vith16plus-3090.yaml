@@ -1,0 +1,87 @@
+name: dinov3-vith16plus-3090
+description: DINOv3 ViT-H+/16 for 2x RTX 3090 24GB (BF16, DDP). Largest non-7B variant.
+
+model:
+  model_name: dinov3_vith16plus
+  num_labels: 2
+  hidden_dropout_prob: 0.1
+  pooling: cls
+  projection_size: null
+
+data:
+  label_col: label
+  subset_col: null
+  image_base_dir: null
+  aug_data_csv: null
+  extra_train_csv: null
+
+training:
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 2
+  num_train_epochs: 12
+  learning_rate: 1.0e-04
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  label_smoothing_factor: 0.0
+  focal_loss_gamma: 0.0
+  use_class_weights: true
+  use_balanced_sampler: false
+  aug_rebalance_ratio: 0.0
+  min_aug_per_class: 0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_f1_macro
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  augmentation_level: medium
+  ema_decay: 0.9998
+  ema_warmup_steps: 200
+
+optuna:
+  n_trials: 40
+  objective_mode: f1
+  rotate_val_seed: true
+  search_space:
+    learning_rate:
+      type: float
+      low: 2.0e-05
+      high: 3.0e-04
+      log: true
+    weight_decay:
+      type: float
+      low: 0.0
+      high: 0.3
+    num_train_epochs:
+      type: int
+      low: 6
+      high: 18
+    warmup_ratio:
+      type: float
+      low: 0.05
+      high: 0.2
+    label_smoothing_factor:
+      type: float
+      low: 0.0
+      high: 0.2
+    hidden_dropout_prob:
+      type: float
+      low: 0.0
+      high: 0.3
+    focal_loss_gamma:
+      type: float
+      low: 0.0
+      high: 2.0
+    rebalancing_strategy:
+      type: categorical
+      choices: [class_weights, balanced_sampler, both, none]
+    pooling:
+      type: categorical
+      choices: [cls, mean, attention]
+    augmentation_level:
+      type: categorical
+      choices: [light, medium, strong]

@@ -42,8 +42,18 @@ def check(c):
 
 
 @task
+def pretrain(c):
+    c.run("uv run python src/pretrain_mae.py", pty=True)
+
+
+@task
 def train(c):
     c.run("uv run python src/train.py", pty=True)
+
+
+@task
+def ensemble(c):
+    c.run("uv run python src/ensemble_train.py", pty=True)
 
 
 @task

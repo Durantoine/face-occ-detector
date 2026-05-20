@@ -25,28 +25,24 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.
     return backbone(pixel_values=pixel_values).last_hidden_state
 
 
-class FaceOccClassifier(nn.Module):
+class FaceOccRegressor(nn.Module):
     def __init__(
         self,
-        model_name: str = "google/vit-base-patch16-224",
-        num_labels: int = 2,
+        model_name: str = "dinov3_vits16",
+        output_dim: int = 1,
         hidden_dropout_prob: float = 0.1,
         pooling: str = "cls",
         projection_size: Optional[int] = None,
-        class_weights: Optional[torch.Tensor] = None,
+        output_activation: str = "sigmoid",
     ):
         super().__init__()
         self.model_name = model_name
-        self.num_labels = num_labels
+        self.output_dim = output_dim
         self.hidden_dropout_prob = hidden_dropout_prob
         self.pooling = pooling
+        self.output_activation = output_activation
 
         self.backbone, hidden_size = _build_backbone(model_name)
-
-        if class_weights is not None:
-            self.register_buffer("class_weights", class_weights)
-        else:
-            self.class_weights = None
 
         if projection_size:
             self.projection: Optional[nn.Sequential] = nn.Sequential(
@@ -62,12 +58,12 @@ class FaceOccClassifier(nn.Module):
 
         self.attention_pool: Optional[nn.Linear] = nn.Linear(hidden_size, 1) if pooling == "attention" else None
         self.dropout = nn.Dropout(hidden_dropout_prob)
-        self.classifier = nn.Linear(final_size, num_labels)
+        self.head = nn.Linear(final_size, output_dim)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in (self.classifier, self.attention_pool):
+        for m in (self.head, self.attention_pool):
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
@@ -88,6 +84,13 @@ class FaceOccClassifier(nn.Module):
             return (hidden * w).sum(dim=1)
         return hidden[:, 0, :]
 
+    def _activate(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.output_activation == "sigmoid":
+            return torch.sigmoid(logits)
+        if self.output_activation == "clamp":
+            return logits.clamp(0.0, 1.0)
+        return logits
+
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         if hasattr(self.backbone, "gradient_checkpointing_enable"):
             self.backbone.gradient_checkpointing_enable(**kwargs)
@@ -99,29 +102,31 @@ class FaceOccClassifier(nn.Module):
     def forward(
         self,
         pixel_values: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
         **kwargs: Any,
-    ) -> Dict[str, Optional[torch.Tensor]]:
+    ) -> Dict[str, torch.Tensor]:
         hidden = _forward_backbone(self.backbone, pixel_values)
         pooled = self._pool(hidden)
         if self.projection is not None:
             pooled = self.projection(pooled)
         pooled = self.dropout(pooled)
-        logits = self.classifier(pooled)
-        loss = nn.functional.cross_entropy(logits, labels, weight=self.class_weights) if labels is not None else None
-        return {"loss": loss, "logits": logits}
+        logits = self.head(pooled)
+        pred = self._activate(logits).squeeze(-1) if self.output_dim == 1 else self._activate(logits)
+        return {"logits": pred}
 
     @classmethod
-    def load_from_mlflow(cls, model_uri: str, num_labels: Optional[int] = None) -> "FaceOccClassifier":
+    def load_from_mlflow(cls, model_uri: str, output_dim: Optional[int] = None) -> "FaceOccRegressor":
         import mlflow
         model = mlflow.pytorch.load_model(model_uri)
-        if num_labels and hasattr(model, "num_labels") and num_labels != model.num_labels:
+        if output_dim and hasattr(model, "output_dim") and output_dim != model.output_dim:
             new_model = cls(
                 model_name=model.model_name,
-                num_labels=num_labels,
+                output_dim=output_dim,
                 hidden_dropout_prob=model.hidden_dropout_prob,
                 pooling=model.pooling,
+                output_activation=getattr(model, "output_activation", "sigmoid"),
             )
             new_model.backbone.load_state_dict(model.backbone.state_dict(), strict=False)
             return new_model
         return model
+
+

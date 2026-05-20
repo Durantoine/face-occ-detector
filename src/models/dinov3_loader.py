@@ -4,11 +4,27 @@ from typing import Any, Optional
 import torch
 from transformers import AutoImageProcessor
 
+
+def _shim_torch_amp_for_dinov3() -> None:
+    import torch.amp as _amp
+    if not hasattr(_amp, "custom_fwd"):
+        from torch.cuda.amp import custom_bwd, custom_fwd
+        _amp.custom_fwd = custom_fwd
+        _amp.custom_bwd = custom_bwd
+
+
+_shim_torch_amp_for_dinov3()
+
 _REPO = Path(__file__).parent / "dinov3_repo"
 _WEIGHTS_DIR = Path(__file__).parent / "weights"
 
 _AVAILABLE_WEIGHTS = {
-    "dinov3_vits16": _WEIGHTS_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "dinov3_vits16":     _WEIGHTS_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "dinov3_vits16plus": _WEIGHTS_DIR / "dinov3_vits16plus_pretrain_lvd1689m-4057cbaa.pth",
+    "dinov3_vitb16":     _WEIGHTS_DIR / "dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_vitl16":     _WEIGHTS_DIR / "dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+    "dinov3_vitl16plus": _WEIGHTS_DIR / "dinov3_vitl16plus_pretrain_lvd1689m-46503df0.pth",
+    "dinov3_vith16plus": _WEIGHTS_DIR / "dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth",
 }
 
 _VARIANTS = {
@@ -18,7 +34,6 @@ _VARIANTS = {
     "dinov3_vitl16":     (300e6, 1024, 10),
     "dinov3_vitl16plus": (400e6, 1024, 13),
     "dinov3_vith16plus": (600e6, 1280, 17),
-    "dinov3_vit7b16":    (7e9,   4096, 999),
 }
 
 _HIDDEN_SIZES = {k: v[1] for k, v in _VARIANTS.items()}

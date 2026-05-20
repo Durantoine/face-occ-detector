@@ -30,12 +30,12 @@ FLOAT_KEYS = {
     "warmup_ratio",
     "hidden_dropout_prob",
     "attention_probs_dropout_prob",
-    "label_smoothing_factor",
     "adam_beta1",
     "adam_beta2",
     "ema_decay",
-    "aug_rebalance_ratio",
-    "focal_loss_gamma",
+    "loss_focal_gamma",
+    "loss_fairness_lambda",
+    "layer_decay",
 }
 
 
@@ -55,6 +55,8 @@ class Config:
         for key, value in config_dict.items():
             if isinstance(value, dict):
                 setattr(self, key, Config(value))
+            elif value is None:
+                setattr(self, key, None)
             else:
                 match key:
                     case k if k in INT_KEYS:

@@ -19,8 +19,8 @@ def format(c):
 
 @task
 def lint(c, fix=False):
-    fix_flag = "--fix" if fix else ""
-    c.run(f"uv run ruff check src tests {fix_flag}", pty=True)
+    flag = "--fix" if fix else ""
+    c.run(f"uv run ruff check src tests {flag}", pty=True)
 
 
 @task
@@ -43,12 +43,17 @@ def check(c):
 
 @task
 def pretrain(c):
-    c.run("uv run python src/pretrain_mae.py", pty=True)
+    c.run("uv run python src/pretrain_ibot.py", pty=True)
 
 
 @task
 def train(c):
     c.run("uv run python src/train.py", pty=True)
+
+
+@task
+def optimize(c):
+    c.run("uv run python src/optimize.py", pty=True)
 
 
 @task
@@ -62,16 +67,8 @@ def predict(c):
 
 
 @task
-def evaluate(c, model_uri, data_csv="data/raw/val.csv", threshold=0.5, output=None):
-    cmd = f"uv run python src/evaluate_model.py --model-uri {model_uri} --data-csv {data_csv} --threshold {threshold}"
-    if output:
-        cmd += f" --output {output}"
-    c.run(cmd, pty=True)
-
-
-@task
-def optimize(c):
-    c.run("uv run python src/optimize.py", pty=True)
+def evaluate(c):
+    c.run("uv run python src/evaluate_model.py", pty=True)
 
 
 @task
@@ -96,13 +93,3 @@ def optuna_dashboard(c, port=8080, storage="sqlite:///optuna.db"):
 @task
 def optuna_stop(c):
     c.run("pkill -f 'optuna-dashboard'", warn=True)
-
-
-@task
-def optuna_best(c, storage="sqlite:///optuna.db", study_name="vit-base-face-occ"):
-    c.run(
-        f"uv run python -c \"import optuna; s = optuna.load_study(study_name='{study_name}', storage='{storage}'); "
-        f"print('Best trial:', s.best_trial.number); print('Best value:', s.best_value); "
-        f"print('Best params:', s.best_params)\"",
-        pty=True,
-    )

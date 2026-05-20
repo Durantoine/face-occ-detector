@@ -1,7 +1,7 @@
 [project]
 name = "face-occ-detector"
 version = "0.1.0"
-description = "Face occlusion detection model"
+description = "Face occlusion detection model (cluster build, CUDA 12.4)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -49,6 +49,15 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 extra-index-url = ["https://pypi.org/simple"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu124" }]
+torchvision = [{ index = "pytorch-cu124" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

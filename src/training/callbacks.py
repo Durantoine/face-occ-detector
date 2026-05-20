@@ -5,8 +5,6 @@ import torch.nn as nn
 from mlflow.tracking import MlflowClient
 from transformers import TrainerCallback
 
-from src.data.dataset import DynamicAugDataset, create_balanced_sampler
-
 
 class MlflowClientCallback(TrainerCallback):
     def __init__(self, client: MlflowClient, run_id: str) -> None:
@@ -20,21 +18,6 @@ class MlflowClientCallback(TrainerCallback):
                     self.client.log_metric(self.run_id, key, value, step=state.global_step)
                 except Exception:
                     pass
-
-
-class AugResamplerCallback(TrainerCallback):
-    def __init__(self, dataset: DynamicAugDataset, base_seed: int = 42, num_classes: int = 2) -> None:
-        self.dataset = dataset
-        self.base_seed = base_seed
-        self.num_classes = num_classes
-
-    def on_epoch_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        self.dataset.resample(seed=self.base_seed + int(state.epoch or 0))
-        trainer = kwargs.get("trainer")
-        if trainer and getattr(trainer, "_custom_train_sampler", None):
-            trainer._custom_train_sampler = create_balanced_sampler(
-                self.dataset.get_current_labels(), self.num_classes
-            )
 
 
 class EMACallback(TrainerCallback):

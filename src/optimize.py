@@ -27,34 +27,29 @@ from src.utils.mlflow_utils import get_or_create_experiment
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": "vit-base-face-occ",
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vits16-face-occ"),
     "n_trials": 30,
     "study_name": None,
     "tracking_uri": "sqlite:///mlflow.db",
     "storage": "sqlite:///optuna.db",
     "use_mlflow": True,
     "parent_run_id": None,
-    "objective_mode": "f1",
+    "objective_mode": "score",
     "rotate_val_seed": True,
     "test_data_csv": None,
 }
 
 _TRAINING_KEYS = {
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
-    "label_smoothing_factor", "aug_rebalance_ratio", "use_class_weights",
-    "use_balanced_sampler", "focal_loss_gamma", "min_aug_per_class",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
-    "augmentation_level", "ema_decay",
+    "augmentation_level", "ema_decay", "layer_decay",
+    "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
 }
-_MODEL_KEYS = {"hidden_dropout_prob", "pooling", "projection_size"}
+_MODEL_KEYS = {"hidden_dropout_prob", "pooling", "projection_size", "output_activation"}
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    """Route a single hyperparameter into the right section of the YAML config."""
-    if name == "rebalancing_strategy":
-        cfg["training"]["use_class_weights"] = value in ("class_weights", "both")
-        cfg["training"]["use_balanced_sampler"] = value in ("balanced_sampler", "both")
-    elif name in _TRAINING_KEYS:
+    if name in _TRAINING_KEYS:
         cfg["training"][name] = value
         if name == "per_device_train_batch_size":
             cfg["training"]["per_device_eval_batch_size"] = value
@@ -90,7 +85,7 @@ def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int
 
 
 def _best_pareto(study: optuna.Study) -> optuna.trial.FrozenTrial:
-    return max(study.best_trials, key=lambda t: t.values[0] - 0.3 * t.values[1])
+    return min(study.best_trials, key=lambda t: t.values[0] + 0.5 * t.values[1])
 
 
 def _make_child_run(
@@ -145,9 +140,9 @@ def objective(
         os.environ["MLFLOW_RUN_ID"] = run_id
     os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
 
-    eval_loss, f1, gap, train_loss = float("inf"), 0.0, 1.0, 0.0
+    eval_loss, score, err_diff = float("inf"), float("inf"), float("inf")
     try:
-        eval_loss, f1, gap, train_loss, _ = train(
+        eval_loss, score, err_diff, _ = train(
             architecture_name=arch_name,
             output_dir=f"./results/optuna_{base_arch}_trial_{trial_data['n']}",
             mlflow_tracking_uri=tracking_uri,
@@ -157,12 +152,12 @@ def objective(
             test_data_csv=test_data_csv,
         )
         if is_main() and client and run_id:
-            for k, v in [("final_eval_loss", eval_loss), ("best_f1_macro", f1), ("overfit_gap", gap), ("final_train_loss", train_loss)]:
+            for k, v in [("final_eval_loss", eval_loss), ("best_score", score), ("err_diff", err_diff)]:
                 client.log_metric(run_id, k, v)
             client.set_terminated(run_id, "FINISHED")
-            print(f"Trial {trial_data['n']}: F1={f1:.4f} gap={gap:.4f}")
+            print(f"Trial {trial_data['n']}: score={score:.5f} err_diff={err_diff:.5f}")
     except Exception:
-        eval_loss, f1, gap = float("inf"), 0.0, 1.0
+        eval_loss, score, err_diff = float("inf"), float("inf"), float("inf")
         if is_main():
             import traceback
             traceback.print_exc()
@@ -175,7 +170,11 @@ def objective(
         gc.collect()
         barrier()
 
-    return (f1, gap) if mode == "pareto" else (f1 if mode == "f1" else eval_loss)
+    if mode == "pareto":
+        return (score, err_diff)
+    if mode == "loss":
+        return eval_loss
+    return score
 
 
 def _save_best_config(arch: str, base: Dict[str, Any], trial: optuna.trial.FrozenTrial, mode: str) -> None:
@@ -205,13 +204,12 @@ def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna
         try:
             if mode == "pareto":
                 return optuna.create_study(
-                    study_name=study_name, directions=["maximize", "minimize"],
+                    study_name=study_name, directions=["minimize", "minimize"],
                     storage=storage, load_if_exists=True,
                     sampler=optuna.samplers.NSGAIISampler(),
                 )
-            direction = "maximize" if mode == "f1" else "minimize"
             return optuna.create_study(
-                study_name=study_name, direction=direction,
+                study_name=study_name, direction="minimize",
                 storage=storage, load_if_exists=True, pruner=pruner,
             )
         except Exception as e:
@@ -224,13 +222,13 @@ def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna
 
 def optimize_hyperparameters(
     architecture: str,
-    n_trials: int = 20,
+    n_trials: int = 30,
     study_name: Optional[str] = None,
     tracking_uri: str = "sqlite:///mlflow.db",
     storage: str = "sqlite:///optuna.db",
     use_mlflow: bool = True,
     parent_run_id: Optional[str] = None,
-    objective_mode: str = "f1",
+    objective_mode: str = "score",
     rotate_val_seed: bool = False,
     test_data_csv: Optional[str] = None,
 ) -> Optional[optuna.Study]:
@@ -302,15 +300,10 @@ def optimize_hyperparameters(
 
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--architecture", default=CONFIG["architecture"])
-    p.add_argument("--study-name", default=None)
-    args = p.parse_args()
     optimize_hyperparameters(
-        architecture=args.architecture,
+        architecture=CONFIG["architecture"],
         n_trials=CONFIG["n_trials"],
-        study_name=args.study_name,
+        study_name=CONFIG["study_name"],
         tracking_uri=CONFIG["tracking_uri"],
         storage=CONFIG["storage"],
         use_mlflow=CONFIG["use_mlflow"],

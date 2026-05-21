@@ -2,7 +2,7 @@
 #SBATCH --job-name=face-occ-sapiens2-01b-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
-#SBATCH --partition=P100
+#SBATCH --partition=3090
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=60G
@@ -11,7 +11,7 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - Sapiens2-0.1B (114M) - balancing strategy comparison (2x P100, FP16)"
+echo "OPTUNA HPO - Sapiens2-0.1B (114M) - balancing strategy comparison (2x RTX 3090, BF16)"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Started: $(date)"
@@ -35,7 +35,7 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-export FACE_OCC_ARCH=sapiens2-01b-p100
+export FACE_OCC_ARCH=sapiens2-01b-3090
 
 mkdir -p scripts/logs
 

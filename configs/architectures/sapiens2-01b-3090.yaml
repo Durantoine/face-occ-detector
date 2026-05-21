@@ -50,7 +50,7 @@ training:
   layer_decay: 0.85
 
 optuna:
-  n_trials: 40
+  n_trials: 60
   objective_mode: score
   rotate_val_seed: true
   search_space:

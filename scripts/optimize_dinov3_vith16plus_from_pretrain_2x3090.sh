@@ -4,7 +4,7 @@
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
 #SBATCH --time=30:00:00
 

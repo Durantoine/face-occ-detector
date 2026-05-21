@@ -60,8 +60,8 @@ optuna:
       high: 0.3
     num_train_epochs:
       type: int
-      low: 6
-      high: 12
+      low: 8
+      high: 15
     warmup_ratio:
       type: float
       low: 0.05

@@ -38,7 +38,7 @@ from src.utils.losses import (
     build_importance_weights,
     make_sampler_keys,
 )
-from src.utils.metrics import compute_metrics
+from src.utils.metrics import make_compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
 from src.utils.mlflow_utils import log_params as ml_log_params
 
@@ -59,7 +59,7 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_patch_mil_alpha",
+    "loss_patch_mil_alpha", "eval_importance_reweight",
     "group_dro_alpha", "layer_decay",
 }
 
@@ -343,15 +343,25 @@ def train(
         train_sampler = create_balanced_sampler(keys.tolist(), num_groups=n_groups)
         print(f"Sampler '{sampler_strategy}': {n_groups} groups, {train_sampler.num_samples} samples/epoch")
 
+    label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+    test_pmf_ratio = build_importance_weights(train_data[label_col].astype(float).values)
+    ml_log_params(client, run_id, {
+        "test_pmf_ratio_per_bin": ",".join(f"{x:.3f}" for x in test_pmf_ratio.tolist()),
+    })
+    print(f"PMF ratios test/train (20 bins of 0.025): {test_pmf_ratio.round(3).tolist()}")
+
     importance_pmf_ratio = None
     if train_cfg.get("loss_importance_reweight", False) and loss_type == "weighted_mse":
-        label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-        importance_pmf_ratio = build_importance_weights(train_data[label_col].astype(float).values)
-        ml_log_params(client, run_id, {
-            "loss_importance_reweight": True,
-            "loss_importance_pmf_ratio": ",".join(f"{x:.3f}" for x in importance_pmf_ratio.tolist()),
-        })
-        print(f"Importance reweight ratios (test/train) per 0.025-bin (20 bins): {importance_pmf_ratio.round(3).tolist()}")
+        importance_pmf_ratio = test_pmf_ratio
+        ml_log_params(client, run_id, {"loss_importance_reweight": True})
+        print("loss_importance_reweight ON (applied in training loss)")
+
+    eval_use_test_pmf = bool(train_cfg.get("eval_importance_reweight", True))
+    eval_pmf_ratio = test_pmf_ratio if eval_use_test_pmf else None
+    if eval_use_test_pmf:
+        ml_log_params(client, run_id, {"eval_importance_reweight": True})
+        print("eval_importance_reweight ON (eval_score reweighted to test distribution)")
+    compute_metrics = make_compute_metrics(importance_pmf_ratio=eval_pmf_ratio)
 
     gender_class_weights = None
     if train_cfg.get("loss_gender_reweight", False) and loss_type == "weighted_mse" and "gender" in train_data.columns:

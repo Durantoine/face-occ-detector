@@ -44,6 +44,7 @@ training:
   loss_gender_reweight: false
   loss_cell_reweight: false
   loss_patch_mil_alpha: 0.0
+  eval_importance_reweight: true
   group_dro_alpha: 0.5
   ema_decay: 0.9998
   ema_warmup_steps: 200
@@ -68,8 +69,8 @@ optuna:
       high: 0.3
     num_train_epochs:
       type: int
-      low: 6
-      high: 12
+      low: 8
+      high: 15
     warmup_ratio:
       type: float
       low: 0.05

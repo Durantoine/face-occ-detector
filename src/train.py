@@ -121,6 +121,7 @@ class WeightedMSETrainer(Trainer):
         labels = inputs["labels"]
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+        self.loss_fct = self.loss_fct.to(preds.device)
         loss = self.loss_fct(preds, labels)
         if self._patch_mil_alpha > 0 and isinstance(outputs, dict) and "patch_pred" in outputs:
             aux = self.loss_fct(outputs["patch_pred"], labels)

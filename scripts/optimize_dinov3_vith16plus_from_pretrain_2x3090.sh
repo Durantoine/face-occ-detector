@@ -2,8 +2,8 @@
 #SBATCH --job-name=face-occ-vith16plus-optuna-ibot
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
-#SBATCH --partition=A40
-#SBATCH --gres=gpu:rtx3090:2
+#SBATCH --partition=3090
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=80G
 #SBATCH --time=30:00:00

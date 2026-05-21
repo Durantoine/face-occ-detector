@@ -75,7 +75,7 @@ def evaluate(c):
 def mlflow_ui(c, port=5000, backend="sqlite:///mlflow.db"):
     env = "OMP_NUM_THREADS=1 TMPDIR=$HOME/tmp MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false MLFLOW_DEPLOYMENTS_TARGET=''"
     c.run(
-        f"mkdir -p $HOME/tmp && {env} uv run mlflow ui --backend-store-uri {backend} --host 0.0.0.0 --port {port}",
+        f"mkdir -p $HOME/tmp && {env} uvx --python 3.12 --from mlflow mlflow ui --backend-store-uri {backend} --host 0.0.0.0 --port {port}",
         pty=True,
     )
 
@@ -87,7 +87,7 @@ def mlflow_stop(c):
 
 @task
 def optuna_dashboard(c, port=8080, storage="sqlite:///optuna.db"):
-    c.run(f"OMP_NUM_THREADS=1 uv run optuna-dashboard {storage} --host 0.0.0.0 --port {port}", pty=True)
+    c.run(f"OMP_NUM_THREADS=1 uvx --python 3.12 --from optuna-dashboard optuna-dashboard {storage} --host 0.0.0.0 --port {port}", pty=True)
 
 
 @task

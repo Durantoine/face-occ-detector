@@ -109,10 +109,15 @@ class WeightedMSETrainer(Trainer):
             extra = ", " + ", ".join(tags) if tags else ""
             print(f"WeightedMSELoss: focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}{extra}")
 
-    def _get_train_sampler(self) -> Any:
-        return self._custom_train_sampler if self._custom_train_sampler is not None else super()._get_train_sampler()
+    def _get_train_sampler(self, train_dataset: Any = None) -> Any:
+        if self._custom_train_sampler is not None:
+            return self._custom_train_sampler
+        try:
+            return super()._get_train_sampler(train_dataset)
+        except TypeError:
+            return super()._get_train_sampler()
 
-    def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False) -> Any:
+    def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:
         labels = inputs["labels"]
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits

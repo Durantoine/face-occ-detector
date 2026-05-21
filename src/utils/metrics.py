@@ -35,7 +35,10 @@ def compute_score(pred: np.ndarray, gt: np.ndarray, gender: np.ndarray) -> Dict[
 
 
 def compute_metrics(p: Any) -> Dict[str, float]:
-    preds = np.asarray(p.predictions).astype(np.float64).flatten()
+    preds_raw = p.predictions
+    if isinstance(preds_raw, (tuple, list)):
+        preds_raw = preds_raw[0]
+    preds = np.asarray(preds_raw).astype(np.float64).flatten()
     labels = np.asarray(p.label_ids).astype(np.float64)
 
     if labels.ndim == 2 and labels.shape[1] >= 2:

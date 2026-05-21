@@ -468,6 +468,8 @@ def train(
         dataloader_pin_memory=True,
         seed=seed,
         remove_unused_columns=False,
+        prediction_loss_only=False,
+        label_names=["labels"],
         **forwarded,
     )
 

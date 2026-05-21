@@ -137,10 +137,11 @@ class FaceOccRegressor(nn.Module):
         logits = self.head(pooled)
         pred = self._activate(logits).squeeze(-1) if self.output_dim == 1 else self._activate(logits)
 
-        patch_logits = self.patch_head(hidden[:, 1:, :]).squeeze(-1)
-        patch_pred = torch.sigmoid(patch_logits).mean(dim=1)
-
-        return {"logits": pred, "patch_pred": patch_pred}
+        out = {"logits": pred}
+        if self.training:
+            patch_logits = self.patch_head(hidden[:, 1:, :]).squeeze(-1)
+            out["patch_pred"] = torch.sigmoid(patch_logits).mean(dim=1)
+        return out
 
     @classmethod
     def load_from_mlflow(cls, model_uri: str, output_dim: Optional[int] = None) -> "FaceOccRegressor":

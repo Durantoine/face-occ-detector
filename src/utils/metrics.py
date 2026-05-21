@@ -34,7 +34,7 @@ def compute_score(pred: np.ndarray, gt: np.ndarray, gender: np.ndarray) -> Dict[
     }
 
 
-def compute_metrics(p: Any) -> Dict[str, float]:
+def compute_metrics(p: Any, compute_result: bool = True, **kwargs: Any) -> Dict[str, float]:
     preds_raw = p.predictions
     if isinstance(preds_raw, (tuple, list)):
         preds_raw = preds_raw[0]

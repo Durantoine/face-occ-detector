@@ -78,6 +78,12 @@ optuna:
     pooling:
       type: categorical
       choices: [cls, mean, attention]
+    balancing_strategy:
+      type: categorical
+      choices: [A, D, E, F]
+    loss_patch_mil_alpha:
+      type: categorical
+      choices: [0.0, 0.5, 1.0]
     augmentation_level:
       type: categorical
       choices: [light, medium, strong]

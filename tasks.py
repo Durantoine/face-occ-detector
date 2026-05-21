@@ -75,7 +75,7 @@ def evaluate(c):
 def mlflow_ui(c, port=5000, backend="sqlite:///mlflow.db"):
     env = "OMP_NUM_THREADS=1 TMPDIR=$HOME/tmp MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false MLFLOW_DEPLOYMENTS_TARGET=''"
     c.run(
-        f"mkdir -p $HOME/tmp && {env} uvx --python 3.12 --from mlflow mlflow ui --backend-store-uri {backend} --host 0.0.0.0 --port {port}",
+        f"mkdir -p $HOME/tmp && {env} uvx --python 3.12 --from 'mlflow<3' mlflow ui --backend-store-uri {backend} --host 0.0.0.0 --port {port} --workers 1",
         pty=True,
     )
 

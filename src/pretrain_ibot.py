@@ -274,45 +274,50 @@ def pretrain_ibot(
         max_steps=max_steps if (is_iterable or max_steps > 0) else -1,
     )
 
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_experiment(mlflow_experiment)
+    rank = int(os.environ.get("RANK", "0"))
 
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     run_id_file = Path(output_dir) / "mlflow_run_id.txt"
     existing_ckpts = sorted(Path(output_dir).glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1])) if Path(output_dir).exists() else []
     if run_id_file.exists() and existing_ckpts:
-        prev_run_id = run_id_file.read_text().strip()
-        mlflow.start_run(run_id=prev_run_id)
-        latest_ckpt = str(existing_ckpts[-1])
-        print(f"RESUMING run {prev_run_id} from {latest_ckpt}")
-        resume_arg = latest_ckpt
+        resume_arg: Optional[str] = str(existing_ckpts[-1])
     else:
-        run_name = f"pretrain-ibot-{arch}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        active = mlflow.start_run(run_name=run_name)
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        run_id_file.write_text(active.info.run_id)
         resume_arg = None
 
-    if resume_arg is None:
-        mlflow.log_params({
-            "method": "iBOT-light-frozen" if teacher_frozen else f"iBOT-light-ema-{teacher_ema_decay}",
-            "arch": arch,
-            "data_source": data_source,
-            "wds_pattern": wds_pattern,
-            "mask_ratio": mask_ratio,
-            "image_size": image_size,
-            "patch_size": patch_size,
-            "is_iterable": is_iterable,
-            "teacher_frozen": teacher_frozen,
-            "teacher_ema_decay": teacher_ema_decay,
-        })
+    if rank == 0:
+        mlflow.set_tracking_uri(tracking_uri)
+        mlflow.set_experiment(mlflow_experiment)
+        if resume_arg is not None:
+            prev_run_id = run_id_file.read_text().strip()
+            mlflow.start_run(run_id=prev_run_id)
+            print(f"RESUMING run {prev_run_id} from {resume_arg}")
+        else:
+            run_name = f"pretrain-ibot-{arch}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            active = mlflow.start_run(run_name=run_name)
+            run_id_file.write_text(active.info.run_id)
+            mlflow.log_params({
+                "method": "iBOT-light-frozen" if teacher_frozen else f"iBOT-light-ema-{teacher_ema_decay}",
+                "arch": arch,
+                "data_source": data_source,
+                "wds_pattern": wds_pattern,
+                "mask_ratio": mask_ratio,
+                "image_size": image_size,
+                "patch_size": patch_size,
+                "is_iterable": is_iterable,
+                "teacher_frozen": teacher_frozen,
+                "teacher_ema_decay": teacher_ema_decay,
+            })
 
     callbacks = [] if teacher_frozen else [EMACallback(model)]
     trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     print(f"iBOT pretraining: {arch} @ {image_size}x{image_size} | mask_ratio={mask_ratio} | "
           f"teacher={'frozen' if teacher_frozen else f'EMA(decay={teacher_ema_decay})'} | "
           f"bs={per_device_train_batch_size}x{gradient_accumulation_steps} (per GPU) | "
-          f"resume={resume_arg}")
+          f"resume={resume_arg} | rank={rank}")
     trainer.train(resume_from_checkpoint=resume_arg)
+
+    if rank != 0:
+        return ""
 
     student = (
         trainer.accelerator.unwrap_model(trainer.model).student

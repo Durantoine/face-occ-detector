@@ -452,7 +452,7 @@ def train(
     training_args = TrainingArguments(
         output_dir=output_dir,
         report_to=["mlflow"] if (use_mlflow and not use_client) else [],
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
         load_best_model_at_end=True,

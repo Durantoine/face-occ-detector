@@ -30,7 +30,11 @@ ls data/occlusion_datasets/  # train.csv, test_students.csv
 # 1. (optional) Download images to data/crops/Crop_224_5fp_100K/
 #    Link: https://partage.imt.fr/index.php/s/ntYk27ZFCbeKGqW
 
-# 2. Pipeline (all declarative — edit CONFIG dicts at top of each src/*.py to switch settings)
+# 2. Environment — single pyproject.toml, CUDA index auto-selected on Linux
+uv sync                # local (Mac/CPU/MPS): plain PyPI wheels
+                       # cluster (Linux):     CUDA 12.6 wheels via [tool.uv.sources] marker
+
+# 3. Pipeline (declarative — edit CONFIG dicts at top of each src/*.py to switch settings)
 inv pretrain           # Stage 0 (optional) — iBOT-light domain adaptation on unlabeled faces
 inv train              # Stage 1 — single supervised run, baseline
 inv optimize           # Stage 2 — Optuna HPO
@@ -41,6 +45,30 @@ inv evaluate           # gender-aware score on a labeled CSV
 # UIs
 inv mlflow-ui          # http://localhost:5000
 inv optuna-dashboard   # http://localhost:8080
+```
+
+### Cluster workflow (SLURM, 2× RTX 3090)
+
+The three canonical sbatch scripts cover the full A/B comparison:
+
+```bash
+# A) Optimize without pretrain (baseline)
+sbatch scripts/optimize_dinov3_vith16plus_2x3090.sh
+#  → uses configs/architectures/dinov3-vith16plus-3090.yaml
+
+# B) iBOT-light pretrain, then optimize from that encoder
+sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh           # single 30h chunk
+# OR
+./scripts/chain_pretrain.sh 3                                # chain 3× (90h cumulative)
+# After pretrain completes:
+#   1. read results/pretrain/mlflow_run_id.txt
+#   2. open configs/architectures/dinov3-vith16plus-3090-ibot.yaml
+#      and replace __FILL_PRETRAIN_RUN_ID__ with that run_id
+sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh
+#  → uses configs/architectures/dinov3-vith16plus-3090-ibot.yaml
+#  → train.py auto-loads runs:/<run_id>/encoder into the backbone and logs
+#    `model_init_backbone_from`, `init_backbone_pretrain_run_id`, all `pretrain_*`
+#    params from the pretrain run, and a `pretrain_run_id` tag for traceability.
 ```
 
 ---
@@ -250,7 +278,7 @@ Implementation: `src/pretrain_ibot.py:DinoV3IBoT` (~100 LOC core).
 | ViT-L/16 (300M) | ~14 GB | ~24 h |
 | **ViT-H+/16 (600M)** ⭐ | **~22 GB** (with grad-ckpt) | **~36 h** |
 
-Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh`. Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`, usable in `train.py` via `resume_from_checkpoint`.
+Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `./scripts/chain_pretrain.sh 3` to chain three 30 h SLURM submissions). Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`. To use it for finetuning, fill that URI into `model.init_backbone_from` of `configs/architectures/dinov3-vith16plus-3090-ibot.yaml` and launch `sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh`. `train.py` then loads the weights into the backbone and copies all pretrain params into the finetune run for full provenance.
 
 ### Why we noticed this late
 
@@ -366,6 +394,7 @@ Per epoch (via `compute_metrics`):
 
 Run start (params):
 - `architecture`, `model_name`, `output_dim`, `pooling`, `augmentation_level`, `sampler_strategy`, `loss_type`, `seed`, `num_train`, `num_val`, `num_train_female`, `num_train_male`, `num_val_female`, `num_val_male`, `train_gender_ratio_M_over_F`
+- When `model.init_backbone_from` is set: `init_backbone_from`, `init_backbone_pretrain_run_id`, `init_backbone_missing_keys`, `init_backbone_unexpected_keys`, plus every `pretrain_*` param copied from the source pretrain run (tag `pretrain_run_id` for the link)
 
 Run start (data-distribution metrics):
 - `data_train_occ_mean/std`, `data_val_occ_mean/std`
@@ -404,13 +433,18 @@ src/
     ├── config.py / environment.py / mlflow_utils.py / distributed.py
 
 configs/architectures/
-├── dinov3-vits16-face-occ.yaml   ViT-S/16 — runs anywhere (weights shipped)
-├── dinov3-vitl16plus-p100.yaml   ViT-L+/16 — 2× P100 (requires manual weight download)
-└── dinov3-vith16plus-3090.yaml   ViT-H+/16 — 2× 3090 (requires manual weight download)
+├── dinov3-vits16-face-occ.yaml         ViT-S/16  — runs anywhere (weights shipped)
+├── dinov3-vitl16-p100.yaml             ViT-L/16  — 2× P100  (requires manual weight download)
+├── dinov3-vitl16-3090.yaml             ViT-L/16  — 2× 3090  (requires manual weight download)
+├── dinov3-vith16plus-3090.yaml         ViT-H+/16 — 2× 3090  (no pretrain — baseline)
+└── dinov3-vith16plus-3090-ibot.yaml    ViT-H+/16 — 2× 3090  (init_backbone_from iBOT pretrain)
 
 scripts/
-├── train_dinov3_vits16_2gpu.sh / optimize_*.sh / ensemble_*.sh   SLURM, DDP, 30h
-├── download_dinov3_weights.sh    URL reference for larger DINOv3 weights
+├── pretrain_ibot_vith16plus_2x3090.sh                       # SLURM iBOT pretrain (30h)
+├── optimize_dinov3_vith16plus_2x3090.sh                     # SLURM Optuna HPO, no pretrain
+├── optimize_dinov3_vith16plus_from_pretrain_2x3090.sh       # SLURM Optuna HPO from iBOT encoder
+├── chain_pretrain.sh                                        # chain N successive sbatch runs
+├── download_dinov3_weights.sh                               # URL reference for larger DINOv3 weights
 ├── connect.sh / clean.sh
 ```
 
@@ -429,6 +463,9 @@ scripts/
 | 7 | Only one fairness mechanism (gender-balanced sampler) | ✅ added Group-DRO loss + post-hoc bias correction |
 | 8 | DINOv3 weights other than ViT-S/16 hardcoded missing | ✅ all 6 paths registered, loader detects presence |
 | 9 | `tqdm` not in pyproject (auto-pulled but implicit) | ✅ added explicit |
+| 10 | Two pyproject files (`pyproject.toml` + `pyproject.cluster.toml`) with `cp` swap in every sbatch | ✅ single `pyproject.toml` with `marker = "sys_platform == 'linux'"` CUDA index |
+| 11 | MPS autograd `.view()` failure on DINOv3 forced torch `<2.6` and a stack of MPS monkey-patches | ✅ bumped to `torch>=2.7`, removed all MPS shims |
+| 12 | Pretrain → finetune wiring opaque (no MLflow trace of which encoder seeded the run) | ✅ `train.py` logs `model_init_backbone_from`, `init_backbone_pretrain_run_id`, all `pretrain_*` params from the source run, and a `pretrain_run_id` tag |
 
 ---
 
@@ -437,7 +474,7 @@ scripts/
 ### P0 — Run the baseline
 1. Download face crops to `data/crops/Crop_224_5fp_100K/`
 2. `inv train` (uses `dinov3-vits16-face-occ.yaml`) — expect `eval_score < 0.005` after a few epochs
-3. `sbatch scripts/optimize_dinov3_vits16_2gpu.sh` — HPO
+3. `sbatch scripts/optimize_dinov3_vith16plus_2x3090.sh` — HPO on ViT-H+/16 (no pretrain)
 4. `inv ensemble` on the best YAML — produces 5 fold models
 5. `inv predict` — emits `test_predictions.csv` for submission
 
@@ -445,7 +482,7 @@ scripts/
 6. **Post-hoc bias correction**: after a trained model, run `find_optimal_bias(preds_val, gt_val, gender_val)` to get `δ_F`, `δ_M`, then `inv predict --delta-f <df> --delta-m <dm>`. Free fairness fix.
 7. **Multi-architecture ensemble**: add DINOv2-base (HF, no license needed) and ConvNeXt v2-large YAMLs → ensemble across 3 backbones × 5 folds = 15 prediction sources.
 8. **Resolution upgrade to 384×384**: write a `get_image_processor(name, size=384)` variant. Drop batch by ~3×, expect −0.5 to −1.5 % on `score`.
-9. **iBOT-light pretraining** on MS1MV3 (or VGGFace2 / LFW) via `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` — see [Pretraining method](#pretraining-method-ibot-not-mae). Marginal expected gain on top of DINOv3 H+ but worth trying if compute is available.
+9. **iBOT-light pretraining + finetune A/B**: `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `chain_pretrain.sh 3`), then fill the resulting `runs:/<id>/encoder` URI into `dinov3-vith16plus-3090-ibot.yaml` and `sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh`. Compare its best `val_score` against the no-pretrain HPO from step 3.
 
 ### P2 — Refinements
 10. **Importance reweighting** to match test distribution explicitly (compute histogram ratios).
@@ -479,4 +516,4 @@ scripts/
 | 1× RTX 3090 | 24 GB | BF16 | ViT-L/16 |
 | 2× RTX 3090 DDP | 48 GB | BF16 | ViT-H+/16 (requires manual weight DL) |
 
-All SLURM scripts use `torchrun --nproc_per_node=2`, 30h time, with the right hardware tags.
+All SLURM scripts use `torchrun --nproc_per_node=2`, 30 h time, with the right hardware tags. On Linux nodes `uv sync` pulls CUDA 12.6 wheels via the `[tool.uv.sources]` marker; on Mac it falls back to the default PyPI index (CPU/MPS). torch is pinned to `>=2.7,<3.0` to keep MPS autograd working for local sanity tests.

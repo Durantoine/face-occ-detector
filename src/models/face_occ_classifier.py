@@ -94,6 +94,18 @@ class FaceOccRegressor(nn.Module):
     def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
         if hasattr(self.backbone, "gradient_checkpointing_enable"):
             self.backbone.gradient_checkpointing_enable(**kwargs)
+            return
+        if hasattr(self.backbone, "blocks"):
+            from torch.utils.checkpoint import checkpoint as ckpt
+            for block in self.backbone.blocks:
+                orig = block.forward
+
+                def _wrap(orig_forward):
+                    def _ckpt_forward(*args, **kw):
+                        return ckpt(orig_forward, *args, use_reentrant=False, **kw)
+                    return _ckpt_forward
+                block.forward = _wrap(orig)
+            print(f"[FaceOccRegressor] gradient_checkpointing enabled on {len(self.backbone.blocks)} blocks")
 
     def gradient_checkpointing_disable(self) -> None:
         if hasattr(self.backbone, "gradient_checkpointing_disable"):

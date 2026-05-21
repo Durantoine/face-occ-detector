@@ -1,0 +1,92 @@
+name: dinov3-vith16plus-3090-ibot
+description: DINOv3 ViT-H+/16 (600M) initialized from iBOT-pretrained encoder. 2x RTX 3090 24GB (BF16, DDP). For A/B vs dinov3-vith16plus-3090 (no pretrain).
+
+model:
+  model_name: dinov3_vith16plus
+  output_dim: 1
+  hidden_dropout_prob: 0.1
+  pooling: cls
+  projection_size: null
+  output_activation: sigmoid
+  init_backbone_from: runs:/__FILL_PRETRAIN_RUN_ID__/encoder
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+
+training:
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 2
+  num_train_epochs: 12
+  learning_rate: 5.0e-05
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: true
+  augmentation_level: medium
+  sampler_strategy: gender_x_occ
+  loss_type: weighted_mse
+  loss_focal_gamma: 0.0
+  loss_fairness_lambda: 1.0
+  group_dro_alpha: 0.5
+  ema_decay: 0.9998
+  ema_warmup_steps: 200
+  layer_decay: 0.85
+
+optuna:
+  n_trials: 30
+  objective_mode: score
+  rotate_val_seed: true
+  search_space:
+    learning_rate:
+      type: float
+      low: 1.0e-05
+      high: 2.0e-04
+      log: true
+    weight_decay:
+      type: float
+      low: 0.0
+      high: 0.3
+    num_train_epochs:
+      type: int
+      low: 8
+      high: 16
+    warmup_ratio:
+      type: float
+      low: 0.05
+      high: 0.2
+    hidden_dropout_prob:
+      type: float
+      low: 0.0
+      high: 0.3
+    pooling:
+      type: categorical
+      choices: [cls, mean, attention]
+    augmentation_level:
+      type: categorical
+      choices: [light, medium, strong]
+    loss_focal_gamma:
+      type: float
+      low: 0.0
+      high: 2.0
+    loss_fairness_lambda:
+      type: float
+      low: 0.5
+      high: 2.0
+    layer_decay:
+      type: float
+      low: 0.65
+      high: 1.0

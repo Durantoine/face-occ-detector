@@ -5,16 +5,6 @@ import torch
 from transformers import AutoImageProcessor
 
 
-def _shim_torch_amp_for_dinov3() -> None:
-    import torch.amp as _amp
-    if not hasattr(_amp, "custom_fwd"):
-        from torch.cuda.amp import custom_bwd, custom_fwd
-        _amp.custom_fwd = custom_fwd
-        _amp.custom_bwd = custom_bwd
-
-
-_shim_torch_amp_for_dinov3()
-
 _REPO = Path(__file__).parent / "dinov3_repo"
 _WEIGHTS_DIR = Path(__file__).parent / "weights"
 
@@ -80,7 +70,14 @@ def recommend_dinov3_variant(headroom_gb: float = 2.0) -> str:
     return best
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 def get_image_processor(model_name: str) -> Any:
     if model_name.startswith("dinov3_"):
-        return AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+        proc.image_mean = list(IMAGENET_MEAN)
+        proc.image_std = list(IMAGENET_STD)
+        return proc
     return AutoImageProcessor.from_pretrained(model_name)

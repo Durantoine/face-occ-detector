@@ -344,8 +344,39 @@ def train(
         )
     )
 
+    init_backbone_from = model_cfg.get("init_backbone_from")
+    if init_backbone_from:
+        import re
+        import mlflow as _ml
+        print(f"Loading pretrained backbone from {init_backbone_from}")
+        pretrained = _ml.pytorch.load_model(init_backbone_from)
+        missing, unexpected = model.backbone.load_state_dict(pretrained.state_dict(), strict=False)
+        print(f"  loaded ({len(missing)} missing, {len(unexpected)} unexpected keys)")
+        m = re.match(r"runs:/([^/]+)/", init_backbone_from)
+        pretrain_run_id = m.group(1) if m else None
+        ml_log_params(client, run_id, {
+            "init_backbone_from": init_backbone_from,
+            "init_backbone_pretrain_run_id": pretrain_run_id,
+            "init_backbone_missing_keys": len(missing),
+            "init_backbone_unexpected_keys": len(unexpected),
+        })
+        if pretrain_run_id:
+            try:
+                pre_run = _ml.tracking.MlflowClient().get_run(pretrain_run_id)
+                pre_params = {f"pretrain_{k}": v for k, v in pre_run.data.params.items()}
+                ml_log_params(client, run_id, pre_params)
+                client.set_tag(run_id, "pretrain_run_id", pretrain_run_id)
+                print(f"  logged {len(pre_params)} pretrain_* params from run {pretrain_run_id}")
+            except Exception as e:
+                print(f"  WARNING: could not fetch pretrain run params: {e}")
+
     forwarded = {k: v for k, v in train_cfg.items() if k not in _NON_HF_TRAIN_KEYS}
     forwarded.setdefault("fp16", True)
+    if not torch.cuda.is_available():
+        if forwarded.get("bf16") or forwarded.get("fp16"):
+            print(f"WARNING: non-CUDA device — disabling bf16/fp16")
+        forwarded["bf16"] = False
+        forwarded["fp16"] = False
     training_args = TrainingArguments(
         output_dir=output_dir,
         report_to=["mlflow"] if (use_mlflow and not use_client) else [],

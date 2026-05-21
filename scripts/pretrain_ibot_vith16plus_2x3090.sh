@@ -26,7 +26,7 @@ cd "${PROJECT_DIR}"
 export UV_PYTHON=python3.11
 export UV_PYTHON_DOWNLOADS=never
 export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
-cp pyproject.cluster.toml pyproject.toml && uv sync --no-dev
+uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"

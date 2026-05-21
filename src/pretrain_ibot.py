@@ -16,6 +16,7 @@ from src.utils.environment import setup_environment
 
 setup_environment()
 
+
 CONFIG: Dict[str, Any] = {
     "arch": os.environ.get("FACE_OCC_PRETRAIN_ARCH", "dinov3_vith16plus"),
     "data_source": os.environ.get("FACE_OCC_PRETRAIN_SRC", "data/pretrain/"),
@@ -34,9 +35,9 @@ CONFIG: Dict[str, Any] = {
     "bf16": True,
     "fp16": False,
     "gradient_checkpointing": True,
-    "image_size": 224,
+    "image_size": 112,
     "patch_size": 16,
-    "max_steps": -1,
+    "max_steps": int(os.environ.get("FACE_OCC_PRETRAIN_MAX_STEPS", "100000")),
     "save_steps": 5000,
     "logging_steps": 100,
     "teacher_frozen": True,
@@ -68,6 +69,25 @@ class DinoV3IBoT(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (image_size // patch_size) ** 2
         self.hidden = hidden_size_of(arch)
+        self._grad_ckpt_enabled = False
+
+    def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
+        from torch.utils.checkpoint import checkpoint as ckpt
+        if self._grad_ckpt_enabled or not hasattr(self.student, "blocks"):
+            return
+        for block in self.student.blocks:
+            orig = block.forward
+
+            def _wrap(orig_forward):
+                def _ckpt_forward(*args, **kw):
+                    return ckpt(orig_forward, *args, use_reentrant=False, **kw)
+                return _ckpt_forward
+            block.forward = _wrap(orig)
+        self._grad_ckpt_enabled = True
+        print(f"[DinoV3IBoT] gradient_checkpointing enabled on {len(self.student.blocks)} student blocks")
+
+    def gradient_checkpointing_disable(self) -> None:
+        self._grad_ckpt_enabled = False
 
     @torch.no_grad()
     def ema_update_teacher(self) -> None:
@@ -128,11 +148,17 @@ class ImageOnlyDataset(Dataset):
 class WebDatasetWrapper(IterableDataset):
     def __init__(self, pattern: str, processor: Any, shuffle_buffer: int = 1000) -> None:
         super().__init__()
+        import glob
+
         import webdataset as wds
+        shards = sorted(glob.glob(pattern))
+        if not shards:
+            raise FileNotFoundError(f"No tar shards matched: {pattern}")
+        print(f"WebDataset: {len(shards)} shards (e.g. {Path(shards[0]).name} ... {Path(shards[-1]).name})")
         self.pattern = pattern
         self.processor = processor
         self._inner = (
-            wds.WebDataset(pattern, resampled=True, nodesplitter=wds.split_by_node, shardshuffle=True)
+            wds.WebDataset(shards, resampled=True, nodesplitter=wds.split_by_node, shardshuffle=False)
             .shuffle(shuffle_buffer)
             .decode("pil")
             .to_tuple("jpg")
@@ -208,12 +234,21 @@ def pretrain_ibot(
     dataset = _build_dataset(data_source, wds_pattern, processor)
     is_iterable = isinstance(dataset, IterableDataset)
 
+    if not torch.cuda.is_available():
+        if bf16 or fp16:
+            print(f"WARNING: non-CUDA device — disabling bf16/fp16 (was bf16={bf16}, fp16={fp16})")
+        bf16 = False
+        fp16 = False
+
     class EMACallback(TrainerCallback):
         def __init__(self, m: DinoV3IBoT) -> None:
             self.m = m
 
         def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
             self.m.ema_update_teacher()
+
+    if is_iterable and max_steps <= 0:
+        raise ValueError("WebDataset is iterable — set max_steps>0 (env FACE_OCC_PRETRAIN_MAX_STEPS).")
 
     args = TrainingArguments(
         output_dir=output_dir,
@@ -241,37 +276,43 @@ def pretrain_ibot(
 
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(mlflow_experiment)
-    run_name = f"pretrain-ibot-{arch}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    mlflow.start_run(run_name=run_name)
 
-    mlflow.log_params({
-        "method": "iBOT-light-frozen" if teacher_frozen else f"iBOT-light-ema-{teacher_ema_decay}",
-        "arch": arch,
-        "data_source": data_source,
-        "wds_pattern": wds_pattern,
-        "mask_ratio": mask_ratio,
-        "image_size": image_size,
-        "patch_size": patch_size,
-        "num_train_epochs": num_train_epochs,
-        "per_device_train_batch_size": per_device_train_batch_size,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "learning_rate": learning_rate,
-        "warmup_ratio": warmup_ratio,
-        "weight_decay": weight_decay,
-        "bf16": bf16, "fp16": fp16,
-        "gradient_checkpointing": gradient_checkpointing,
-        "max_steps": max_steps,
-        "is_iterable": is_iterable,
-        "teacher_frozen": teacher_frozen,
-        "teacher_ema_decay": teacher_ema_decay,
-    })
+    run_id_file = Path(output_dir) / "mlflow_run_id.txt"
+    existing_ckpts = sorted(Path(output_dir).glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1])) if Path(output_dir).exists() else []
+    if run_id_file.exists() and existing_ckpts:
+        prev_run_id = run_id_file.read_text().strip()
+        mlflow.start_run(run_id=prev_run_id)
+        latest_ckpt = str(existing_ckpts[-1])
+        print(f"RESUMING run {prev_run_id} from {latest_ckpt}")
+        resume_arg = latest_ckpt
+    else:
+        run_name = f"pretrain-ibot-{arch}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        active = mlflow.start_run(run_name=run_name)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        run_id_file.write_text(active.info.run_id)
+        resume_arg = None
+
+    if resume_arg is None:
+        mlflow.log_params({
+            "method": "iBOT-light-frozen" if teacher_frozen else f"iBOT-light-ema-{teacher_ema_decay}",
+            "arch": arch,
+            "data_source": data_source,
+            "wds_pattern": wds_pattern,
+            "mask_ratio": mask_ratio,
+            "image_size": image_size,
+            "patch_size": patch_size,
+            "is_iterable": is_iterable,
+            "teacher_frozen": teacher_frozen,
+            "teacher_ema_decay": teacher_ema_decay,
+        })
 
     callbacks = [] if teacher_frozen else [EMACallback(model)]
     trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     print(f"iBOT pretraining: {arch} @ {image_size}x{image_size} | mask_ratio={mask_ratio} | "
           f"teacher={'frozen' if teacher_frozen else f'EMA(decay={teacher_ema_decay})'} | "
-          f"bs={per_device_train_batch_size}x{gradient_accumulation_steps} (per GPU)")
-    trainer.train()
+          f"bs={per_device_train_batch_size}x{gradient_accumulation_steps} (per GPU) | "
+          f"resume={resume_arg}")
+    trainer.train(resume_from_checkpoint=resume_arg)
 
     student = (
         trainer.accelerator.unwrap_model(trainer.model).student

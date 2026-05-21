@@ -40,6 +40,10 @@ training:
   loss_type: weighted_mse
   loss_focal_gamma: 0.0
   loss_fairness_lambda: 1.0
+  loss_importance_reweight: false
+  loss_gender_reweight: false
+  loss_cell_reweight: false
+  loss_patch_mil_alpha: 0.0
   group_dro_alpha: 0.5
   ema_decay: 0.9998
   ema_warmup_steps: 200

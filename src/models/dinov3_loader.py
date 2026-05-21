@@ -75,9 +75,9 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 def get_image_processor(model_name: str) -> Any:
-    if model_name.startswith("dinov3_"):
+    if model_name.startswith("dinov3_") or "sapiens" in model_name.lower():
         proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
         return proc
-    return AutoImageProcessor.from_pretrained(model_name)
+    return AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)

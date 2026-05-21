@@ -122,7 +122,7 @@ def ensemble_train(
         run_id = child.info.run_id
         client.log_param(run_id, "fold", i)
 
-        eval_loss, score, err_diff, model_uri = train(
+        eval_loss, score, err_diff, model_uri, _, _ = train(
             architecture_name=architecture,
             data_csv=tr_csv,
             val_data_csv=va_csv,

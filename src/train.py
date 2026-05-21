@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
+import numpy as np
 import pandas as pd
 import torch
 from mlflow.tracking import MlflowClient
@@ -30,7 +31,13 @@ from src.models.face_occ_classifier import FaceOccRegressor
 from src.training.callbacks import MlflowClientCallback, make_ema_callback_from_cfg
 from src.utils.config import load_architecture_config
 from src.utils.environment import setup_environment
-from src.utils.losses import GroupDROLoss, WeightedMSELoss, make_sampler_keys
+from src.utils.losses import (
+    GroupDROLoss,
+    WeightedMSELoss,
+    build_cell_weights,
+    build_importance_weights,
+    make_sampler_keys,
+)
 from src.utils.metrics import compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
 from src.utils.mlflow_utils import log_params as ml_log_params
@@ -51,6 +58,8 @@ _NON_HF_TRAIN_KEYS = {
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
+    "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
+    "loss_patch_mil_alpha",
     "group_dro_alpha", "layer_decay",
 }
 
@@ -66,6 +75,10 @@ class WeightedMSETrainer(Trainer):
         focal_gamma: float = 0.0,
         fairness_lambda: float = 0.0,
         group_dro_alpha: float = 0.5,
+        importance_pmf_ratio: Optional[Any] = None,
+        gender_class_weights: Optional[Any] = None,
+        cell_class_weights: Optional[Any] = None,
+        patch_mil_alpha: float = 0.0,
         train_sampler: Optional[Any] = None,
         layer_decay: float = 1.0,
         *args: Any,
@@ -74,12 +87,27 @@ class WeightedMSETrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._custom_train_sampler = train_sampler
         self._layer_decay = layer_decay
+        self._patch_mil_alpha = float(patch_mil_alpha)
         if loss_type == "group_dro":
             self.loss_fct = GroupDROLoss(alpha=group_dro_alpha)
             print(f"GroupDROLoss: alpha={group_dro_alpha}")
         else:
-            self.loss_fct = WeightedMSELoss(focal_gamma=focal_gamma, fairness_lambda=fairness_lambda)
-            print(f"WeightedMSELoss: focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}")
+            self.loss_fct = WeightedMSELoss(
+                focal_gamma=focal_gamma,
+                fairness_lambda=fairness_lambda,
+                importance_pmf_ratio=importance_pmf_ratio,
+                gender_class_weights=gender_class_weights,
+                cell_class_weights=cell_class_weights,
+            )
+            tags = []
+            if importance_pmf_ratio is not None:
+                tags.append(f"importance_reweight=on (mean={float(importance_pmf_ratio.mean()):.2f})")
+            if gender_class_weights is not None:
+                tags.append(f"gender_reweight=on (F={gender_class_weights[0]:.2f}, M={gender_class_weights[1]:.2f})")
+            if cell_class_weights is not None:
+                tags.append(f"cell_reweight=on (max={float(cell_class_weights.max()):.2f}, min={float(cell_class_weights.min()):.2f})")
+            extra = ", " + ", ".join(tags) if tags else ""
+            print(f"WeightedMSELoss: focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}{extra}")
 
     def _get_train_sampler(self) -> Any:
         return self._custom_train_sampler if self._custom_train_sampler is not None else super()._get_train_sampler()
@@ -89,6 +117,9 @@ class WeightedMSETrainer(Trainer):
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         loss = self.loss_fct(preds, labels)
+        if self._patch_mil_alpha > 0 and isinstance(outputs, dict) and "patch_pred" in outputs:
+            aux = self.loss_fct(outputs["patch_pred"], labels)
+            loss = loss + self._patch_mil_alpha * aux
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self) -> torch.optim.Optimizer:
@@ -306,6 +337,47 @@ def train(
         train_sampler = create_balanced_sampler(keys.tolist(), num_groups=n_groups)
         print(f"Sampler '{sampler_strategy}': {n_groups} groups, {train_sampler.num_samples} samples/epoch")
 
+    importance_pmf_ratio = None
+    if train_cfg.get("loss_importance_reweight", False) and loss_type == "weighted_mse":
+        label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+        importance_pmf_ratio = build_importance_weights(train_data[label_col].astype(float).values)
+        ml_log_params(client, run_id, {
+            "loss_importance_reweight": True,
+            "loss_importance_pmf_ratio": ",".join(f"{x:.3f}" for x in importance_pmf_ratio.tolist()),
+        })
+        print(f"Importance reweight ratios (test/train) per 0.025-bin (20 bins): {importance_pmf_ratio.round(3).tolist()}")
+
+    gender_class_weights = None
+    if train_cfg.get("loss_gender_reweight", False) and loss_type == "weighted_mse" and "gender" in train_data.columns:
+        n_f = max(int((train_data["gender"] < 0.5).sum()), 1)
+        n_m = max(int((train_data["gender"] >= 0.5).sum()), 1)
+        w_f = 1.0 / (2.0 * n_f / (n_f + n_m))
+        w_m = 1.0 / (2.0 * n_m / (n_f + n_m))
+        norm = (w_f + w_m) / 2.0
+        gender_class_weights = np.array([w_f / norm, w_m / norm], dtype=np.float64)
+        ml_log_params(client, run_id, {
+            "loss_gender_reweight": True,
+            "loss_gender_weight_F": float(gender_class_weights[0]),
+            "loss_gender_weight_M": float(gender_class_weights[1]),
+        })
+        print(f"Gender reweight: F={gender_class_weights[0]:.3f}, M={gender_class_weights[1]:.3f} (mean=1.0)")
+
+    cell_class_weights = None
+    if train_cfg.get("loss_cell_reweight", False) and loss_type == "weighted_mse" and "gender" in train_data.columns:
+        label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+        cell_class_weights = build_cell_weights(
+            train_data[label_col].astype(float).values,
+            train_data["gender"].astype(float).values,
+        )
+        ml_log_params(client, run_id, {
+            "loss_cell_reweight": True,
+            "loss_cell_weights_max": float(cell_class_weights.max()),
+            "loss_cell_weights_min": float(cell_class_weights.min()),
+            "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
+            "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
+        })
+        print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
+
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())
     n_val_f = int((val_data["gender"] < 0.5).sum())
@@ -409,6 +481,10 @@ def train(
         focal_gamma=train_cfg.get("loss_focal_gamma", 0.0),
         fairness_lambda=train_cfg.get("loss_fairness_lambda", 0.0),
         group_dro_alpha=train_cfg.get("group_dro_alpha", 0.5),
+        importance_pmf_ratio=importance_pmf_ratio,
+        gender_class_weights=gender_class_weights,
+        cell_class_weights=cell_class_weights,
+        patch_mil_alpha=train_cfg.get("loss_patch_mil_alpha", 0.0),
         train_sampler=train_sampler,
         layer_decay=train_cfg.get("layer_decay", 1.0),
         model=model,
@@ -427,6 +503,8 @@ def train(
     eval_loss = eval_results["eval_loss"]
     eval_score = eval_results.get("eval_score", 0.0)
     err_diff = eval_results.get("eval_err_diff", 0.0)
+    err_F = eval_results.get("eval_err_F", 0.0)
+    err_M = eval_results.get("eval_err_M", 0.0)
     print(f"score={eval_score:.5f} | err_diff={err_diff:.5f} | loss={eval_loss:.5f}")
 
     if test_data_csv and trainer.is_world_process_zero():
@@ -455,7 +533,7 @@ def train(
             print(f"WARNING test eval: {e}")
 
     if not trainer.is_world_process_zero():
-        return eval_loss, eval_score, err_diff, ""
+        return eval_loss, eval_score, err_diff, "", err_F, err_M
 
     ml_log_metrics(client, run_id, {
         "val_score": eval_score,
@@ -484,7 +562,7 @@ def train(
     if output_dir and output_dir != "./results":
         shutil.rmtree(output_dir, ignore_errors=True)
 
-    return eval_loss, eval_score, err_diff, model_uri
+    return eval_loss, eval_score, err_diff, model_uri, err_F, err_M
 
 
 if __name__ == "__main__":

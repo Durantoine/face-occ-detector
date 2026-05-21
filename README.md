@@ -286,6 +286,63 @@ Honest postmortem: the previous iterations of this project anchored on "MAE" ear
 
 ---
 
+## Sampler × loss-weight design — the F-occ confound
+
+### The two-axis imbalance
+
+Our 100k train subset (a stratified slice of Idemia's full 752k brief train set — **already partly balanced toward mid-occ**, peak at bin 0 is 32.5 % not 44 %) has two independent imbalances:
+
+1. **Gender** : M/F = 2.086 (67.6 % M, 32.4 % F)
+2. **Occlusion** : 32.5 % in `[0, 0.025)`, decaying to <0.1 % above `[0.45, 0.50)`
+
+And a critical **confound** :
+
+| gender | n | occ_mean | occ_std |
+|---|---|---|---|
+| F (0) | 32,400 | **0.129** | 0.094 |
+| M (1) | 67,600 | **0.061** | 0.073 |
+
+→ **Women's faces have 2× more occlusion on average** in the training data. Any model can learn `gender → +0.07 occlusion` as a shortcut instead of looking at actual occlusion cues. This shortcut works on train but degrades test performance and inflates `|Err_F − Err_M|`.
+
+### Four options to decorrelate
+
+The math: with `f_sampler(b)` the per-bin batch frequency under the sampler and `w_imp(b)` the per-bin loss multiplier, the optimizer effectively minimizes `Σ_b f_sampler(b) · w_imp(b) · E[w_metric·err | bin = b]`. To match the test-time evaluation `Σ_b p_test(b) · E[w_metric·err | bin = b]`, we need `f_sampler(b) · w_imp(b) = p_test(b)` per bin.
+
+Following the same pattern as `online-polarization-detector` (which tested `none / class_weights / balanced_sampler / both` in HPO), we ship four strategies:
+
+| Option | Sampler | Loss weights | Pro | Con (especially on our 100k subset) |
+|---|---|---|---|---|
+| **A** (current default) | `gender` (balance F/M only, occ natural) | `w_imp = p_test / p_train` | each sample seen ~1× per epoch, no over-fit risk on rare bins, uses 100 % of train data | does NOT decorrelate gender × occ at the batch level — model can still learn the shortcut, mitigated only by `loss_fairness_lambda` |
+| **B** | `gender_x_occ` (uniform over 20 bins × 2 genders) | `w_imp = n_buckets · p_test` | hard decorrelation of (gender × occ) at the batch level, kills the shortcut | bins 17-19 have only 19/62/51 samples each → drawn 100+ times per epoch → memorization; bin 0's 32k samples drawn 0.15×/epoch |
+| **C** | `test_like_x_gender` (sample occ ∝ `_TEST_PMF_0025`, gender 50/50 within each bin) | `w_imp = 1` (sampler does the shift) | conceptually cleanest, batch ≈ test distribution, no double correction | mid-occ samples (bins 5-13, ~1500-5000 unique each) drawn 2-3× per epoch → memorization over 12 epochs; bins 17-19 (132 samples total) never drawn → discarded |
+| **D** (loss-only) | `none` (natural train distribution, each sample 1× per epoch) | `w_imp = p_test / p_train`  ×  `w_gender = [1/(2·p_F), 1/(2·p_M)]` per sample | strict 100 % data coverage (no replacement), single-pass per epoch ⇒ no memorization, sampler-loss decoupling is clean, easy to debug | gender balance enforced only on average (across epochs), not per-batch — `λ_fairness` may converge slower since `Err_F` / `Err_M` estimates per step have higher variance |
+
+### What we ship
+
+**Default in `dinov3-vith16plus-3090-ibot.yaml` and `sapiens2-08b-3090.yaml` : Option A** (`sampler_strategy: gender` + `loss_importance_reweight: true`). Reasons:
+
+- On 100k samples, A is the only option without a memorization or data-discard risk.
+- A treats the F-occ confound passively via `loss_fairness_lambda: 1.0` — the explicit penalty on `|Err_F − Err_M|` in the loss. If the model picks up the shortcut, the penalty pushes back.
+- **D is the natural rival to A** — both keep each sample at ~1× per epoch, only the gender-balance mechanism differs (sampler vs loss weight). Recommended HPO axis : `Optuna over {A, D}` to pick the better convergence path empirically. The other axes (`B`, `C`) are not viable on our subset size.
+
+Optuna search-space pattern (compatible with the existing `categorical` mechanism) — add to a yaml's `optuna.search_space` :
+
+```yaml
+balancing_strategy:
+  type: categorical
+  choices: [A, D]   # B and C disabled on 100k subset
+```
+
+When the strategy is selected, `optimize.py` sets `sampler_strategy` and `loss_gender_reweight` accordingly:
+- A : `sampler_strategy: gender`, `loss_gender_reweight: false`
+- D : `sampler_strategy: none`,   `loss_gender_reweight: true`
+
+C will become the right call on a **larger dataset** (e.g. the full 752k Idemia train) — there, each bin has 5k+ samples and the multiplicity issue vanishes. Tracked as lever #14b for future work. B has a worst-of-both-worlds profile on our subset and is left out.
+
+> Known limitation : if you manually set `sampler_strategy: gender_x_occ` outside of HPO, `build_importance_weights` still computes `p_test/p_train` which is incorrect for that sampler. The B-variant formula (`n_buckets · p_test`) is not auto-selected.
+
+---
+
 ## Distribution shift train → test
 
 Per the task brief (page 3 of `example/task_brief.pdf`):
@@ -471,27 +528,42 @@ scripts/
 
 ## Roadmap — next steps
 
-### P0 — Run the baseline
-1. Download face crops to `data/crops/Crop_224_5fp_100K/`
-2. `inv train` (uses `dinov3-vits16-face-occ.yaml`) — expect `eval_score < 0.005` after a few epochs
-3. `sbatch scripts/optimize_dinov3_vith16plus_2x3090.sh` — HPO on ViT-H+/16 (no pretrain)
-4. `inv ensemble` on the best YAML — produces 5 fold models
-5. `inv predict` — emits `test_predictions.csv` for submission
+### Implemented and runnable now
 
-### P1 — Push performance
-6. **Post-hoc bias correction**: after a trained model, run `find_optimal_bias(preds_val, gt_val, gender_val)` to get `δ_F`, `δ_M`, then `inv predict --delta-f <df> --delta-m <dm>`. Free fairness fix.
-7. **Multi-architecture ensemble**: add DINOv2-base (HF, no license needed) and ConvNeXt v2-large YAMLs → ensemble across 3 backbones × 5 folds = 15 prediction sources.
-8. **Resolution upgrade to 384×384**: write a `get_image_processor(name, size=384)` variant. Drop batch by ~3×, expect −0.5 to −1.5 % on `score`.
-9. **iBOT-light pretraining + finetune A/B**: `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `chain_pretrain.sh 3`), then fill the resulting `runs:/<id>/encoder` URI into `dinov3-vith16plus-3090-ibot.yaml` and `sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh`. Compare its best `val_score` against the no-pretrain HPO from step 3.
+| # | Lever | Where | Status |
+|---|---|---|---|
+| 1 | **HPO on ViT-H+/16 baseline** | `scripts/optimize_dinov3_vith16plus_2x3090.sh` + `dinov3-vith16plus-3090.yaml` | ready |
+| 2 | **iBOT-light pretrain** on MS1MV3 | `scripts/pretrain_ibot_vith16plus_2x3090.sh` + `chain_pretrain.sh` | ready |
+| 3 | **HPO from iBOT pretrain** | `scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh` + `dinov3-vith16plus-3090-ibot.yaml` | ready (fill `init_backbone_from` after pretrain) |
+| 4 | **Sapiens2-0.8B baseline** (1B human pretrain) | `scripts/optimize_sapiens2_08b_2x3090.sh` + `sapiens2-08b-3090.yaml` | ready |
+| 5 | **Importance reweighting** `w(GT) = p_test/p_train` 20 bins | `src/utils/losses.py:build_importance_weights` + yaml `loss_importance_reweight` | ready, on by default for `*-ibot` and sapiens2 yamls |
+| 6 | **Gender-balanced sampler** `gender_x_occ` | `src/utils/losses.py:make_sampler_keys` | always on |
+| 7 | **Fairness penalty** `λ·|Err_F − Err_M|` | `src/utils/losses.py:WeightedMSELoss` | yaml `loss_fairness_lambda: 1.0` |
+| 8 | **Group-DRO** worst-group min | `src/utils/losses.py:GroupDROLoss` | yaml `loss_type: group_dro` |
+| 9 | **Post-hoc per-gender bias correction** | `src/inference/calibration.py` | `predict.py --delta-f --delta-m` |
+| 10 | **Worst-K validation analysis** | `src/evaluate_model.py:_save_worst_k` | run after training |
+| 11 | **EMA + LLRD + grad-ckpt + bf16/fp16** | `src/train.py` | yaml toggles |
 
-### P2 — Refinements
-10. **Importance reweighting** to match test distribution explicitly (compute histogram ratios).
-11. **Group-DRO**: try `loss_type: group_dro` with `group_dro_alpha ∈ {0.3, 0.5, 1.0}` if disparity persists.
-12. **Pseudo-labeling**: use ensemble predictions on test, keep extreme-confidence samples, retrain.
+### Non-implemented levers — tracked for future work
 
-### P3 — Polish
-13. (deprecated — was about DINOv3→MAE mapping, now obsolete since we use iBOT).
-14. More tests (DDP smoke test, EMA on a tiny model).
+| # | Lever | Estimated effort | Estimated ROI | Notes |
+|---|---|---|---|---|
+| 12 | **Val test-like resampling** — sample val from buckets according to `_TEST_PMF_0025` so `eval_score` becomes an honest proxy of test score | ~30 LOC in `data/dataset.py` | metric honesty + ~0.5-1% via better HPO selection | highest priority — currently `eval_score` underestimates the test gap |
+| 13 | **PMF calibration via leaderboard** — after 1 submission, fit `_TEST_PMF_*` so that `expected_score(val) ≈ leaderboard_score` | ~20 LOC + 1 submission | refines #5, ~0.3% | requires a baseline submission first |
+| 14 | **MAFA + RandomErasing with label recompute** — synthetic occluders pasted on faces, label increment proportional to area covered | ~150 LOC in `transforms.py` + helper script | ~1-2% on score | covers regime 1 (physical occlusion) gap |
+| 15 | **Quality-degradation augmentations** — blur, JPEG artifacts, noise, pixelation with proportional label increment | ~100 LOC in `transforms.py` | ~0.5-1% on score | covers regime 2 (information degradation) of the FaceOcclusion label |
+| 16 | **DINOv3 ViT-7B + LoRA** as ensemble member | ~100 LOC loader + yaml + sbatch | ensemble diversity, 0.5-1% | full FT impossible on 2×3090, LoRA only |
+| 17 | **Sapiens2-5B + LoRA** as ensemble member | similar to #16 | similar | same constraint |
+| 18 | **Multi-arch ensemble** add DINOv2-base + ConvNeXt v2-large (HF, no license) | ~2 yamls + sbatch | ensemble diversity, ~1% | low effort if compute available |
+| 19 | **Resolution upgrade 384×384** (or Sapiens2 native 1024×768) | ~50 LOC `get_image_processor` + yaml batch downsize | ~0.5-1.5% on score | 3× compute cost |
+| 20 | **SAM3-based pseudo-labeling** on CelebA/VGGFace2 for regime-1 occlusion auto-labels → `extra_train_csv` | ~200 LOC offline pipeline | uncertain, only addresses regime 1 | high effort, not yet justified |
+| 21 | **Pseudo-labeling** on `test_students.csv` using ensemble high-confidence predictions, retrain | ~80 LOC | ~0.5% if disparity is low | risk of self-confirming bias |
+| 22 | **Test-time augmentation beyond hflip** — light crop/scale TTA, ensembled | ~50 LOC in `inference/tta.py` | ~0.2-0.5% | careful with ratio regression invariance |
+| 23 | **More tests** — DDP smoke test, EMA correctness, sampler distribution checks | ~200 LOC | maintenance | nice-to-have |
+| 24 | **MIL B1 — pure per-patch head**, drop the pooled head entirely. Inference = `mean(sigmoid(patch_logits))` only | ~30 LOC (also touch `predict.py`) | possible if pooled head adds noise vs locality signal | risky : loses CLS + projection context |
+| 25 | **MIL B2 — mix at inference** `(pooled_pred + patch_pred) / 2` | ~20 LOC in `predict.py` | cheap ensemble of the two heads | only worthwhile if both heads converge to comparable performance individually |
+| 26 | **MIL B4 — learnable mix scalar `β`** at training time, inference uses `β·pooled + (1−β)·patch_pred` | ~40 LOC | clean version of B2, lets the model decide weight | requires extra trainable scalar + careful init |
+| 27 | **MIL with face mask** — exclude background patches via SAM3-derived face mask, mean over face patches only | ~80 LOC + offline mask gen | corrects the background-dilution issue in `patch_pred` | depends on SAM3 pseudo-labels (lever #20) |
 
 ---
 

@@ -1,14 +1,13 @@
-name: dinov3-vith16plus-3090-ibot
-description: DINOv3 ViT-H+/16 (600M) initialized from iBOT-pretrained encoder. 2x RTX 3090 24GB (BF16, DDP). For A/B vs dinov3-vith16plus-3090 (no pretrain).
+name: dinov3-vitb16-p100
+description: DINOv3 ViT-B/16 (86M) for fast balancing-strategy HPO on 2x P100 16GB (FP16). Param-comparable to sapiens2-01b.
 
 model:
-  model_name: dinov3_vith16plus
+  model_name: dinov3_vitb16
   output_dim: 1
   hidden_dropout_prob: 0.1
   pooling: cls
   projection_size: null
   output_activation: sigmoid
-  init_backbone_from: runs:/__FILL_PRETRAIN_RUN_ID__/encoder
 
 data:
   image_col: filename
@@ -19,10 +18,10 @@ data:
   extra_train_csv: null
 
 training:
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 16
-  gradient_accumulation_steps: 2
-  num_train_epochs: 12
+  per_device_train_batch_size: 24
+  per_device_eval_batch_size: 48
+  gradient_accumulation_steps: 1
+  num_train_epochs: 8
   learning_rate: 5.0e-05
   weight_decay: 0.05
   warmup_ratio: 0.1
@@ -33,9 +32,9 @@ training:
   logging_steps: 50
   metric_for_best_model: eval_score
   greater_is_better: false
-  bf16: true
-  fp16: false
-  gradient_checkpointing: true
+  bf16: false
+  fp16: true
+  gradient_checkpointing: false
   augmentation_level: medium
   sampler_strategy: gender
   loss_type: weighted_mse
@@ -51,10 +50,13 @@ training:
   layer_decay: 0.85
 
 optuna:
-  n_trials: 30
+  n_trials: 24
   objective_mode: score
   rotate_val_seed: true
   search_space:
+    balancing_strategy:
+      type: categorical
+      choices: [A, D, E, F]
     learning_rate:
       type: float
       low: 1.0e-05
@@ -66,8 +68,8 @@ optuna:
       high: 0.3
     num_train_epochs:
       type: int
-      low: 8
-      high: 16
+      low: 6
+      high: 12
     warmup_ratio:
       type: float
       low: 0.05
@@ -76,20 +78,16 @@ optuna:
       type: float
       low: 0.0
       high: 0.3
-    pooling:
-      type: categorical
-      choices: [cls, mean, attention]
     augmentation_level:
       type: categorical
       choices: [light, medium, strong]
-    loss_focal_gamma:
+    loss_fairness_lambda:
       type: float
       low: 0.0
       high: 2.0
-    loss_fairness_lambda:
-      type: float
-      low: 0.5
-      high: 2.0
+    loss_patch_mil_alpha:
+      type: categorical
+      choices: [0.0, 0.5, 1.0]
     layer_decay:
       type: float
       low: 0.65

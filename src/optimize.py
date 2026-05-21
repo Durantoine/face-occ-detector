@@ -44,11 +44,24 @@ _TRAINING_KEYS = {
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level", "ema_decay", "layer_decay",
     "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
+    "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
+    "loss_patch_mil_alpha", "loss_type", "group_dro_alpha",
 }
 _MODEL_KEYS = {"hidden_dropout_prob", "pooling", "projection_size", "output_activation"}
 
+_BALANCING_STRATEGY_MAP = {
+    "A": {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False},
+    "D": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False},
+    "E": {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True},
+    "F": {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False},
+}
+
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
+    if name == "balancing_strategy":
+        for k, v in _BALANCING_STRATEGY_MAP[str(value)].items():
+            cfg["training"][k] = v
+        return
     if name in _TRAINING_KEYS:
         cfg["training"][name] = value
         if name == "per_device_train_batch_size":
@@ -140,9 +153,9 @@ def objective(
         os.environ["MLFLOW_RUN_ID"] = run_id
     os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
 
-    eval_loss, score, err_diff = float("inf"), float("inf"), float("inf")
+    eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
     try:
-        eval_loss, score, err_diff, _ = train(
+        eval_loss, score, err_diff, _, err_F, err_M = train(
             architecture_name=arch_name,
             output_dir=f"./results/optuna_{base_arch}_trial_{trial_data['n']}",
             mlflow_tracking_uri=tracking_uri,
@@ -152,12 +165,19 @@ def objective(
             test_data_csv=test_data_csv,
         )
         if is_main() and client and run_id:
-            for k, v in [("final_eval_loss", eval_loss), ("best_score", score), ("err_diff", err_diff)]:
+            for k, v in [
+                ("final_eval_loss", eval_loss), ("best_score", score),
+                ("err_diff", err_diff), ("err_F", err_F), ("err_M", err_M),
+            ]:
                 client.log_metric(run_id, k, v)
             client.set_terminated(run_id, "FINISHED")
-            print(f"Trial {trial_data['n']}: score={score:.5f} err_diff={err_diff:.5f}")
+            print(f"Trial {trial_data['n']}: score={score:.5f} err_F={err_F:.5f} err_M={err_M:.5f} err_diff={err_diff:.5f}")
+        trial.set_user_attr("err_F", float(err_F))
+        trial.set_user_attr("err_M", float(err_M))
+        trial.set_user_attr("err_diff", float(err_diff))
+        trial.set_user_attr("eval_loss", float(eval_loss))
     except Exception:
-        eval_loss, score, err_diff = float("inf"), float("inf"), float("inf")
+        eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
         if is_main():
             import traceback
             traceback.print_exc()

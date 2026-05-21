@@ -5,6 +5,8 @@ import torch.nn as nn
 from transformers import AutoModel
 
 from src.models.dinov3_loader import hidden_size_of, load_dinov3
+from src.models.sapiens2_loader import hidden_size_of as sapiens2_hidden_size_of
+from src.models.sapiens2_loader import is_sapiens2, load_sapiens2
 
 
 def _is_dinov3(model_name: str) -> bool:
@@ -15,14 +17,20 @@ def _build_backbone(model_name: str) -> Tuple[nn.Module, int]:
     if _is_dinov3(model_name):
         backbone = load_dinov3(model_name)
         return backbone, hidden_size_of(model_name)
-    backbone = AutoModel.from_pretrained(model_name)
+    if is_sapiens2(model_name):
+        backbone = load_sapiens2(model_name)
+        return backbone, sapiens2_hidden_size_of(model_name)
+    backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     return backbone, backbone.config.hidden_size
 
 
 def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
     if hasattr(backbone, "get_intermediate_layers"):
         return backbone.get_intermediate_layers(pixel_values, n=1)[0]
-    return backbone(pixel_values=pixel_values).last_hidden_state
+    out = backbone(pixel_values)
+    if isinstance(out, (tuple, list)):
+        return out[0]
+    return out.last_hidden_state if hasattr(out, "last_hidden_state") else out
 
 
 class FaceOccRegressor(nn.Module):
@@ -59,11 +67,12 @@ class FaceOccRegressor(nn.Module):
         self.attention_pool: Optional[nn.Linear] = nn.Linear(hidden_size, 1) if pooling == "attention" else None
         self.dropout = nn.Dropout(hidden_dropout_prob)
         self.head = nn.Linear(final_size, output_dim)
+        self.patch_head: nn.Linear = nn.Linear(hidden_size, 1)
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in (self.head, self.attention_pool):
+        for m in (self.head, self.attention_pool, self.patch_head):
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
@@ -95,17 +104,21 @@ class FaceOccRegressor(nn.Module):
         if hasattr(self.backbone, "gradient_checkpointing_enable"):
             self.backbone.gradient_checkpointing_enable(**kwargs)
             return
-        if hasattr(self.backbone, "blocks"):
-            from torch.utils.checkpoint import checkpoint as ckpt
-            for block in self.backbone.blocks:
-                orig = block.forward
+        blocks_attr = next((a for a in ("blocks", "layers") if hasattr(self.backbone, a)), None)
+        if blocks_attr is None:
+            print(f"[FaceOccRegressor] WARNING: cannot enable gradient_checkpointing (backbone has neither .blocks nor .layers)")
+            return
+        from torch.utils.checkpoint import checkpoint as ckpt
+        blocks = getattr(self.backbone, blocks_attr)
+        for block in blocks:
+            orig = block.forward
 
-                def _wrap(orig_forward):
-                    def _ckpt_forward(*args, **kw):
-                        return ckpt(orig_forward, *args, use_reentrant=False, **kw)
-                    return _ckpt_forward
-                block.forward = _wrap(orig)
-            print(f"[FaceOccRegressor] gradient_checkpointing enabled on {len(self.backbone.blocks)} blocks")
+            def _wrap(orig_forward):
+                def _ckpt_forward(*args, **kw):
+                    return ckpt(orig_forward, *args, use_reentrant=False, **kw)
+                return _ckpt_forward
+            block.forward = _wrap(orig)
+        print(f"[FaceOccRegressor] gradient_checkpointing enabled on {len(blocks)} {blocks_attr}")
 
     def gradient_checkpointing_disable(self) -> None:
         if hasattr(self.backbone, "gradient_checkpointing_disable"):
@@ -123,7 +136,11 @@ class FaceOccRegressor(nn.Module):
         pooled = self.dropout(pooled)
         logits = self.head(pooled)
         pred = self._activate(logits).squeeze(-1) if self.output_dim == 1 else self._activate(logits)
-        return {"logits": pred}
+
+        patch_logits = self.patch_head(hidden[:, 1:, :]).squeeze(-1)
+        patch_pred = torch.sigmoid(patch_logits).mean(dim=1)
+
+        return {"logits": pred, "patch_pred": patch_pred}
 
     @classmethod
     def load_from_mlflow(cls, model_uri: str, output_dim: Optional[int] = None) -> "FaceOccRegressor":

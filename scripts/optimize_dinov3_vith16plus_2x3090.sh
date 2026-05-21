@@ -23,7 +23,7 @@ TORCHRUN="${VENV_DIR}/bin/torchrun"
 
 cd "${PROJECT_DIR}"
 
-export UV_PYTHON=python3.11
+export UV_PYTHON=python3.12
 export UV_PYTHON_DOWNLOADS=automatic
 export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
 uv sync --no-dev

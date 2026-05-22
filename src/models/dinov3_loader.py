@@ -35,6 +35,28 @@ def hidden_size_of(arch: str) -> int:
     return _HIDDEN_SIZES[arch]
 
 
+def _set_drop_path_rate(model: torch.nn.Module, drop_path_rate: float) -> None:
+    """Override stochastic depth in DINOv3 ViT blocks via linear scaling 0 → drop_path_rate.
+
+    DINOv3 uses sample-level stochastic depth stored as `block.sample_drop_ratio` (not
+    a DropPath module). We mutate that attribute directly.
+    """
+    if drop_path_rate <= 0 or not hasattr(model, "blocks"):
+        return
+    blocks = list(model.blocks)
+    n = max(len(blocks) - 1, 1)
+    applied = 0
+    for i, block in enumerate(blocks):
+        target = drop_path_rate * i / n
+        if hasattr(block, "sample_drop_ratio"):
+            block.sample_drop_ratio = target
+            applied += 1
+    if applied == 0:
+        print(f"WARNING: backbone_drop_path_rate={drop_path_rate} requested but blocks have no sample_drop_ratio attribute (no-op)")
+    else:
+        print(f"DINOv3 drop_path_rate={drop_path_rate} applied (linear 0 → {drop_path_rate:.3f} across {applied} blocks via sample_drop_ratio)")
+
+
 def load_dinov3(
     arch: str = "dinov3_vits16",
     device: Optional[torch.device] = None,
@@ -43,10 +65,8 @@ def load_dinov3(
     if not _REPO.exists():
         raise FileNotFoundError(f"DINOv3 repo not found at {_REPO}")
 
-    hub_kwargs: Any = {"source": "local", "pretrained": False}
-    if drop_path_rate > 0:
-        hub_kwargs["drop_path_rate"] = drop_path_rate
-    model = torch.hub.load(str(_REPO), arch, **hub_kwargs)
+    model = torch.hub.load(str(_REPO), arch, source="local", pretrained=False)
+    _set_drop_path_rate(model, drop_path_rate)
 
     weights_path = _AVAILABLE_WEIGHTS.get(arch)
     if weights_path and weights_path.exists():

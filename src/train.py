@@ -260,7 +260,14 @@ def _save_model_to_mlflow(
         mlflow.end_run()
     mlflow.start_run(run_id=run_id)
 
-    raw = _unwrap(trainer.model).cpu() if not hasattr(trainer, "accelerator") or not trainer.accelerator else trainer.accelerator.unwrap_model(trainer.model).cpu()
+    if hasattr(trainer, "accelerator") and trainer.accelerator:
+        try:
+            raw = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper=False)
+        except TypeError:
+            raw = trainer.accelerator.unwrap_model(trainer.model)
+    else:
+        raw = _unwrap(trainer.model)
+    raw = raw.to(torch.float32).cpu()
 
     _orig = _nn.Module.__dict__.get("__getstate__")
     _nn.Module.__getstate__ = lambda self: {k: v for k, v in self.__dict__.items()}

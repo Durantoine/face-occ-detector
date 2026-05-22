@@ -312,32 +312,27 @@ Following the same pattern as `online-polarization-detector` (which tested `none
 
 | Option | Sampler | Loss weights | Pro | Con (especially on our 100k subset) |
 |---|---|---|---|---|
-| **A** (current default) | `gender` (balance F/M only, occ natural) | `w_imp = p_test / p_train` | each sample seen ~1× per epoch, no over-fit risk on rare bins, uses 100 % of train data | does NOT decorrelate gender × occ at the batch level — model can still learn the shortcut, mitigated only by `loss_fairness_lambda` |
-| **B** | `gender_x_occ` (uniform over 20 bins × 2 genders) | `w_imp = n_buckets · p_test` | hard decorrelation of (gender × occ) at the batch level, kills the shortcut | bins 17-19 have only 19/62/51 samples each → drawn 100+ times per epoch → memorization; bin 0's 32k samples drawn 0.15×/epoch |
-| **C** | `test_like_x_gender` (sample occ ∝ `_TEST_PMF_0025`, gender 50/50 within each bin) | `w_imp = 1` (sampler does the shift) | conceptually cleanest, batch ≈ test distribution, no double correction | mid-occ samples (bins 5-13, ~1500-5000 unique each) drawn 2-3× per epoch → memorization over 12 epochs; bins 17-19 (132 samples total) never drawn → discarded |
+| **A** (default) | `gender` (balance F/M only, occ natural) | `w_imp = p_test / p_train` | each sample seen ~1× per epoch, no over-fit risk on rare bins, uses 100 % of train data | does NOT decorrelate gender × occ at the batch level — model can still learn the shortcut, mitigated only by `loss_fairness_lambda` |
+| **B** | `gender_x_occ` (uniform over 20 bins × 2 genders) | `w_imp = n_buckets · p_test` | hard decorrelation of (gender × occ) at the batch level, kills the shortcut | bins 17-19 have only 19/62/51 samples each → drawn 100+ times per epoch → memorization; bin 0's 32k samples drawn 0.15×/epoch — **excluded from HPO** |
+| **C** | `test_like_x_gender` (sample occ ∝ `_TEST_PMF_0025`, gender 50/50 within each bin) | `w_imp = 1` (sampler does the shift) | conceptually cleanest, batch ≈ test distribution, no double correction | mid-occ samples (bins 5-13) drawn 2-3× per epoch → memorization; bins 17-19 jamais drawn → 132 samples discarded — **excluded from HPO** |
 | **D** (loss-only) | `none` (natural train distribution, each sample 1× per epoch) | `w_imp = p_test / p_train`  ×  `w_gender = [1/(2·p_F), 1/(2·p_M)]` per sample | strict 100 % data coverage (no replacement), single-pass per epoch ⇒ no memorization, sampler-loss decoupling is clean, easy to debug | gender balance enforced only on average (across epochs), not per-batch — `λ_fairness` may converge slower since `Err_F` / `Err_M` estimates per step have higher variance |
+| **E** (cell-reweight) | `none` | per-cell `w_cell(g, b) = 1/sqrt(count(g, b))` normalized over the **2 × 20 = 40 cells** | hard decorrelation of (gender × occ) **dans le gradient** (chaque case `(g,b)` contribue identiquement au loss), **sans** sur-tirer des cellules rares physiquement | bins ultra-rares (count<20) ont des poids ~5× la moyenne → bruit sur la loss au début ; pas de `w_imp` sur l'axe occ → on n'aligne pas explicitement sur la distribution test |
+| **F** (mix inverse de A) | `occlusion` (quantile, 10 buckets équi-effectifs) | `w_gender` only | sampler couvre l'axe occ via quantiles équilibrés (chaque sample vu ~1× par epoch, pas de cellules micro), gender ré-équilibré par loss seul | bucketing par **quantiles** ≠ bucketing par **GT-bins** → ne matche pas la distribution test sur l'axe occ aussi finement que `w_imp` ; gender balance moins fort que sampler `gender` |
 
 ### What we ship
 
-**Default in `dinov3-vith16plus-3090-ibot.yaml` and `sapiens2-08b-3090.yaml` : Option A** (`sampler_strategy: gender` + `loss_importance_reweight: true`). Reasons:
+**Default in active yamls : Option A** (`sampler_strategy: gender` + `loss_importance_reweight: true`). Optuna teste les **4 stratégies viables `{A, D, E, F}`** sur chaque petit modèle (vitb16, sapiens2-01b) via le categorical `balancing_strategy` du `optuna.search_space`.
 
-- On 100k samples, A is the only option without a memorization or data-discard risk.
-- A treats the F-occ confound passively via `loss_fairness_lambda: 1.0` — the explicit penalty on `|Err_F − Err_M|` in the loss. If the model picks up the shortcut, the penalty pushes back.
-- **D is the natural rival to A** — both keep each sample at ~1× per epoch, only the gender-balance mechanism differs (sampler vs loss weight). Recommended HPO axis : `Optuna over {A, D}` to pick the better convergence path empirically. The other axes (`B`, `C`) are not viable on our subset size.
+Mapping géré dans [optimize.py:_BALANCING_STRATEGY_MAP](src/optimize.py) :
 
-Optuna search-space pattern (compatible with the existing `categorical` mechanism) — add to a yaml's `optuna.search_space` :
+| Strat | `sampler_strategy` | `loss_importance_reweight` | `loss_gender_reweight` | `loss_cell_reweight` |
+|---|---|---|---|---|
+| A | `gender` | true | false | false |
+| D | `none` | true | true | false |
+| E | `none` | false | false | true |
+| F | `occlusion` | false | true | false |
 
-```yaml
-balancing_strategy:
-  type: categorical
-  choices: [A, D]   # B and C disabled on 100k subset
-```
-
-When the strategy is selected, `optimize.py` sets `sampler_strategy` and `loss_gender_reweight` accordingly:
-- A : `sampler_strategy: gender`, `loss_gender_reweight: false`
-- D : `sampler_strategy: none`,   `loss_gender_reweight: true`
-
-C will become the right call on a **larger dataset** (e.g. the full 752k Idemia train) — there, each bin has 5k+ samples and the multiplicity issue vanishes. Tracked as lever #14b for future work. B has a worst-of-both-worlds profile on our subset and is left out.
+C deviendra le bon choix sur un **dataset plus grand** (full 752k Idemia) — là, chaque bin a 5k+ samples et le problème de multiplicité disparaît. Tracé comme levier #14b. B a un worst-of-both-worlds profil sur notre subset et est laissé out.
 
 > Known limitation : if you manually set `sampler_strategy: gender_x_occ` outside of HPO, `build_importance_weights` still computes `p_test/p_train` which is incorrect for that sampler. The B-variant formula (`n_buckets · p_test`) is not auto-selected.
 

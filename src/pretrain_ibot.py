@@ -21,7 +21,7 @@ CONFIG: Dict[str, Any] = {
     "arch": os.environ.get("FACE_OCC_PRETRAIN_ARCH", "dinov3_vith16plus"),
     "data_source": os.environ.get("FACE_OCC_PRETRAIN_SRC", "data/pretrain/"),
     "wds_pattern": None,
-    "output_dir": "./results/pretrain",
+    "output_dir": os.environ.get("FACE_OCC_PRETRAIN_OUT", "./results/pretrain"),
     "tracking_uri": "sqlite:///mlflow.db",
     "mlflow_experiment": "face-occ-pretrain",
     "num_train_epochs": 30,
@@ -319,11 +319,14 @@ def pretrain_ibot(
     if rank != 0:
         return ""
 
-    student = (
-        trainer.accelerator.unwrap_model(trainer.model).student
-        if hasattr(trainer, "accelerator") and trainer.accelerator
-        else trainer.model.student
-    ).cpu()
+    if hasattr(trainer, "accelerator") and trainer.accelerator:
+        try:
+            wrapped = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper=False)
+        except TypeError:
+            wrapped = trainer.accelerator.unwrap_model(trainer.model)
+    else:
+        wrapped = trainer.model
+    student = wrapped.student.to(torch.float32).cpu()
     info = mlflow.pytorch.log_model(student, "encoder")
     encoder_uri = info.model_uri
     print(f"Student encoder saved: {encoder_uri}")

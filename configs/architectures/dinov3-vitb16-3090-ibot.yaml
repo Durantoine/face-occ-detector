@@ -46,6 +46,7 @@ training:
   loss_cell_reweight: false
   loss_patch_mil_alpha: 0.0
   eval_importance_reweight: true
+  save_worst_k: 30
   group_dro_alpha: 0.5
   ema_decay: 0.9998
   ema_warmup_steps: 200
@@ -62,7 +63,7 @@ optuna:
     loss_patch_mil_alpha:
       type: float
       low: 0.0
-      high: 1.5
+      high: 1.0
     learning_rate:
       type: float
       low: 1.0e-05

@@ -286,6 +286,36 @@ Honest postmortem: the previous iterations of this project anchored on "MAE" ear
 
 ---
 
+## Monitoring UIs (MLflow + Optuna) — SLURM workflow
+
+Le gateway `gpu-gw` n'a pas assez de RAM pour faire tourner MLflow UI directement (`Killed` au démarrage). Solution : lancer les UIs sur la partition `CPU` (10 nœuds, 4-day timelimit, pas de QOS GPU) et port-forward depuis ton laptop.
+
+**One-liner pour tout lancer :**
+
+```bash
+# Sur le cluster:
+./scripts/launch_ui.sh
+```
+
+Le script :
+1. `sbatch scripts/mlflow_ui.sh` et `scripts/optuna_dashboard.sh` sur la partition `CPU`
+2. Poll `squeue` jusqu'à voir les 2 jobs `RUNNING`
+3. Extrait les hostnames des nœuds alloués
+4. Imprime la commande **`ssh -L ... gpu-gw`** à copy-paste sur ton laptop
+
+Output type :
+```
+ssh -N -L 5000:nodecpu03:5000 -L 8080:nodecpu05:8080 adurand-25@gpu-gw
+```
+
+Sur ton laptop, après le `ssh -N` (qui reste ouvert) :
+- `http://localhost:5000` → MLflow UI
+- `http://localhost:8080` → Optuna dashboard
+
+Stop avec `scancel <job-ids>` (le script les imprime). Les jobs CPU durent jusqu'à 24h par défaut (modifiable via `#SBATCH --time` dans le sbatch).
+
+---
+
 ## Sampler × loss-weight design — the F-occ confound
 
 ### The two-axis imbalance
@@ -559,6 +589,8 @@ scripts/
 | 25 | **MIL B2 — mix at inference** `(pooled_pred + patch_pred) / 2` | ~20 LOC in `predict.py` | cheap ensemble of the two heads | only worthwhile if both heads converge to comparable performance individually |
 | 26 | **MIL B4 — learnable mix scalar `β`** at training time, inference uses `β·pooled + (1−β)·patch_pred` | ~40 LOC | clean version of B2, lets the model decide weight | requires extra trainable scalar + careful init |
 | 27 | **MIL with face mask** — exclude background patches via SAM3-derived face mask, mean over face patches only | ~80 LOC + offline mask gen | corrects the background-dilution issue in `patch_pred` | depends on SAM3 pseudo-labels (lever #20) |
+| 28 | **Per-patch 2-channel decomposition** — per patch: `(occ_p, valid_p) = (sigmoid(head_occ), sigmoid(head_valid))`. Global ratio = `Σ occ_p · valid_p / Σ valid_p`. Adds sparsity regularizer `λ_sparsity · max(0, mean(valid_p) − 0.85)` to force ~15 % background suppression without external face mask. Identifiable by construction (vs the 3-class permutation idea which suffers from inter-image inconsistency). | ~80 LOC in `face_occ_classifier.py` + `losses.py` | force la localisation valid/invalid sans dépendance externe, capture l'intuition "patches utiles seulement" | encore underdetermined sans face mask (modèle peut tricher valid=1 partout) — la régul sparsity est un workaround soft |
+| 29 | **Rich pooling head** — remplace le mean/cls/attention single-query par une tête plus expressive consommant **tous** les patch embeddings, pas juste un résumé. Options : (a) **multi-head attention pooling** avec K=8 queries learnables (Perceiver-style), (b) **conv head** qui reshape `(B, N, D) → (B, D, H, W)` puis Conv2D, (c) **mini-transformer head** 1-2 layers au-dessus. Bénéfice : moins de perte info → patch coarseness moins problématique car le réseau exploite la richesse de chaque embedding. | ~20-50 LOC dans `face_occ_classifier.py` | gain attendu si le HPO actuel montre `pooling: attention` > `mean` ; bonne réponse au problème "patch trop grossier" en gardant toute l'info par patch | ajoute des params (10-100k) ; redondant avec le ViT self-attention pour les cas où pooled simple suffit |
 
 ---
 

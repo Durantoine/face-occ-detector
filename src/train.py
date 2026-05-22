@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
@@ -59,7 +60,7 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_patch_mil_alpha", "eval_importance_reweight",
+    "loss_patch_mil_alpha", "eval_importance_reweight", "save_worst_k",
     "group_dro_alpha", "layer_decay",
 }
 
@@ -122,10 +123,13 @@ class WeightedMSETrainer(Trainer):
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         self.loss_fct = self.loss_fct.to(preds.device)
-        loss = self.loss_fct(preds, labels)
-        if self._patch_mil_alpha > 0 and isinstance(outputs, dict) and "patch_pred" in outputs:
+        main_loss = self.loss_fct(preds, labels)
+        alpha = self._patch_mil_alpha
+        if alpha > 0 and isinstance(outputs, dict) and "patch_pred" in outputs:
             aux = self.loss_fct(outputs["patch_pred"], labels)
-            loss = loss + self._patch_mil_alpha * aux
+            loss = (1.0 - alpha) * main_loss + alpha * aux
+        else:
+            loss = main_loss
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self) -> torch.optim.Optimizer:
@@ -531,6 +535,58 @@ def train(
     err_F = eval_results.get("eval_err_F", 0.0)
     err_M = eval_results.get("eval_err_M", 0.0)
     print(f"score={eval_score:.5f} | err_diff={err_diff:.5f} | loss={eval_loss:.5f}")
+
+    save_worst_k = int(train_cfg.get("save_worst_k", 0))
+    if save_worst_k > 0 and trainer.is_world_process_zero():
+        try:
+            pred_out = trainer.predict(val_dataset)
+            preds_raw = pred_out.predictions
+            if isinstance(preds_raw, (tuple, list)):
+                preds_raw = preds_raw[0]
+            preds = np.asarray(preds_raw).astype(np.float64).flatten()
+            labels = np.asarray(pred_out.label_ids).astype(np.float64)
+            gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
+            gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
+            w = 1.0 / 30.0 + gt
+            per_sample_err = w * (preds - gt) ** 2
+            order = np.argsort(-per_sample_err)[:save_worst_k]
+            paths = val_data.iloc[order]["image_path"].values if "image_path" in val_data.columns else None
+            worst_df = pd.DataFrame({
+                "rank": np.arange(1, len(order) + 1),
+                "filename": paths if paths is not None else order,
+                "gt": gt[order],
+                "pred": preds[order],
+                "abs_err": np.abs(preds[order] - gt[order]),
+                "weighted_err": per_sample_err[order],
+                "gender": gender[order],
+            })
+            worst_dir = Path(output_dir) / "worst"
+            worst_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = worst_dir / "worst.csv"
+            worst_df.to_csv(csv_path, index=False)
+            img_dir = worst_dir / "images"
+            img_dir.mkdir(exist_ok=True)
+            if paths is not None:
+                base = Path(image_base_dir) if image_base_dir else None
+                for rank, row in enumerate(worst_df.itertuples(index=False), start=1):
+                    src = Path(row.filename)
+                    if base and not src.is_absolute():
+                        src = base / row.filename
+                    if not src.exists():
+                        continue
+                    dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
+                    if dst.exists():
+                        dst.unlink()
+                    try:
+                        dst.symlink_to(src.resolve())
+                    except OSError:
+                        import shutil
+                        shutil.copy(src, dst)
+            print(f"Saved {len(worst_df)} worst predictions: {csv_path} + {img_dir}")
+            if use_mlflow and use_client and client and run_id:
+                client.log_artifacts(run_id, str(worst_dir), "worst")
+        except Exception as e:
+            print(f"WARNING: could not save worst-K: {e}")
 
     if test_data_csv and trainer.is_world_process_zero():
         try:

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch MLflow UI + Optuna Dashboard as SLURM jobs, wait for them to start,
+# Launch the combined MLflow + Optuna UI as a single SLURM job, wait for it to start,
 # then print the ssh-tunnel command to copy/paste on your laptop.
 #
 # Usage: ./scripts/launch_ui.sh
@@ -12,47 +12,42 @@ GATEWAY="${GATEWAY:-adurand-25@gpu-gw}"
 
 cd "$(dirname "$0")/.."
 
-ML_JOB=$(sbatch --parsable scripts/mlflow_ui.sh)
-OP_JOB=$(sbatch --parsable scripts/optuna_dashboard.sh)
-echo "Submitted: MLflow job=${ML_JOB}, Optuna job=${OP_JOB}"
-echo "Waiting for both jobs to be RUNNING..."
+UI_JOB=$(sbatch --parsable scripts/ui.sh)
+echo "Submitted: UI job=${UI_JOB}"
+echo "Waiting for job to be RUNNING..."
 
 extract_node() {
-    # Only return node when job is RUNNING (state R), else empty
     squeue -j "$1" -h -t RUNNING -o '%N' 2>/dev/null | head -1
 }
 
 for i in {1..60}; do
-    ML_NODE=$(extract_node "$ML_JOB")
-    OP_NODE=$(extract_node "$OP_JOB")
-    if [[ -n "$ML_NODE" && -n "$OP_NODE" ]]; then
+    UI_NODE=$(extract_node "$UI_JOB")
+    if [[ -n "$UI_NODE" ]]; then
         break
     fi
-    echo "  ... waiting (mlflow=${ML_NODE:-pending}, optuna=${OP_NODE:-pending})"
+    echo "  ... waiting (state: $(squeue -j $UI_JOB -h -o '%T' 2>/dev/null || echo gone))"
     sleep 5
 done
 
-if [[ -z "$ML_NODE" || -z "$OP_NODE" ]]; then
-    echo "TIMEOUT: jobs still pending after 5 min. Check 'squeue --me'." >&2
+if [[ -z "$UI_NODE" ]]; then
+    echo "TIMEOUT: job still pending after 5 min. Check 'squeue --me'." >&2
     exit 1
 fi
 
 cat <<EOF
 
 ================================================================================
-UIs running:
-  MLflow  → ${ML_NODE}:${MLFLOW_PORT}     (job ${ML_JOB})
-  Optuna  → ${OP_NODE}:${OPTUNA_PORT}     (job ${OP_JOB})
+UI running on ${UI_NODE} (job ${UI_JOB})
 
 Copy-paste this on your LAPTOP:
 
-  ssh -N -L ${MLFLOW_PORT}:${ML_NODE}:${MLFLOW_PORT} -L ${OPTUNA_PORT}:${OP_NODE}:${OPTUNA_PORT} ${GATEWAY}
+  ssh -N -L ${MLFLOW_PORT}:${UI_NODE}:${MLFLOW_PORT} -L ${OPTUNA_PORT}:${UI_NODE}:${OPTUNA_PORT} ${GATEWAY}
 
 Then open in your browser:
   http://localhost:${MLFLOW_PORT}     (MLflow)
   http://localhost:${OPTUNA_PORT}     (Optuna dashboard)
 
-Stop the UIs:
-  scancel ${ML_JOB} ${OP_JOB}
+Stop the UI:
+  scancel ${UI_JOB}
 ================================================================================
 EOF

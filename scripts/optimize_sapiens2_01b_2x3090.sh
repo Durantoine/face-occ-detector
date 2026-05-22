@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-sapiens2-01b-optuna
+#SBATCH --job-name=face-occ-sapiens2-01b-v2-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -35,7 +35,7 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
-export FACE_OCC_ARCH=sapiens2-01b-3090
+export FACE_OCC_ARCH=sapiens2-01b-3090-v2
 
 mkdir -p scripts/logs
 

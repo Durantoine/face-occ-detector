@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-vitb16-optuna-ibot
+#SBATCH --job-name=face-occ-vitb16-v2-ibot-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -34,7 +34,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
-export FACE_OCC_ARCH=dinov3-vitb16-3090-ibot
+export FACE_OCC_ARCH=dinov3-vitb16-3090-v2-ibot
 
 mkdir -p scripts/logs
 

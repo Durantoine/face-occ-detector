@@ -544,56 +544,64 @@ def train(
     print(f"score={eval_score:.5f} | err_diff={err_diff:.5f} | loss={eval_loss:.5f}")
 
     save_worst_k = int(train_cfg.get("save_worst_k", 0))
-    if save_worst_k > 0 and trainer.is_world_process_zero():
+    if save_worst_k > 0:
+        # IMPORTANT: trainer.predict is a DDP collective — ALL ranks must call it,
+        # only rank 0 processes the result. Gating predict() on rank 0 only
+        # → other ranks skip the collective → NCCL timeout deadlock.
         try:
             pred_out = trainer.predict(val_dataset)
-            preds_raw = pred_out.predictions
-            if isinstance(preds_raw, (tuple, list)):
-                preds_raw = preds_raw[0]
-            preds = np.asarray(preds_raw).astype(np.float64).flatten()
-            labels = np.asarray(pred_out.label_ids).astype(np.float64)
-            gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
-            gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
-            w = 1.0 / 30.0 + gt
-            per_sample_err = w * (preds - gt) ** 2
-            order = np.argsort(-per_sample_err)[:save_worst_k]
-            paths = val_data.iloc[order]["image_path"].values if "image_path" in val_data.columns else None
-            worst_df = pd.DataFrame({
-                "rank": np.arange(1, len(order) + 1),
-                "filename": paths if paths is not None else order,
-                "gt": gt[order],
-                "pred": preds[order],
-                "abs_err": np.abs(preds[order] - gt[order]),
-                "weighted_err": per_sample_err[order],
-                "gender": gender[order],
-            })
-            worst_dir = Path(output_dir) / "worst"
-            worst_dir.mkdir(parents=True, exist_ok=True)
-            csv_path = worst_dir / "worst.csv"
-            worst_df.to_csv(csv_path, index=False)
-            img_dir = worst_dir / "images"
-            img_dir.mkdir(exist_ok=True)
-            if paths is not None:
-                base = Path(image_base_dir) if image_base_dir else None
-                for rank, row in enumerate(worst_df.itertuples(index=False), start=1):
-                    src = Path(row.filename)
-                    if base and not src.is_absolute():
-                        src = base / row.filename
-                    if not src.exists():
-                        continue
-                    dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
-                    if dst.exists():
-                        dst.unlink()
-                    try:
-                        dst.symlink_to(src.resolve())
-                    except OSError:
-                        import shutil
-                        shutil.copy(src, dst)
-            print(f"Saved {len(worst_df)} worst predictions: {csv_path} + {img_dir}")
-            if use_mlflow and use_client and client and run_id:
-                client.log_artifacts(run_id, str(worst_dir), "worst")
         except Exception as e:
-            print(f"WARNING: could not save worst-K: {e}")
+            print(f"WARNING: trainer.predict failed: {e}")
+            pred_out = None
+        if pred_out is not None and trainer.is_world_process_zero():
+            try:
+                preds_raw = pred_out.predictions
+                if isinstance(preds_raw, (tuple, list)):
+                    preds_raw = preds_raw[0]
+                preds = np.asarray(preds_raw).astype(np.float64).flatten()
+                labels = np.asarray(pred_out.label_ids).astype(np.float64)
+                gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
+                gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
+                w = 1.0 / 30.0 + gt
+                per_sample_err = w * (preds - gt) ** 2
+                order = np.argsort(-per_sample_err)[:save_worst_k]
+                paths = val_data.iloc[order]["image_path"].values if "image_path" in val_data.columns else None
+                worst_df = pd.DataFrame({
+                    "rank": np.arange(1, len(order) + 1),
+                    "filename": paths if paths is not None else order,
+                    "gt": gt[order],
+                    "pred": preds[order],
+                    "abs_err": np.abs(preds[order] - gt[order]),
+                    "weighted_err": per_sample_err[order],
+                    "gender": gender[order],
+                })
+                worst_dir = Path(output_dir) / "worst"
+                worst_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = worst_dir / "worst.csv"
+                worst_df.to_csv(csv_path, index=False)
+                img_dir = worst_dir / "images"
+                img_dir.mkdir(exist_ok=True)
+                if paths is not None:
+                    base = Path(image_base_dir) if image_base_dir else None
+                    for rank, row in enumerate(worst_df.itertuples(index=False), start=1):
+                        src = Path(row.filename)
+                        if base and not src.is_absolute():
+                            src = base / row.filename
+                        if not src.exists():
+                            continue
+                        dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
+                        if dst.exists():
+                            dst.unlink()
+                        try:
+                            dst.symlink_to(src.resolve())
+                        except OSError:
+                            import shutil
+                            shutil.copy(src, dst)
+                print(f"Saved {len(worst_df)} worst predictions: {csv_path} + {img_dir}")
+                if use_mlflow and use_client and client and run_id:
+                    client.log_artifacts(run_id, str(worst_dir), "worst")
+            except Exception as e:
+                print(f"WARNING: could not save worst-K: {e}")
 
     if test_data_csv and trainer.is_world_process_zero():
         try:

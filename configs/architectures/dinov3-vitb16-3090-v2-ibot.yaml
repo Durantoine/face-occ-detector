@@ -1,4 +1,4 @@
-name: dinov3-vitb16-3090-ibot-v2
+name: dinov3-vitb16-3090-v2-ibot
 description: DINOv3 ViT-B/16 (86M) initialized from iBOT-pretrained encoder on MS1MV3 (50k steps @112). 2x RTX 3090 24GB (BF16, DDP). A/B comparison vs dinov3-vitb16-3090 (no pretrain).
 
 model:

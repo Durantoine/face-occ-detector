@@ -18,21 +18,21 @@ echo "Submitted: MLflow job=${ML_JOB}, Optuna job=${OP_JOB}"
 echo "Waiting for both jobs to be RUNNING..."
 
 extract_node() {
-    squeue -j "$1" -h -o '%R' 2>/dev/null | head -1
+    # Only return node when job is RUNNING (state R), else empty
+    squeue -j "$1" -h -t RUNNING -o '%N' 2>/dev/null | head -1
 }
 
 for i in {1..60}; do
     ML_NODE=$(extract_node "$ML_JOB")
     OP_NODE=$(extract_node "$OP_JOB")
-    if [[ -n "$ML_NODE" && "$ML_NODE" != "(Resources)" && "$ML_NODE" != "(Priority)" \
-       && -n "$OP_NODE" && "$OP_NODE" != "(Resources)" && "$OP_NODE" != "(Priority)" ]]; then
+    if [[ -n "$ML_NODE" && -n "$OP_NODE" ]]; then
         break
     fi
     echo "  ... waiting (mlflow=${ML_NODE:-pending}, optuna=${OP_NODE:-pending})"
     sleep 5
 done
 
-if [[ "$ML_NODE" == "(Resources)" || "$ML_NODE" == "(Priority)" || -z "$ML_NODE" ]]; then
+if [[ -z "$ML_NODE" || -z "$OP_NODE" ]]; then
     echo "TIMEOUT: jobs still pending after 5 min. Check 'squeue --me'." >&2
     exit 1
 fi

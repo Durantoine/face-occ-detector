@@ -286,6 +286,118 @@ Honest postmortem: the previous iterations of this project anchored on "MAE" ear
 
 ---
 
+## Branches
+
+- **`main`** — version v1 : `FaceOccRegressor` avec pooling simple (cls / mean / max / attention single-query) + tête MIL auxiliaire (`patch_head` + `loss_patch_mil_alpha`)
+- **`v2-attention-pooling`** — version v2 : `FaceOccRegressor` avec **K=6 multi-head attention pooling** à températures mixtes (focal/diffuse/free), apprises ; tête MIL retirée ; 3 niveaux de régularization séparés
+
+Voir la section [v2 attention pooling](#v2-attention-pooling) pour les détails de l'architecture v2.
+
+---
+
+## v2 attention pooling
+
+Implémenté sur la branche `v2-attention-pooling`. Inspiré de [Set Transformer (PMA)](https://arxiv.org/abs/1810.00825), [Perceiver IO](https://arxiv.org/abs/2107.14795), et [Dual-Attention MIL (2024)](https://www.mdpi.com/2079-9292/13/22/4445).
+
+### Motivation
+
+Le pooling v1 (mean / cls / attention single-query) compresse `(B, N, D)` → `(B, D)` en jetant 98 % de l'info. Avec un DINOv3 pretrained qui produit des embeddings très riches par patch (768 dims pour ViT-B/16), c'est gaspiller.
+
+L'architecture v2 garde la richesse : `(B, N, D)` → K queries attendent indépendamment sur tous les patches → `(B, K·D)` → tête finale → scalaire.
+
+### Architecture détaillée
+
+```
+                       backbone (DINOv3 / Sapiens2)
+                                  │
+                          (B, N+1, D)   ← +1 = CLS
+                                  │
+                       ┌──────────┴──────────┐
+                       │ AttentionPooling    │
+                       │                     │
+                       │  K=6 queries:       │
+                       │  • 2 focal (τ=0.1)  │ ← capture occluders localisés (régime 1)
+                       │  • 2 diffuse (τ=1.5)│ ← capture qualité globale (régime 2)
+                       │  • 2 free (τ=1.0)   │ ← libre de spécialiser
+                       │                     │
+                       │  τ apprises via log_tau = nn.Parameter
+                       │  (positivité garantie par exp)
+                       │                     │
+                       │  scores = Q·K / (scale × τ)
+                       │  weights = softmax(scores)        ← dropout pool_attn_dropout
+                       │  pooled = weights @ V             (par query)
+                       └──────────┬──────────┘
+                                  │
+                          (B, K=6, D)
+                                  │
+                          flatten → (B, K·D)
+                                  │
+                              LayerNorm                    ← dropout pool_proj_dropout
+                                  │
+                            [projection]                   ← optionnel, Linear→Norm→GELU→Dropout
+                                  │
+                              dropout                      ← head_dropout
+                                  │
+                              Linear                       ← (K·D, 1)
+                                  │
+                              sigmoid
+                                  │
+                              scalar prediction
+```
+
+### Les 3 niveaux de régularization (yaml params)
+
+| Niveau | Param | Effet |
+|---|---|---|
+| **Backbone** | `backbone_drop_path_rate` ∈ [0, 0.2] | Stochastic depth dans le ViT (DINOv3) / `drop_rate` (Sapiens2). Passé au constructor du backbone. |
+| **Pool** | `pool_attn_dropout` ∈ [0, 0.3] | Dropout appliqué sur les **poids d'attention** dans la pool (entre softmax et la multiplication par V). |
+| **Pool** | `pool_proj_dropout` ∈ [0, 0.3] | Dropout sur la **sortie agrégée** de la pool (après LayerNorm, avant la tête). |
+| **Head** | `head_dropout` ∈ [0, 0.3] | Dropout avant le Linear final (et dans la projection optionnelle). |
+
+### Query diversity penalty
+
+Au-delà des dropouts, on peut **pénaliser la redondance entre queries** :
+
+```python
+loss = main_loss + λ_div × diversity_penalty(attn_weights)
+```
+
+où `diversity_penalty` = moyenne des cosinus pairwise entre les K=6 distributions d'attention :
+- 0 si queries totalement orthogonales (attention sur des patches disjoints)
+- 1 si queries identiques (collapse)
+
+Param yaml : `loss_query_diversity_lambda ∈ [0, 0.2]` (Optuna search). À λ=0, aucune contrainte ; à λ=0.2, forte pression vers diversité.
+
+### Structure des K=6 queries (yaml params)
+
+| Param | Default | Notes |
+|---|---|---|
+| `n_focal` | 2 | Queries init avec τ basse → softmax sharp → attention concentrée (occluders) |
+| `n_diffuse` | 2 | Queries init avec τ haute → softmax flat → attention uniforme (qualité globale) |
+| `n_free` | 2 | Queries init avec τ=1 → neutres |
+| `tau_focal_init` | 0.1 | (Optuna explore [0.05, 0.3]) |
+| `tau_diffuse_init` | 1.5 | (Optuna explore [1.0, 3.0]) |
+| `tau_free_init` | 1.0 | Fixé en pratique |
+| `learnable_tau` | true | Si false, les τ restent fixes à leurs valeurs init |
+
+Au cours du training, les τ apprises peuvent **diverger arbitrairement** — la spécialisation focale/diffuse n'est qu'un prior d'init, pas une contrainte stricte. Si le modèle décide qu'il a besoin de 6 queries diffuses, il peut converger là.
+
+### Workflow v2
+
+```bash
+# Bascule sur la branche v2:
+git checkout v2-attention-pooling
+
+# Lance le HPO (search_space inclut tous les nouveaux params):
+sbatch scripts/optimize_dinov3_vitb16_2x3090.sh
+
+# Compare avec main (v1, MIL+simple pooling) via MLflow UI
+```
+
+L'A/B v1 vs v2 sur ViT-B/16 dira si l'enrichissement architectural vaut le coup avant d'investir sur le H+/16.
+
+---
+
 ## Monitoring UIs (MLflow + Optuna) — SLURM workflow
 
 Le gateway `gpu-gw` n'a pas assez de RAM pour faire tourner MLflow UI directement (`Killed` au démarrage). Solution : lancer les UIs sur la partition `CPU` (10 nœuds, 4-day timelimit, pas de QOS GPU) et port-forward depuis ton laptop.
@@ -590,7 +702,7 @@ scripts/
 | 26 | **MIL B4 — learnable mix scalar `β`** at training time, inference uses `β·pooled + (1−β)·patch_pred` | ~40 LOC | clean version of B2, lets the model decide weight | requires extra trainable scalar + careful init |
 | 27 | **MIL with face mask** — exclude background patches via SAM3-derived face mask, mean over face patches only | ~80 LOC + offline mask gen | corrects the background-dilution issue in `patch_pred` | depends on SAM3 pseudo-labels (lever #20) |
 | 28 | **Per-patch 2-channel decomposition** — per patch: `(occ_p, valid_p) = (sigmoid(head_occ), sigmoid(head_valid))`. Global ratio = `Σ occ_p · valid_p / Σ valid_p`. Adds sparsity regularizer `λ_sparsity · max(0, mean(valid_p) − 0.85)` to force ~15 % background suppression without external face mask. Identifiable by construction (vs the 3-class permutation idea which suffers from inter-image inconsistency). | ~80 LOC in `face_occ_regressor.py` + `losses.py` | force la localisation valid/invalid sans dépendance externe, capture l'intuition "patches utiles seulement" | encore underdetermined sans face mask (modèle peut tricher valid=1 partout) — la régul sparsity est un workaround soft |
-| 29 | **Rich pooling head** — remplace le mean/cls/attention single-query par une tête plus expressive consommant **tous** les patch embeddings, pas juste un résumé. Options : (a) **multi-head attention pooling** avec K=8 queries learnables (Perceiver-style), (b) **conv head** qui reshape `(B, N, D) → (B, D, H, W)` puis Conv2D, (c) **mini-transformer head** 1-2 layers au-dessus. Bénéfice : moins de perte info → patch coarseness moins problématique car le réseau exploite la richesse de chaque embedding. | ~20-50 LOC dans `face_occ_regressor.py` | gain attendu si le HPO actuel montre `pooling: attention` > `mean` ; bonne réponse au problème "patch trop grossier" en gardant toute l'info par patch | ajoute des params (10-100k) ; redondant avec le ViT self-attention pour les cas où pooled simple suffit |
+| 29 | ~~**Rich pooling head**~~ — **IMPLEMENTÉ** sur la branche [`v2-attention-pooling`](#v2-attention-pooling) (K=6 multi-head attention pooling, mixed temperature init, learnable τ, dual-attention régime 1/2 prior). Remplace MIL + simple pooling sur cette branche. | done | gain attendu si HPO révèle des τ apprises divergentes (focal vs diffuse) | nécessite Optuna fresh study car search_space change |
 
 ---
 

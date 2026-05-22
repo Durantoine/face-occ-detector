@@ -1,4 +1,4 @@
-name: sapiens2-01b-3090
+name: sapiens2-01b-3090-v2
 description: Sapiens2-0.1B (114M) on 2x RTX 3090 24GB (BF16, larger batch). Alternative to sapiens2-01b-p100 when 3090 partition is free.
 
 model:

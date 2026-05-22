@@ -1,4 +1,4 @@
-name: dinov3-vitb16-3090
+name: dinov3-vitb16-3090-v2
 description: DINOv3 ViT-B/16 (86M) with K=6 multi-head attention pooling (mixed temp init). 2x RTX 3090 24GB (BF16). v2 branch (replaces MIL + simple pooling).
 
 model:

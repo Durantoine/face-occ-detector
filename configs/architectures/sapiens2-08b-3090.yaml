@@ -1,4 +1,4 @@
-name: sapiens2-08b-3090
+name: sapiens2-08b-3090-v2
 description: Sapiens2-0.8B (818M, trained on 1B human images) finetune for face occlusion regression. 2x RTX 3090 24GB (BF16, DDP, grad-ckpt). No iBOT pretrain — Sapiens2 is already face/human-specialized.
 
 model:

@@ -1,4 +1,4 @@
-name: dinov3-vith16plus-3090
+name: dinov3-vith16plus-3090-v2
 description: DINOv3 ViT-H+/16 (600M) baseline for 2x RTX 3090 24GB (BF16, DDP). NO pretraining (for comparison with iBOT-pretrained variant).
 
 model:

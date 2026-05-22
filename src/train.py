@@ -28,7 +28,7 @@ from src.data.dataset import (
 )
 from src.data.transforms import build_train_transform
 from src.models.dinov3_loader import get_image_processor
-from src.models.face_occ_classifier import FaceOccRegressor
+from src.models.face_occ_regressor import FaceOccRegressor
 from src.training.callbacks import MlflowClientCallback, make_ema_callback_from_cfg
 from src.utils.config import load_architecture_config
 from src.utils.environment import setup_environment
@@ -60,7 +60,7 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_patch_mil_alpha", "eval_importance_reweight", "save_worst_k",
+    "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k",
     "group_dro_alpha", "layer_decay",
 }
 
@@ -79,7 +79,7 @@ class WeightedMSETrainer(Trainer):
         importance_pmf_ratio: Optional[Any] = None,
         gender_class_weights: Optional[Any] = None,
         cell_class_weights: Optional[Any] = None,
-        patch_mil_alpha: float = 0.0,
+        query_diversity_lambda: float = 0.0,
         train_sampler: Optional[Any] = None,
         layer_decay: float = 1.0,
         *args: Any,
@@ -88,7 +88,7 @@ class WeightedMSETrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._custom_train_sampler = train_sampler
         self._layer_decay = layer_decay
-        self._patch_mil_alpha = float(patch_mil_alpha)
+        self._query_diversity_lambda = float(query_diversity_lambda)
         if loss_type == "group_dro":
             self.loss_fct = GroupDROLoss(alpha=group_dro_alpha)
             print(f"GroupDROLoss: alpha={group_dro_alpha}")
@@ -123,13 +123,11 @@ class WeightedMSETrainer(Trainer):
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         self.loss_fct = self.loss_fct.to(preds.device)
-        main_loss = self.loss_fct(preds, labels)
-        alpha = self._patch_mil_alpha
-        if alpha > 0 and isinstance(outputs, dict) and "patch_pred" in outputs:
-            aux = self.loss_fct(outputs["patch_pred"], labels)
-            loss = (1.0 - alpha) * main_loss + alpha * aux
-        else:
-            loss = main_loss
+        loss = self.loss_fct(preds, labels)
+        if self._query_diversity_lambda > 0 and isinstance(outputs, dict) and "attn_weights" in outputs:
+            from src.models.face_occ_regressor import _query_diversity_penalty
+            div = _query_diversity_penalty(outputs["attn_weights"])
+            loss = loss + self._query_diversity_lambda * div
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self) -> torch.optim.Optimizer:
@@ -436,10 +434,19 @@ def train(
         else FaceOccRegressor(
             model_name=model_name,
             output_dim=output_dim,
-            hidden_dropout_prob=model_cfg.get("hidden_dropout_prob", 0.1),
-            pooling=model_cfg.get("pooling", "cls"),
+            head_dropout=float(model_cfg.get("head_dropout", model_cfg.get("hidden_dropout_prob", 0.1))),
             projection_size=model_cfg.get("projection_size"),
             output_activation=model_cfg.get("output_activation", "sigmoid"),
+            backbone_drop_path_rate=float(model_cfg.get("backbone_drop_path_rate", 0.0)),
+            n_focal=int(model_cfg.get("n_focal", 2)),
+            n_diffuse=int(model_cfg.get("n_diffuse", 2)),
+            n_free=int(model_cfg.get("n_free", 2)),
+            tau_focal_init=float(model_cfg.get("tau_focal_init", 0.1)),
+            tau_diffuse_init=float(model_cfg.get("tau_diffuse_init", 1.5)),
+            tau_free_init=float(model_cfg.get("tau_free_init", 1.0)),
+            learnable_tau=bool(model_cfg.get("learnable_tau", True)),
+            pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", model_cfg.get("attn_dropout", 0.0))),
+            pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", model_cfg.get("proj_dropout", 0.0))),
         )
     )
 
@@ -513,7 +520,7 @@ def train(
         importance_pmf_ratio=importance_pmf_ratio,
         gender_class_weights=gender_class_weights,
         cell_class_weights=cell_class_weights,
-        patch_mil_alpha=train_cfg.get("loss_patch_mil_alpha", 0.0),
+        query_diversity_lambda=train_cfg.get("loss_query_diversity_lambda", 0.0),
         train_sampler=train_sampler,
         layer_decay=train_cfg.get("layer_decay", 1.0),
         model=model,

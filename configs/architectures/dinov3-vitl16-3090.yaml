@@ -4,7 +4,7 @@ description: DINOv3 ViT-L/16 regressor for 2x RTX 3090 24GB (BF16, DDP). ViT-H+/
 model:
   model_name: dinov3_vitl16
   output_dim: 1
-  hidden_dropout_prob: 0.1
+  head_dropout: 0.1
   pooling: cls
   projection_size: null
   output_activation: sigmoid
@@ -67,7 +67,7 @@ optuna:
       type: float
       low: 0.05
       high: 0.2
-    hidden_dropout_prob:
+    head_dropout:
       type: float
       low: 0.0
       high: 0.3

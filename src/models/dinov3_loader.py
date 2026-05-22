@@ -35,11 +35,18 @@ def hidden_size_of(arch: str) -> int:
     return _HIDDEN_SIZES[arch]
 
 
-def load_dinov3(arch: str = "dinov3_vits16", device: Optional[torch.device] = None) -> torch.nn.Module:
+def load_dinov3(
+    arch: str = "dinov3_vits16",
+    device: Optional[torch.device] = None,
+    drop_path_rate: float = 0.0,
+) -> torch.nn.Module:
     if not _REPO.exists():
         raise FileNotFoundError(f"DINOv3 repo not found at {_REPO}")
 
-    model = torch.hub.load(str(_REPO), arch, source="local", pretrained=False)
+    hub_kwargs: Any = {"source": "local", "pretrained": False}
+    if drop_path_rate > 0:
+        hub_kwargs["drop_path_rate"] = drop_path_rate
+    model = torch.hub.load(str(_REPO), arch, **hub_kwargs)
 
     weights_path = _AVAILABLE_WEIGHTS.get(arch)
     if weights_path and weights_path.exists():

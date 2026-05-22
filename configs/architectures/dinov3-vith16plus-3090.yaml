@@ -4,10 +4,19 @@ description: DINOv3 ViT-H+/16 (600M) baseline for 2x RTX 3090 24GB (BF16, DDP). 
 model:
   model_name: dinov3_vith16plus
   output_dim: 1
-  hidden_dropout_prob: 0.1
-  pooling: cls
+  head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  learnable_tau: true
+  backbone_drop_path_rate: 0.0
 
 data:
   image_col: filename
@@ -43,7 +52,7 @@ training:
   loss_importance_reweight: false
   loss_gender_reweight: false
   loss_cell_reweight: false
-  loss_patch_mil_alpha: 0.0
+  loss_query_diversity_lambda: 0.0
   eval_importance_reweight: true
   save_worst_k: 30
   group_dro_alpha: 0.5
@@ -73,20 +82,13 @@ optuna:
       type: float
       low: 0.05
       high: 0.2
-    hidden_dropout_prob:
+    head_dropout:
       type: float
       low: 0.0
       high: 0.3
-    pooling:
-      type: categorical
-      choices: [cls, mean, attention]
     balancing_strategy:
       type: categorical
       choices: [A, D, E, F]
-    loss_patch_mil_alpha:
-      type: float
-      low: 0.0
-      high: 1.0
     augmentation_level:
       type: categorical
       choices: [none, light, medium, strong]
@@ -102,3 +104,28 @@ optuna:
       type: float
       low: 0.65
       high: 1.0
+    backbone_drop_path_rate:
+      type: float
+      low: 0.0
+      high: 0.2
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+    tau_focal_init:
+      type: float
+      low: 0.05
+      high: 0.3
+      log: true
+    tau_diffuse_init:
+      type: float
+      low: 1.0
+      high: 3.0

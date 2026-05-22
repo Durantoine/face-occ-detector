@@ -45,9 +45,16 @@ _TRAINING_KEYS = {
     "augmentation_level", "ema_decay", "layer_decay",
     "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_patch_mil_alpha", "loss_type", "group_dro_alpha",
+    "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
 }
-_MODEL_KEYS = {"hidden_dropout_prob", "pooling", "projection_size", "output_activation"}
+_MODEL_KEYS = {
+    "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
+    "backbone_drop_path_rate",
+    "n_focal", "n_diffuse", "n_free",
+    "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
+    "pool_attn_dropout", "pool_proj_dropout",
+    "attn_dropout", "proj_dropout",
+}
 
 _BALANCING_STRATEGY_MAP = {
     "A": {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False},

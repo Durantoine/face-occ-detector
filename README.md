@@ -500,7 +500,7 @@ src/
 │   ├── dataset.py        FaceOccDataset, InferenceDataset, balanced_sampler, load_csv_data
 │   └── transforms.py     PIL augmentation pipeline (hflip / jitter / rotation / RandAugment)
 ├── models/
-│   ├── face_occ_classifier.py    FaceOccRegressor (HF + DINOv3 dispatch)
+│   ├── face_occ_regressor.py    FaceOccRegressor (HF + DINOv3 dispatch)
 │   ├── dinov3_loader.py          weights + variant picker
 │   ├── dinov3_repo/              Meta's vendored DINOv3 code
 │   └── weights/                  local .pth files (vits16 shipped)
@@ -589,20 +589,53 @@ scripts/
 | 25 | **MIL B2 — mix at inference** `(pooled_pred + patch_pred) / 2` | ~20 LOC in `predict.py` | cheap ensemble of the two heads | only worthwhile if both heads converge to comparable performance individually |
 | 26 | **MIL B4 — learnable mix scalar `β`** at training time, inference uses `β·pooled + (1−β)·patch_pred` | ~40 LOC | clean version of B2, lets the model decide weight | requires extra trainable scalar + careful init |
 | 27 | **MIL with face mask** — exclude background patches via SAM3-derived face mask, mean over face patches only | ~80 LOC + offline mask gen | corrects the background-dilution issue in `patch_pred` | depends on SAM3 pseudo-labels (lever #20) |
-| 28 | **Per-patch 2-channel decomposition** — per patch: `(occ_p, valid_p) = (sigmoid(head_occ), sigmoid(head_valid))`. Global ratio = `Σ occ_p · valid_p / Σ valid_p`. Adds sparsity regularizer `λ_sparsity · max(0, mean(valid_p) − 0.85)` to force ~15 % background suppression without external face mask. Identifiable by construction (vs the 3-class permutation idea which suffers from inter-image inconsistency). | ~80 LOC in `face_occ_classifier.py` + `losses.py` | force la localisation valid/invalid sans dépendance externe, capture l'intuition "patches utiles seulement" | encore underdetermined sans face mask (modèle peut tricher valid=1 partout) — la régul sparsity est un workaround soft |
-| 29 | **Rich pooling head** — remplace le mean/cls/attention single-query par une tête plus expressive consommant **tous** les patch embeddings, pas juste un résumé. Options : (a) **multi-head attention pooling** avec K=8 queries learnables (Perceiver-style), (b) **conv head** qui reshape `(B, N, D) → (B, D, H, W)` puis Conv2D, (c) **mini-transformer head** 1-2 layers au-dessus. Bénéfice : moins de perte info → patch coarseness moins problématique car le réseau exploite la richesse de chaque embedding. | ~20-50 LOC dans `face_occ_classifier.py` | gain attendu si le HPO actuel montre `pooling: attention` > `mean` ; bonne réponse au problème "patch trop grossier" en gardant toute l'info par patch | ajoute des params (10-100k) ; redondant avec le ViT self-attention pour les cas où pooled simple suffit |
+| 28 | **Per-patch 2-channel decomposition** — per patch: `(occ_p, valid_p) = (sigmoid(head_occ), sigmoid(head_valid))`. Global ratio = `Σ occ_p · valid_p / Σ valid_p`. Adds sparsity regularizer `λ_sparsity · max(0, mean(valid_p) − 0.85)` to force ~15 % background suppression without external face mask. Identifiable by construction (vs the 3-class permutation idea which suffers from inter-image inconsistency). | ~80 LOC in `face_occ_regressor.py` + `losses.py` | force la localisation valid/invalid sans dépendance externe, capture l'intuition "patches utiles seulement" | encore underdetermined sans face mask (modèle peut tricher valid=1 partout) — la régul sparsity est un workaround soft |
+| 29 | **Rich pooling head** — remplace le mean/cls/attention single-query par une tête plus expressive consommant **tous** les patch embeddings, pas juste un résumé. Options : (a) **multi-head attention pooling** avec K=8 queries learnables (Perceiver-style), (b) **conv head** qui reshape `(B, N, D) → (B, D, H, W)` puis Conv2D, (c) **mini-transformer head** 1-2 layers au-dessus. Bénéfice : moins de perte info → patch coarseness moins problématique car le réseau exploite la richesse de chaque embedding. | ~20-50 LOC dans `face_occ_regressor.py` | gain attendu si le HPO actuel montre `pooling: attention` > `mean` ; bonne réponse au problème "patch trop grossier" en gardant toute l'info par patch | ajoute des params (10-100k) ; redondant avec le ViT self-attention pour les cas où pooled simple suffit |
 
 ---
 
 ## SOTA references
 
-- **Sagawa et al.** *Distributionally Robust Neural Networks for Group Shifts* — Group-DRO. [arXiv:1911.08731](https://arxiv.org/abs/1911.08731)
-- **DINOv3 / DINOv2** — Meta (DINOv3 vendored at `src/models/dinov3_repo/`; DINOv2: [arXiv:2304.07193](https://arxiv.org/abs/2304.07193))
+### Backbones & SSL
+- **DINOv3** — Meta, vendored at `src/models/dinov3_repo/`. ViT + DINO + iBOT + KoLeo + Gram losses.
+- **DINOv2** — Oquab et al. [arXiv:2304.07193](https://arxiv.org/abs/2304.07193)
 - **MAE** — He et al. [arXiv:2111.06377](https://arxiv.org/abs/2111.06377)
+- **iBOT** (image BERT-like SSL) — Zhou et al. [arXiv:2111.07832](https://arxiv.org/abs/2111.07832)
+- **Sapiens** — Khirodkar et al., Meta foundation for human vision (1B human images)
+- **Sapiens 2** — Meta, custom architecture (RoPE + GQA + SwiGLU + RMSNorm), [github.com/facebookresearch/sapiens2](https://github.com/facebookresearch/sapiens2)
 - **ConvNeXt v2** — Woo et al. [arXiv:2301.00808](https://arxiv.org/abs/2301.00808)
 - **EVA-02** — Fang et al. [arXiv:2303.11331](https://arxiv.org/abs/2303.11331)
-- **EMA / SWA** — Izmailov et al. [arXiv:1803.05407](https://arxiv.org/abs/1803.05407)
-- **LLRD** — Howard & Ruder (ULMFiT). [arXiv:1801.06146](https://arxiv.org/abs/1801.06146)
+
+### Face image quality / occlusion analysis (most relevant to our task)
+- **A Comprehensive Review of Face Detection Techniques for Occluded Faces** (CMES 2025) — [techscience.com/CMES/v143n3/62822](https://www.techscience.com/CMES/v143n3/62822/html). Survey 4 categories: feature-based, ML, DL, hybrid. Note la trend ViT/Swin.
+- **A Survey of Face Recognition Techniques under Occlusion** (IET Biometrics 2021) — [Zeng et al.](https://ietresearch.onlinelibrary.wiley.com/doi/full/10.1049/bme2.12029). 3 stratégies: visible-parts → reconstruction, fusion sub-regions, adversarial.
+- **CLIB-FIQA** (CVPR 2024) — Ou et al. Confidence calibration for face quality. [paper](https://openaccess.thecvf.com/content/CVPR2024/papers/Ou_CLIB-FIQA_Face_Image_Quality_Assessment_with_Confidence_Calibration_CVPR_2024_paper.pdf)
+- **CR-FIQA** (Boutros 2023) — Sample relative classifiability for FIQA
+- **FaceQNet** — Hernández-Ortega et al. [arXiv:1904.01740](https://arxiv.org/abs/1904.01740)
+- **AOFD: Adversarial Occlusion-aware Face Detection** — segmentation + detection jointly. [arXiv:1709.05188](https://arxiv.org/abs/1709.05188)
+
+### Multiple Instance Learning (MIL) + attention pooling
+- **Attention-based Deep MIL** — Ilse et al. 2018. [arXiv:1802.04712](https://arxiv.org/abs/1802.04712). Notre baseline conceptuel.
+- **Set Transformer / PMA (Pooling by Multihead Attention)** — Lee et al. 2019. [arXiv:1810.00825](https://arxiv.org/abs/1810.00825). Base théorique du multi-head attention pooling (levier #29).
+- **Perceiver IO** — Jaegle et al. 2021. [arXiv:2107.14795](https://arxiv.org/abs/2107.14795). K-query attention pour set→scalar.
+- **Rethinking Attention-Based MIL** (2024) — [arXiv:2404.00351](https://arxiv.org/abs/2404.00351). État de l'art MIL attention.
+- **Dual-Attention MIL** (Electronics 2024) — 2 attentions parallèles pour WSI classification. [MDPI](https://www.mdpi.com/2079-9292/13/22/4445). **Base de notre levier #30 dual-attention régime 1/2.**
+- **CAMIL: Channel Attention MIL** (Bioinformatics 2025) — [Oxford Academic](https://academic.oup.com/bioinformatics/article/41/2/btaf024/7958575)
+- **Neighborhood Attention MIL** (2024) — locality + attention pour WSI. [PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC11390382/)
+
+### Fairness in face analysis
+- **Group-DRO** — Sagawa et al. *Distributionally Robust Neural Networks for Group Shifts*. [arXiv:1911.08731](https://arxiv.org/abs/1911.08731). Implémenté dans `src/utils/losses.py:GroupDROLoss`.
+- **Component-Based Fairness in Face Attribute Classification** (FAccT 2025) — Bayesian network + meta-learning. [arXiv:2505.01699](https://arxiv.org/abs/2505.01699)
+- **Toward Fairer Face Recognition Datasets** (2024) — [arXiv:2406.16592](https://arxiv.org/abs/2406.16592)
+
+### Optimization / regularization
+- **EMA / SWA** — Izmailov et al. [arXiv:1803.05407](https://arxiv.org/abs/1803.05407). Implémenté.
+- **LLRD** — Howard & Ruder (ULMFiT). [arXiv:1801.06146](https://arxiv.org/abs/1801.06146). Implémenté.
+- **Focal Loss** — Lin et al. [arXiv:1708.02002](https://arxiv.org/abs/1708.02002). Adapté en `loss_focal_gamma`.
+- **Importance weighting / covariate shift** — Shimodaira 2000 (classical reference for `w = p_test/p_train`)
+
+### Notre niche : continuous occlusion ratio regression
+Aucune publication ne fait **exactement** notre tâche (Idemia metric `(Err_F + Err_M)/2 + |Err_F − Err_M|` avec `w = 1/30 + GT`). Le champ FIQA produit des scores de qualité multi-facteur (incluant occlusion comme une dimension parmi d'autres), mais pas de regression isolée sur le ratio d'occlusion. → **Setup spécifique au challenge**, on combine des briques validées individuellement.
 
 ---
 

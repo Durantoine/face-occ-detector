@@ -34,7 +34,11 @@ def hidden_size_of(arch: str) -> int:
     return _HIDDEN_SIZES[arch]
 
 
-def load_sapiens2(arch: str = "sapiens2_0.8b", image_size: int = 224) -> torch.nn.Module:
+def load_sapiens2(
+    arch: str = "sapiens2_0.8b",
+    image_size: int = 224,
+    drop_rate: float = 0.0,
+) -> torch.nn.Module:
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
     from sapiens.backbones.standalone.sapiens2 import Sapiens2
@@ -49,6 +53,7 @@ def load_sapiens2(arch: str = "sapiens2_0.8b", image_size: int = 224) -> torch.n
         out_indices=-1,
         out_type="raw",
         with_cls_token=True,
+        drop_rate=drop_rate,
     )
     ckpt_path = hf_hub_download(
         repo_id=_HF_REPO_BY_ARCH[arch],

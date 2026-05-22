@@ -28,7 +28,7 @@ export TMPDIR=$HOME/tmp
 export MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING=false
 export MLFLOW_DEPLOYMENTS_TARGET=''
 
-uvx --python 3.12 --from 'mlflow<3' mlflow ui \
+uvx --python 3.12 --from mlflow mlflow server \
     --backend-store-uri sqlite:///mlflow.db \
     --host 0.0.0.0 \
     --port "${PORT}" \

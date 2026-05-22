@@ -84,11 +84,12 @@ optuna:
       type: categorical
       choices: [A, D, E, F]
     loss_patch_mil_alpha:
-      type: categorical
-      choices: [0.0, 0.5, 1.0]
+      type: float
+      low: 0.0
+      high: 1.5
     augmentation_level:
       type: categorical
-      choices: [light, medium, strong]
+      choices: [none, light, medium, strong]
     loss_focal_gamma:
       type: float
       low: 0.0

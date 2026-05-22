@@ -171,25 +171,39 @@ def objective(
             val_seed=val_seed,
             test_data_csv=test_data_csv,
         )
-        if is_main() and client and run_id:
-            for k, v in [
-                ("final_eval_loss", eval_loss), ("best_score", score),
-                ("err_diff", err_diff), ("err_F", err_F), ("err_M", err_M),
-            ]:
-                client.log_metric(run_id, k, v)
-            client.set_terminated(run_id, "FINISHED")
-            print(f"Trial {trial_data['n']}: score={score:.5f} err_F={err_F:.5f} err_M={err_M:.5f} err_diff={err_diff:.5f}")
-        trial.set_user_attr("err_F", float(err_F))
-        trial.set_user_attr("err_M", float(err_M))
-        trial.set_user_attr("err_diff", float(err_diff))
-        trial.set_user_attr("eval_loss", float(eval_loss))
     except Exception:
         eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
         if is_main():
             import traceback
             traceback.print_exc()
             if client and run_id:
-                client.set_terminated(run_id, "FAILED")
+                try:
+                    client.set_terminated(run_id, "FAILED")
+                except Exception:
+                    pass
+
+    # Post-train MLflow ops + user attrs in a SEPARATE try/except so a failed
+    # MLflow call (e.g. run already terminated by _save_model_to_mlflow) does NOT
+    # poison the Optuna trial value (which would record `inf` instead of the
+    # actual score returned by train()).
+    if is_main() and client and run_id:
+        try:
+            for k, v in [
+                ("final_eval_loss", eval_loss), ("best_score", score),
+                ("err_diff", err_diff), ("err_F", err_F), ("err_M", err_M),
+            ]:
+                client.log_metric(run_id, k, v)
+            client.set_terminated(run_id, "FINISHED")
+        except Exception as e:
+            print(f"WARNING: post-train MLflow logging failed (trial value preserved): {e}")
+        print(f"Trial {trial_data['n']}: score={score:.5f} err_F={err_F:.5f} err_M={err_M:.5f} err_diff={err_diff:.5f}")
+    try:
+        trial.set_user_attr("err_F", float(err_F))
+        trial.set_user_attr("err_M", float(err_M))
+        trial.set_user_attr("err_diff", float(err_diff))
+        trial.set_user_attr("eval_loss", float(eval_loss))
+    except Exception as e:
+        print(f"WARNING: trial.set_user_attr failed: {e}")
     finally:
         os.environ.pop("MLFLOW_RUN_ID", None)
         if torch.cuda.is_available():

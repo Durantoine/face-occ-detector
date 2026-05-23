@@ -595,7 +595,6 @@ def train(
                         try:
                             dst.symlink_to(src.resolve())
                         except OSError:
-                            import shutil
                             shutil.copy(src, dst)
                 print(f"Saved {len(worst_df)} worst predictions: {csv_path} + {img_dir}")
                 if use_mlflow and use_client and client and run_id:

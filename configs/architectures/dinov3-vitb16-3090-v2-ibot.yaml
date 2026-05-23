@@ -17,7 +17,7 @@ model:
   pool_proj_dropout: 0.0
   learnable_tau: true
   backbone_drop_path_rate: 0.0
-  init_backbone_from: runs:/7dec8c8a90564ceeac15522cc6a551fa/encoder
+  init_backbone_from: runs:/c2c396cae2f74566a413502633de7781/encoder
 
 data:
   image_col: filename

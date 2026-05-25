@@ -61,6 +61,7 @@ def load_dinov3(
     arch: str = "dinov3_vits16",
     device: Optional[torch.device] = None,
     drop_path_rate: float = 0.0,
+    pretrained: bool = True,
 ) -> torch.nn.Module:
     if not _REPO.exists():
         raise FileNotFoundError(f"DINOv3 repo not found at {_REPO}")
@@ -68,13 +69,16 @@ def load_dinov3(
     model = torch.hub.load(str(_REPO), arch, source="local", pretrained=False)
     _set_drop_path_rate(model, drop_path_rate)
 
-    weights_path = _AVAILABLE_WEIGHTS.get(arch)
-    if weights_path and weights_path.exists():
-        state = torch.load(weights_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(state, strict=True)
-        print(f"Loaded DINOv3 weights: {weights_path.name}")
+    if not pretrained:
+        print(f"DINOv3 {arch}: random init (pretrained=False)")
     else:
-        print(f"WARNING: no weights for {arch} at {weights_path} — model is randomly initialized")
+        weights_path = _AVAILABLE_WEIGHTS.get(arch)
+        if weights_path and weights_path.exists():
+            state = torch.load(weights_path, map_location="cpu", weights_only=False)
+            model.load_state_dict(state, strict=True)
+            print(f"Loaded DINOv3 weights: {weights_path.name}")
+        else:
+            print(f"WARNING: no weights for {arch} at {weights_path} — model is randomly initialized")
 
     if device is not None:
         model = model.to(device)

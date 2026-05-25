@@ -46,21 +46,29 @@ _TRAINING_KEYS = {
     "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
+    "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
+    "adv_lambda", "mmd_lambda", "mixup_alpha",
 }
 _MODEL_KEYS = {
     "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
     "backbone_drop_path_rate",
+    "pretrained", "pooling_type",
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
+    "num_heads", "gem_p_init",
     "pool_attn_dropout", "pool_proj_dropout",
     "attn_dropout", "proj_dropout",
 }
 
 _BALANCING_STRATEGY_MAP = {
-    "A": {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False},
-    "D": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False},
-    "E": {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True},
-    "F": {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False},
+    "A": {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "D": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "E": {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True,  "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "F": {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    # G/H/I — feature-level fairness mechanisms on top of importance reweighting (no sampler reduction).
+    "G": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "H": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
+    "I": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
 }
 
 
@@ -77,24 +85,57 @@ def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
         cfg["model"][name] = value
 
 
+def _suggest(trial: optuna.Trial, name: str, spec: Dict[str, Any]) -> Any:
+    t = spec["type"]
+    if t == "float":
+        return trial.suggest_float(name, float(spec["low"]), float(spec["high"]), log=spec.get("log", False))
+    if t == "int":
+        return trial.suggest_int(name, int(spec["low"]), int(spec["high"]))
+    if t == "categorical":
+        return trial.suggest_categorical(name, spec["choices"])
+    return None
+
+
+def _spec_active(spec: Dict[str, Any], sampled: Dict[str, Any]) -> bool:
+    """Conditional gating: a spec with `conditional_on: {param: [allowed, values]}` is
+    sampled only when sampled[param] is in the allowed list. Missing dependency → skip."""
+    cond = spec.get("conditional_on")
+    if not cond:
+        return True
+    for parent, allowed in cond.items():
+        if parent not in sampled:
+            return False
+        if sampled[parent] not in (allowed if isinstance(allowed, list) else [allowed]):
+            return False
+    return True
+
+
 def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int) -> str:
     cfg = copy.deepcopy(base_config)
     search_space = cfg.get("optuna", {}).get("search_space", {})
     if not search_space:
         raise ValueError(f"No search_space in config '{base_config.get('name')}'")
 
+    # Two-pass: unconditional first (so parents are sampled), then conditional children.
+    sampled: Dict[str, Any] = {}
     for name, spec in search_space.items():
-        if name == "seed":
+        if name == "seed" or spec.get("conditional_on"):
             continue
-        t = spec["type"]
-        if t == "float":
-            v: Any = trial.suggest_float(name, float(spec["low"]), float(spec["high"]), log=spec.get("log", False))
-        elif t == "int":
-            v = trial.suggest_int(name, int(spec["low"]), int(spec["high"]))
-        elif t == "categorical":
-            v = trial.suggest_categorical(name, spec["choices"])
-        else:
+        v = _suggest(trial, name, spec)
+        if v is None:
             continue
+        sampled[name] = v
+        _apply_trial_param(cfg, name, v)
+
+    for name, spec in search_space.items():
+        if name == "seed" or not spec.get("conditional_on"):
+            continue
+        if not _spec_active(spec, sampled):
+            continue
+        v = _suggest(trial, name, spec)
+        if v is None:
+            continue
+        sampled[name] = v
         _apply_trial_param(cfg, name, v)
 
     cfg["name"] = f"{cfg['name']}_trial{n}"
@@ -147,7 +188,18 @@ def objective(
         val_seed = (seed + trial.number * 13) if rotate_val_seed else None
         if client and experiment_id:
             run_id = _make_child_run(client, experiment_id, parent_run_id, base_arch, trial)
-        trial_data = {"arch": arch_name, "run_id": run_id, "seed": seed, "val_seed": val_seed, "n": trial.number}
+        # Save model weights only if this trial would improve over current best.
+        # Pareto mode: skip the gate (multi-objective best is ambiguous).
+        try:
+            study = trial.study
+            best = float(study.best_value) if mode != "pareto" and study.best_trial is not None else float("inf")
+        except (ValueError, AttributeError):
+            best = float("inf")
+        min_score_to_save = None if mode == "pareto" else best
+        trial_data = {
+            "arch": arch_name, "run_id": run_id, "seed": seed, "val_seed": val_seed,
+            "n": trial.number, "min_score_to_save": min_score_to_save,
+        }
 
     trial_data = broadcast(trial_data)
     assert trial_data is not None
@@ -155,6 +207,7 @@ def objective(
     run_id = trial_data["run_id"]
     seed = trial_data["seed"]
     val_seed = trial_data["val_seed"]
+    min_score_to_save = trial_data["min_score_to_save"]
 
     if run_id:
         os.environ["MLFLOW_RUN_ID"] = run_id
@@ -170,6 +223,7 @@ def objective(
             seed=seed,
             val_seed=val_seed,
             test_data_csv=test_data_csv,
+            min_score_to_save=min_score_to_save,
         )
     except Exception:
         eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")

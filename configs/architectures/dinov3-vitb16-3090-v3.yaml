@@ -1,21 +1,29 @@
-name: sapiens2-01b-3090-v2
-description: Sapiens2-0.1B (114M) on 2x RTX 3090 24GB (BF16, larger batch). Alternative to sapiens2-01b-p100 when 3090 partition is free.
+name: dinov3-vitb16-3090-v3
+description: DINOv3 ViT-B/16 (86M) v3 — extended search space (pooling_type, pretrained, qualitative best+worst). 2x RTX 3090 24GB (BF16).
 
 model:
-  model_name: sapiens2_0.1b
+  model_name: dinov3_vitb16
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
+  pretrained: true
+  pooling_type: attention_k_query
+  # Attention K-query
   n_focal: 2
   n_diffuse: 2
   n_free: 2
   tau_focal_init: 0.1
   tau_diffuse_init: 1.5
   tau_free_init: 1.0
+  learnable_tau: true
+  # Multi-head
+  num_heads: 4
+  # GeM
+  gem_p_init: 3.0
+  # Common pool
   pool_attn_dropout: 0.0
   pool_proj_dropout: 0.0
-  learnable_tau: true
   backbone_drop_path_rate: 0.0
 
 data:
@@ -54,20 +62,27 @@ training:
   loss_cell_reweight: false
   loss_query_diversity_lambda: 0.0
   eval_importance_reweight: true
-  save_worst_k: 30
+  save_qualitative_k: 10
   group_dro_alpha: 0.5
   ema_decay: 0.9998
   ema_warmup_steps: 200
   layer_decay: 0.85
 
 optuna:
-  n_trials: 60
+  n_trials: 100
   objective_mode: score
   rotate_val_seed: true
   search_space:
+    # === Always sampled ===
+    pretrained:
+      type: categorical
+      choices: [true, false]
+    pooling_type:
+      type: categorical
+      choices: [cls, gem, attention_k_query, multihead_attention]
     balancing_strategy:
       type: categorical
-      choices: [A, D, E, F]
+      choices: [A, D, E, F, G, H, I]
     learning_rate:
       type: float
       low: 1.0e-05
@@ -104,24 +119,69 @@ optuna:
       type: float
       low: 0.0
       high: 0.2
+
+    # === Conditional on pooling_type ∈ {attention_k_query, multihead_attention} ===
     pool_attn_dropout:
       type: float
       low: 0.0
       high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
     pool_proj_dropout:
       type: float
       low: 0.0
       high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+
+    # === Conditional on pooling_type == attention_k_query ===
     loss_query_diversity_lambda:
       type: float
       low: 0.0
       high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
     tau_focal_init:
       type: float
       low: 0.05
       high: 0.3
       log: true
+      conditional_on:
+        pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
       low: 1.0
       high: 3.0
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # === Conditional on pooling_type == multihead_attention ===
+    num_heads:
+      type: categorical
+      # Divisors common to ViT-B (768) / ViT-L (1024) / ViT-H+ (1280) — keeps search space
+      # portable across backbones without arch-specific yaml duplication.
+      choices: [2, 4, 8, 16]
+      conditional_on:
+        pooling_type: multihead_attention
+
+    # === Conditional on balancing_strategy ∈ {G, H, I} (feature-level fairness) ===
+    adv_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        balancing_strategy: G
+    mmd_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        balancing_strategy: H
+    mixup_alpha:
+      type: float
+      low: 0.1
+      high: 0.5
+      conditional_on:
+        balancing_strategy: I

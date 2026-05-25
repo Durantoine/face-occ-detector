@@ -60,8 +60,10 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k",
+    "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
     "group_dro_alpha", "layer_decay",
+    "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
+    "adv_lambda", "mmd_lambda", "mixup_alpha",
 }
 
 
@@ -80,6 +82,10 @@ class WeightedMSETrainer(Trainer):
         gender_class_weights: Optional[Any] = None,
         cell_class_weights: Optional[Any] = None,
         query_diversity_lambda: float = 0.0,
+        adv_lambda: float = 0.0,
+        mmd_lambda: float = 0.0,
+        mixup_alpha: float = 0.0,
+        mixup_bin_width: float = 0.025,
         train_sampler: Optional[Any] = None,
         layer_decay: float = 1.0,
         *args: Any,
@@ -89,6 +95,10 @@ class WeightedMSETrainer(Trainer):
         self._custom_train_sampler = train_sampler
         self._layer_decay = layer_decay
         self._query_diversity_lambda = float(query_diversity_lambda)
+        self._adv_lambda = float(adv_lambda)
+        self._mmd_lambda = float(mmd_lambda)
+        self._mixup_alpha = float(mixup_alpha)
+        self._mixup_bin_width = float(mixup_bin_width)
         if loss_type == "group_dro":
             self.loss_fct = GroupDROLoss(alpha=group_dro_alpha)
             print(f"GroupDROLoss: alpha={group_dro_alpha}")
@@ -118,16 +128,49 @@ class WeightedMSETrainer(Trainer):
         except TypeError:
             return super()._get_train_sampler()
 
+    def training_step(self, model: Any, inputs: Dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        # Inter-gender Mixup (strategy I): replace F samples in-place with
+        # F⊕M interpolations of nearest Y bucket BEFORE the forward pass.
+        if self._mixup_alpha > 0 and model.training and "labels" in inputs and "pixel_values" in inputs:
+            from src.utils.losses import inter_gender_mixup
+            inputs = dict(inputs)
+            inputs["pixel_values"], inputs["labels"] = inter_gender_mixup(
+                inputs["pixel_values"], inputs["labels"],
+                alpha=self._mixup_alpha, bin_width=self._mixup_bin_width,
+            )
+        return super().training_step(model, inputs, *args, **kwargs)
+
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:
         labels = inputs["labels"]
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         self.loss_fct = self.loss_fct.to(preds.device)
         loss = self.loss_fct(preds, labels)
+
         if self._query_diversity_lambda > 0 and isinstance(outputs, dict) and "attn_weights" in outputs:
             from src.models.face_occ_regressor import _query_diversity_penalty
             div = _query_diversity_penalty(outputs["attn_weights"])
             loss = loss + self._query_diversity_lambda * div
+
+        # Adversarial debiasing (strategy G): GRL is applied inside the model,
+        # so a normal CE here propagates an INVERTED gradient into the backbone.
+        if self._adv_lambda > 0 and isinstance(outputs, dict) and "adv_logits" in outputs:
+            if labels.dim() == 2 and labels.size(1) >= 2:
+                g_tgt = (labels[:, 1] >= 0.5).long()
+                adv = torch.nn.functional.cross_entropy(outputs["adv_logits"], g_tgt)
+                loss = loss + self._adv_lambda * adv
+
+        # MMD alignment (strategy H) on pooled features between F and M.
+        if self._mmd_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
+            if labels.dim() == 2 and labels.size(1) >= 2:
+                from src.utils.losses import mmd_rbf
+                feats = outputs["features"]
+                g = labels[:, 1]
+                f_mask = g < 0.5
+                m_mask = g >= 0.5
+                mmd = mmd_rbf(feats[f_mask], feats[m_mask])
+                loss = loss + self._mmd_lambda * mmd
+
         return (loss, outputs) if return_outputs else loss
 
     def create_optimizer(self) -> torch.optim.Optimizer:
@@ -315,6 +358,7 @@ def train(
     val_seed: Optional[int] = None,
     mlflow_run_id: Optional[str] = None,
     test_data_csv: Optional[str] = None,
+    min_score_to_save: Optional[float] = None,
 ) -> Tuple[float, float, float, str]:
     cfg = load_architecture_config(architecture_name).to_dict()
     train_cfg = cfg.get("training", {})
@@ -428,6 +472,8 @@ def train(
         "data_val_occ_male_mean": _safe_mean(val_data.loc[val_data["gender"] >= 0.5, "FaceOcclusion"]),
     })
 
+    pretrained = bool(model_cfg.get("pretrained", True))
+    enable_adv_disc = bool(train_cfg.get("loss_adv_debiasing", False))
     model = (
         FaceOccRegressor.load_from_mlflow(resume_from_checkpoint, output_dim=output_dim)
         if resume_from_checkpoint
@@ -438,6 +484,8 @@ def train(
             projection_size=model_cfg.get("projection_size"),
             output_activation=model_cfg.get("output_activation", "sigmoid"),
             backbone_drop_path_rate=float(model_cfg.get("backbone_drop_path_rate", 0.0)),
+            pretrained=pretrained,
+            pooling_type=str(model_cfg.get("pooling_type", "attention_k_query")),
             n_focal=int(model_cfg.get("n_focal", 2)),
             n_diffuse=int(model_cfg.get("n_diffuse", 2)),
             n_free=int(model_cfg.get("n_free", 2)),
@@ -445,12 +493,15 @@ def train(
             tau_diffuse_init=float(model_cfg.get("tau_diffuse_init", 1.5)),
             tau_free_init=float(model_cfg.get("tau_free_init", 1.0)),
             learnable_tau=bool(model_cfg.get("learnable_tau", True)),
+            num_heads=int(model_cfg.get("num_heads", 4)),
+            gem_p_init=float(model_cfg.get("gem_p_init", 3.0)),
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", model_cfg.get("attn_dropout", 0.0))),
             pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", model_cfg.get("proj_dropout", 0.0))),
+            enable_adv_disc=enable_adv_disc,
         )
     )
 
-    init_backbone_from = model_cfg.get("init_backbone_from")
+    init_backbone_from = model_cfg.get("init_backbone_from") if pretrained else None
     if init_backbone_from:
         import re
         import mlflow as _ml
@@ -521,6 +572,9 @@ def train(
         gender_class_weights=gender_class_weights,
         cell_class_weights=cell_class_weights,
         query_diversity_lambda=train_cfg.get("loss_query_diversity_lambda", 0.0),
+        adv_lambda=float(train_cfg.get("adv_lambda", 0.0)) if train_cfg.get("loss_adv_debiasing", False) else 0.0,
+        mmd_lambda=float(train_cfg.get("mmd_lambda", 0.0)) if train_cfg.get("loss_mmd_alignment", False) else 0.0,
+        mixup_alpha=float(train_cfg.get("mixup_alpha", 0.0)) if train_cfg.get("mixup_inter_gender", False) else 0.0,
         train_sampler=train_sampler,
         layer_decay=train_cfg.get("layer_decay", 1.0),
         model=model,
@@ -543,8 +597,8 @@ def train(
     err_M = eval_results.get("eval_err_M", 0.0)
     print(f"score={eval_score:.5f} | err_diff={err_diff:.5f} | loss={eval_loss:.5f}")
 
-    save_worst_k = int(train_cfg.get("save_worst_k", 0))
-    if save_worst_k > 0:
+    save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
+    if save_qualitative_k > 0:
         # IMPORTANT: trainer.predict is a DDP collective — ALL ranks must call it,
         # only rank 0 processes the result. Gating predict() on rank 0 only
         # → other ranks skip the collective → NCCL timeout deadlock.
@@ -564,26 +618,31 @@ def train(
                 gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
                 w = 1.0 / 30.0 + gt
                 per_sample_err = w * (preds - gt) ** 2
-                order = np.argsort(-per_sample_err)[:save_worst_k]
-                paths = val_data.iloc[order]["image_path"].values if "image_path" in val_data.columns else None
-                worst_df = pd.DataFrame({
-                    "rank": np.arange(1, len(order) + 1),
-                    "filename": paths if paths is not None else order,
-                    "gt": gt[order],
-                    "pred": preds[order],
-                    "abs_err": np.abs(preds[order] - gt[order]),
-                    "weighted_err": per_sample_err[order],
-                    "gender": gender[order],
-                })
-                worst_dir = Path(output_dir) / "worst"
-                worst_dir.mkdir(parents=True, exist_ok=True)
-                csv_path = worst_dir / "worst.csv"
-                worst_df.to_csv(csv_path, index=False)
-                img_dir = worst_dir / "images"
-                img_dir.mkdir(exist_ok=True)
-                if paths is not None:
-                    base = Path(image_base_dir) if image_base_dir else None
-                    for rank, row in enumerate(worst_df.itertuples(index=False), start=1):
+                worst_order = np.argsort(-per_sample_err)[:save_qualitative_k]
+                best_order = np.argsort(per_sample_err)[:save_qualitative_k]
+                paths_all = val_data["image_path"].values if "image_path" in val_data.columns else None
+                qual_root = Path(output_dir) / "qualitative"
+                base = Path(image_base_dir) if image_base_dir else None
+
+                def _dump(order: Any, label: str) -> None:
+                    paths = paths_all[order] if paths_all is not None else None
+                    df = pd.DataFrame({
+                        "rank": np.arange(1, len(order) + 1),
+                        "filename": paths if paths is not None else order,
+                        "gt": gt[order],
+                        "pred": preds[order],
+                        "abs_err": np.abs(preds[order] - gt[order]),
+                        "weighted_err": per_sample_err[order],
+                        "gender": gender[order],
+                    })
+                    sub = qual_root / label
+                    sub.mkdir(parents=True, exist_ok=True)
+                    df.to_csv(sub / f"{label}.csv", index=False)
+                    img_dir = sub / "images"
+                    img_dir.mkdir(exist_ok=True)
+                    if paths is None:
+                        return
+                    for rank, row in enumerate(df.itertuples(index=False), start=1):
                         src = Path(row.filename)
                         if base and not src.is_absolute():
                             src = base / row.filename
@@ -592,15 +651,15 @@ def train(
                         dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
                         if dst.exists():
                             dst.unlink()
-                        try:
-                            dst.symlink_to(src.resolve())
-                        except OSError:
-                            shutil.copy(src, dst)
-                print(f"Saved {len(worst_df)} worst predictions: {csv_path} + {img_dir}")
+                        shutil.copy(src, dst)
+                    print(f"Saved {len(df)} {label} predictions: {sub}/{label}.csv + {img_dir}")
+
+                _dump(worst_order, "worst")
+                _dump(best_order, "best")
                 if use_mlflow and use_client and client and run_id:
-                    client.log_artifacts(run_id, str(worst_dir), "worst")
+                    client.log_artifacts(run_id, str(qual_root), "qualitative")
             except Exception as e:
-                print(f"WARNING: could not save worst-K: {e}")
+                print(f"WARNING: could not save qualitative-K: {e}")
 
     if test_data_csv and trainer.is_world_process_zero():
         try:
@@ -645,7 +704,12 @@ def train(
             mlflow.log_artifact(artifact)
 
     model_uri = ""
-    if use_mlflow:
+    should_save = use_mlflow and (
+        min_score_to_save is None or float(eval_score) < float(min_score_to_save)
+    )
+    if use_mlflow and not should_save:
+        print(f"Skipping model save: eval_score={eval_score:.5f} ≥ best={min_score_to_save:.5f}")
+    if should_save:
         try:
             model_uri = _save_model_to_mlflow(trainer, processor, run_id, f"{cfg['name']}")
             print(f"Model saved: {model_uri}")

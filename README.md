@@ -106,6 +106,439 @@ The metric (and `objective_mode: pareto`) drives Optuna's selection across these
 
 ---
 
+## Train↔test distribution shift on Y — and the Y×G coupling
+
+**Le shift existe** : on a estimé la distribution d'occlusion du test set par inférence sur les images, et elle diffère de celle du train. Codée en dur dans [`_TEST_PMF_0025`](src/utils/losses.py#L6) — vecteur de $B = 20$ bins de largeur $\delta = 0{,}025$ couvrant $[0, 0{,}5]$.
+
+**Le coupling Y↔G** : dans le train, $\mathbb{E}[Y \mid G = F] > \mathbb{E}[Y \mid G = M]$. Donc si on corrige le shift sur $Y$ (test plus chargé vers le haut), les femmes (sur-représentées dans les bins haut-$Y$) reçoivent implicitement plus de poids. La question : **est-ce qu'on doit re-corriger côté genre par-dessus ?**
+
+### Notations et dimensions
+
+| Symbole | Définition | Domaine / dim |
+|---|---|---|
+| $N$ | taille d'un batch (ou d'un epoch selon contexte) | scalaire |
+| $i$ | index sample | $1 \le i \le N$ |
+| $y_i$ | label d'occlusion | $y_i \in [0, 1]$ |
+| $g_i$ | genre | $g_i \in \{0, 1\}$ ($0 = F$, $1 = M$) |
+| $\hat y_i$ | prédiction du modèle | $\hat y_i \in [0, 1]$ |
+| $e_i = (\hat y_i - y_i)^2$ | erreur quadratique | $e_i \ge 0$ |
+| $B$ | nombre de bins | $B = 20$ |
+| $\delta$ | largeur d'un bin | $\delta = 0{,}025$ |
+| $b(y) = \lfloor y / \delta \rfloor$ | indice du bin | $b(y) \in \{0, \dots, B-1\}$ |
+| $P_{\text{train}} \in \mathbb{R}^B$ | PMF empirique train sur $Y$ | $P_{\text{train}}[b] = \tfrac{1}{N}\sum_{i} \mathbb{1}\{b(y_i) = b\}$ |
+| $P_{\text{test}} \in \mathbb{R}^B$ | PMF test pré-estimée | constante codée |
+| $w^{\text{imp}} \in \mathbb{R}^B$ | ratio d'importance par bin | défini ci-dessous |
+| $w_i^{\text{base}} = \tfrac{1}{30} + y_i$ | poids de la métrique cible | scalaire par sample |
+| $w_i^{\text{gender}} \in \{c_F, c_M\}$ | poids gender_class_weights[$g_i$] | scalaire par sample |
+| $n_F = \lvert\{i : g_i = 0\}\rvert$, $n_M$ | effectifs par genre dans un batch | scalaire |
+
+### 1. Importance reweighting (correction du shift Y)
+
+Sous l'hypothèse de **covariate shift sur Y uniquement** :
+$$P_{\text{test}}(g \mid y) = P_{\text{train}}(g \mid y) \quad \text{pour tout } (y, g),$$
+le ratio de Radon-Nikodym se simplifie :
+$$\frac{P_{\text{test}}(y, g)}{P_{\text{train}}(y, g)} \;=\; \frac{P_{\text{test}}(y) \cdot P_{\text{test}}(g \mid y)}{P_{\text{train}}(y) \cdot P_{\text{train}}(g \mid y)} \;=\; \frac{P_{\text{test}}(y)}{P_{\text{train}}(y)}.$$
+
+Le bon ratio est donc **marginal sur $Y$**, et il **traite automatiquement la corrélation $Y \times G$** : pas besoin de corriger en plus côté genre, puisque $P(g \mid y)$ est supposé identique.
+
+Implémenté dans [`build_importance_weights`](src/utils/losses.py#L12) :
+$$w^{\text{imp}}[b] \;=\; \mathrm{clip}\!\left(\frac{P_{\text{test}}[b]}{\max\!\left(P_{\text{train}}[b],\; 10^{-6}\right)},\; \tfrac{1}{10},\; 10\right), \qquad w^{\text{imp}} \leftarrow \frac{w^{\text{imp}}}{\bar{w}^{\text{imp}}}.$$
+
+Le clip $[1/10, 10]$ empêche les ratios divergents sur bins quasi-vides ; la renormalisation à moyenne 1 garde l'échelle de loss stable.
+
+### 2. Loss formula (avec ou sans `gender_rw`)
+
+Posons le poids effectif par sample (`loss_importance_reweight=True`) :
+$$w_i \;=\; w_i^{\text{base}} \cdot w^{\text{imp}}[b(y_i)] \qquad \text{(shape: } (N,)\text{)}.$$
+
+Avec `loss_gender_reweight=True` ([src/utils/losses.py:109](src/utils/losses.py#L109)) on ajoute :
+$$w_i^{(\text{D})} \;=\; w_i \cdot w_i^{\text{gender}} \;=\; w_i \cdot c_{g_i}.$$
+
+Comme `gender` est toujours présent chez nous, [src/utils/losses.py:131-134](src/utils/losses.py#L131-L134) calcule :
+$$\overline{e}_G \;=\; \frac{\sum_{i :\, g_i = G} w_i^{(\cdot)} \cdot e_i}{\sum_{i :\, g_i = G} w_i^{(\cdot)}}, \qquad \mathcal{L} \;=\; \tfrac{1}{2}\!\left(\overline{e}_F + \overline{e}_M\right) + \lambda \cdot \left\lvert\overline{e}_F - \overline{e}_M\right\rvert.$$
+
+### 3. Pourquoi `gender_rw` est un **no-op** dans cette formule
+
+Le facteur $c_G$ est **constant à l'intérieur d'un groupe**. Au numérateur et au dénominateur de $\overline{e}_G$ il se factorise et **se simplifie** :
+$$\overline{e}_F^{(\text{avec gender\_rw})} \;=\; \frac{\sum_{i :\, g_i = 0}\; c_F \cdot w_i \cdot e_i}{\sum_{i :\, g_i = 0}\; c_F \cdot w_i} \;=\; \frac{c_F \cdot \sum_{i :\, g_i = 0} w_i \cdot e_i}{c_F \cdot \sum_{i :\, g_i = 0} w_i} \;=\; \overline{e}_F^{(\text{sans gender\_rw})}.$$
+
+Idem pour $\overline{e}_M$ avec $c_M$. **Conclusion : activer ou désactiver `loss_gender_reweight` ne change strictement rien au gradient** (tant que le batch contient au moins un sample F et un sample M, ce qui est le cas typique avec un sampler équilibré ou des batchs assez grands).
+
+> Note importante : `loss_cell_reweight` n'a PAS cette propriété, parce que $w^{\text{cell}}[g_i, b(y_i)]$ **varie à l'intérieur d'un groupe** (en fonction du bin $Y$). Le facteur ne se simplifie pas → c'est un vrai mécanisme de reweighting joint $Y \times G$.
+
+### 4. Alors pourquoi la stratégie D bat la stratégie A en pratique ?
+
+Récap des deux stratégies dans [`_BALANCING_STRATEGY_MAP`](src/optimize.py#L59) :
+
+| | A | D |
+|---|---|---|
+| `sampler_strategy` | `gender` | `none` |
+| `loss_importance_reweight` | True | True |
+| `loss_gender_reweight` | False | **True** (mais on a montré que c'est un no-op) |
+
+→ **La seule différence active** est le **sampler**. Avec `sampler_strategy: gender` ([`create_balanced_sampler`](src/data/dataset.py#L18)) :
+$$n_{\text{samples par epoch}} \;=\; 2 \cdot \min(n_F, n_M).$$
+
+Si le train est par exemple 60/40 F/M sur 100k samples, **A voit ~80k samples par epoch (perte de 20%)** alors que D voit les 100k. À budget d'epochs égal, D fait plus de gradient steps sur la full distribution.
+
+De plus, la formule de loss $\tfrac{1}{2}(\overline{e}_F + \overline{e}_M) + \lambda\lvert\overline{e}_F - \overline{e}_M\rvert$ **fait déjà le boulot de fairness côté loss** (moyenne par groupe = pondération implicite, $\lambda$ pénalise le gap). Forcer un batch équilibré F/M via sampler ajoute peu une fois cette aggregation par-groupe en place.
+
+**Hypothèse empirique principale pour D > A** : D utilise simplement plus de données par epoch.
+
+### 5. Recommandation pratique
+
+| Objectif | Mécanisme | Statut |
+|---|---|---|
+| Honnêteté de la métrique val→test | `eval_importance_reweight` (val score reweighté à $P_{\text{test}}$) | par défaut `True` |
+| Correction du shift Y à l'entraînement | `loss_importance_reweight` | `True` |
+| Fairness G **sur la distribution test** | `loss_fairness_lambda > 0` ou `loss_type: group_dro` | tunable |
+| `loss_gender_reweight` | **sans effet** sous notre formule | indifférent — laisse Optuna trancher |
+| `sampler_strategy: gender` | optionnel ; **coûte de la donnée** (20–40% selon imbalance) | À éviter par défaut. Préférer `none` ou `gender_x_occ`. |
+
+→ **Strategy A** (sampler=gender) reste théoriquement propre mais paie en données.
+→ **Strategy D** (no sampler + gender_rw_no-op) ≡ **Strategy "no sampler + importance_rw seul"** en pratique. C'est probablement la baseline à battre.
+
+### 6. Si on suspectait un shift sur G aussi (non couvert ici)
+
+Si $P_{\text{test}}(g) \ne P_{\text{train}}(g)$, l'hypothèse $P_{\text{test}}(g \mid y) = P_{\text{train}}(g \mid y)$ tombe, et il faudrait estimer $P_{\text{test}}(g \mid y)$ via un classifieur d'attributs sur les images test, puis :
+$$w(y, g) \;=\; \frac{P_{\text{test}}(y, g)}{P_{\text{train}}(y, g)}.$$
+
+On n'a pas cette estimation aujourd'hui, donc on s'en tient à l'hypothèse Y-only.
+
+---
+
+## Méthodes — référence détaillée
+
+> Cette section donne pour chaque méthode du search space v3 : la formule, les dimensions, le coût et la motivation théorique. Elle utilise du LaTeX rendu en MathJax — viewable sur GitHub directement, ou en local avec une extension Markdown supportant MathJax.
+
+### Notations communes
+
+| Symbole | Définition | Dimensions |
+|---|---|---|
+| $B$ | taille du batch | scalaire |
+| $N$ | nombre de tokens en sortie du backbone (= 1 CLS + $N_p$ patches) | scalaire |
+| $D$ | dimension cachée du backbone | scalaire (768 ViT-B, 1024 ViT-L, 1280 ViT-H+) |
+| $X \in \mathbb{R}^{B \times N \times D}$ | sortie du backbone (CLS à l'index 0) | tenseur |
+| $\Phi \in \mathbb{R}^{B \times D'}$ | features après pooling (input du head) | $D'$ dépend du pooling |
+| $h \in \mathbb{R}^B$ | sortie du head, scalaire d'occlusion prédit | $\hat y = \sigma(h)$ |
+| $y_i \in [0, 1]$, $g_i \in \{0, 1\}$ | label et genre du sample $i$ | scalaires |
+
+---
+
+### Poolings
+
+#### Pooling 1 — CLS
+
+Le plus simple : on garde le premier token (le [CLS] entraîné par DINO pour agréger globalement).
+
+| Tenseur | Shape | Description |
+|---|---|---|
+| $X$ | $(B,\, N,\, D)$ | sortie du backbone (input du pool) |
+| $\Phi = X[:, 0, :]$ | $(B,\, D)$ | features (input du head) |
+
+- **Params appris dans le pool** : 0 (le [CLS] est déjà entraîné par le backbone)
+- **Output dim** : $D' = D$
+- **Coût** : nul
+- **Quand l'utiliser** : baseline propre quand le backbone DINO/iBOT est de qualité ; suffisant si le signal est global et déjà capturé par [CLS]
+- **Limite** : ne mélange pas l'info des patches au-delà de ce que le backbone a déjà fait
+
+#### Pooling 2 — GeM (Generalized Mean)
+
+Généralisation de mean et max (Radenović et al. 2018). $p$ apprenable contrôle la sharpness.
+
+| Tenseur / paramètre | Shape | Description |
+|---|---|---|
+| $X$ | $(B,\, N,\, D)$ | input |
+| $\tilde p$ | $()$ scalaire | paramètre brut |
+| $p = \text{softplus}(\tilde p) + \varepsilon$ | $()$ | exposant strictement positif |
+| $X[:, 1:, :]$ | $(B,\, N_p,\, D)$ | patches (skip [CLS] à l'index 0), $N_p = N - 1$ |
+| $\Phi$ | $(B,\, D)$ | features pooled |
+
+$$\Phi_{b, d} = \left( \frac{1}{N_p} \sum_{n=1}^{N_p} \max(X[b, n, d],\, \varepsilon)^{p} \right)^{1/p}.$$
+
+- **Cas limites** : $p \to 1$ → mean ; $p \to \infty$ → max
+- **Params appris dans le pool** : 1 (le scalaire $\tilde p$)
+- **Output dim** : $D' = D$
+- **Coût** : O($B \cdot N_p \cdot D$), négligeable
+- **Limite v2 → v3** : sur features ViT non-activées (peuvent être négatives), le clamp à $\varepsilon$ tue la moitié du signal. Acceptable comme baseline ; reconsidérer si GeM perd contre les autres.
+
+#### Pooling 3 — Attention K-query (le v2 actuel)
+
+$K = n_{\text{focal}} + n_{\text{diffuse}} + n_{\text{free}}$ queries apprenables, chacune avec sa propre température $\tau_k$ apprenable.
+
+| Tenseur / paramètre | Shape | Description |
+|---|---|---|
+| $X$ | $(B,\, N,\, D)$ | input du pool |
+| $Q$ | $(K,\, D)$ | matrice des $K$ queries apprenables |
+| $\log \tau$ | $(K,)$ | log-températures apprenables, $\tau_k = \exp(\log \tau_k) > 0$ |
+| $W_K \in \mathbb{R}^{D \times D}$, $W_V \in \mathbb{R}^{D \times D}$ | $(D,\, D)$ | projections clé/valeur |
+| $K_X = X W_K^\top$, $V_X = X W_V^\top$ | $(B,\, N,\, D)$ | clés/valeurs projetées |
+| $A$ (attention weights) | $(B,\, K,\, N)$ | poids softmax par query sur les patches |
+| pooled (avant flatten) | $(B,\, K,\, D)$ | $K$ vecteurs poolés par sample |
+| $\Phi$ après concat + LayerNorm | $(B,\, K \cdot D)$ | features finales |
+
+Init différenciée des $\tau$ pour forcer la diversité des rôles :
+- $\tau_k = \tau_{\text{focal}}$ ≈ 0.1 pour les $n_{\text{focal}}$ premières queries → attention piquée, capture des indices locaux
+- $\tau_k = \tau_{\text{diffuse}}$ ≈ 1.5 pour les $n_{\text{diffuse}}$ suivantes → attention plate, capture des signaux globaux
+- $\tau_k = \tau_{\text{free}}$ = 1 pour les $n_{\text{free}}$ dernières → neutre
+
+Forward :
+$$\underbrace{\text{scores}_{b,k,n}}_{(B,K,N)} = \frac{\overbrace{Q_{k,:}}^{(D,)} \cdot \overbrace{K_X[b,n,:]}^{(D,)}}{\sqrt{D} \cdot \tau_k}, \qquad \underbrace{A_{b,k,:}}_{(N,)} = \text{softmax}_n(\text{scores}_{b,k,:}),$$
+$$\underbrace{\Phi_b}_{(K \cdot D,)} = \text{LayerNorm}\!\left( \mathrm{concat}_{k=1}^{K} \underbrace{\sum_{n=1}^{N} A_{b,k,n} \cdot V_X[b,n,:]}_{(D,)} \right).$$
+
+- **Output dim** : $D' = K \cdot D$ (par défaut $K = 6$, soit $6 \cdot 768 = 4608$ pour ViT-B/16)
+- **Params appris dans le pool** : $K \cdot D$ (queries) + $K$ ($\log \tau$) + $2 D^2$ (projections K/V) + $2 \cdot K \cdot D$ (LayerNorm γ/β)
+- **Coût** : O($B \cdot K \cdot N \cdot D$), modeste
+- **Pénalité optionnelle** : `loss_query_diversity_lambda` ajoute une pénalité cosinus entre paires de queries pour empêcher le collapse. Notons $\widetilde A_{b,k,:} = A_{b,k,:} / \|A_{b,k,:}\|_2 \in \mathbb{R}^{N}$, alors :
+$$\Omega_{\text{div}} = \frac{1}{B \cdot K(K-1)} \sum_b \sum_{k \neq j} \widetilde A_{b,k,:} \cdot \widetilde A_{b,j,:} \in [-\tfrac{1}{K-1}, 1].$$
+
+#### Pooling 4 — Multi-Head Attention (MHA)
+
+1 query apprenable découpée en $H$ heads de dim $D/H$. Pas de $\tau$ per-head — la diversité émerge des projections aléatoirement initialisées.
+
+| Tenseur / paramètre | Shape | Description |
+|---|---|---|
+| $X$ | $(B,\, N,\, D)$ | input |
+| $Q$ (la query unique) | $(D,)$ | paramètre apprenable |
+| $W_Q, W_K, W_V \in \mathbb{R}^{D \times D}$ | $(D,\, D)$ | projections par-token |
+| $W_{\text{out}} \in \mathbb{R}^{D \times D}$ | $(D,\, D)$ | projection de sortie |
+| $q = W_Q Q$ réorganisée | $(H,\, D/H)$ | query splittée en $H$ heads |
+| $k = W_K X$ réorganisée | $(B,\, H,\, N,\, D/H)$ | clés par-head |
+| $v = W_V X$ réorganisée | $(B,\, H,\, N,\, D/H)$ | valeurs par-head |
+| $A$ (attention weights) | $(B,\, H,\, N)$ | softmax par-head sur les patches |
+| pooled (avant concat) | $(B,\, H,\, D/H)$ | un vecteur poolé par head |
+| $\Phi = W_{\text{out}} \cdot \mathrm{concat}(\ldots)$ | $(B,\, D)$ | features finales |
+
+Forward :
+$$\underbrace{\text{scores}_{b,h,n}}_{(B,H,N)} = \frac{\overbrace{q_h}^{(D/H,)} \cdot \overbrace{k_{b,h,n,:}}^{(D/H,)}}{\sqrt{D/H}}, \qquad A_{b,h,:} = \text{softmax}_n(\text{scores}),$$
+$$\underbrace{\Phi_b}_{(D,)} = W_{\text{out}} \cdot \mathrm{concat}_{h=1}^{H} \underbrace{\sum_n A_{b,h,n} \cdot v_{b,h,n,:}}_{(D/H,)}.$$
+
+- **Output dim** : $D' = D$
+- **Params appris dans le pool** : $D$ (query) + $4 D^2$ (4 projections linéaires) + $2D$ (LayerNorm)
+- **Coût** : O($B \cdot H \cdot N \cdot D/H) = O(B \cdot N \cdot D)$, identique à un transformer block standard
+- **Search space** : `num_heads ∈ {2, 4, 8, 16}` (diviseurs communs ViT-B/L/H+)
+- **Contrainte** : $D$ doit être divisible par $H$. Pour ViT-B (D=768), ViT-L (D=1024), ViT-H+ (D=1280), les valeurs $\{2, 4, 8, 16\}$ sont toutes des diviseurs.
+
+---
+
+### Stratégies d'équilibrage & fairness
+
+**Notations pour cette section** :
+
+| Tenseur | Shape | Description |
+|---|---|---|
+| $\hat y, y, w, e$ | $(B,)$ | prédictions, labels Y, poids par-sample, erreurs $e_i = (\hat y_i - y_i)^2$ |
+| $g$ | $(B,)$ | labels genre, valeurs $\in \{0, 1\}$ |
+| $w^{\text{imp}}$ | $(B_{\text{bins}},)$ avec $B_{\text{bins}} = 20$ | poids d'importance par bin de Y |
+| $b(y) = \lfloor y / \delta \rfloor$ | scalaire $\in \{0, \dots, B_{\text{bins}} - 1\}$ | indice du bin pour le sample |
+| $\Phi$ | $(B,\, D')$ | features pooled |
+
+Toutes ces stratégies se combinent (multiplicativement pour les poids, additivement pour les pénalités) avec la loss de base :
+$$\underbrace{\mathcal{L}_{\text{base},i}}_{\text{scalaire}} = \underbrace{w_i}_{\text{scalaire}} \cdot (\hat y_i - y_i)^2, \qquad w_i = \underbrace{(\tfrac{1}{30} + y_i)}_{\text{poids métrique}} \cdot \underbrace{w^{\text{imp}}[b(y_i)]}_{\text{shift Y, optionnel}}.$$
+
+L'aggregation finale dans `WeightedMSELoss` (avec gender présent) :
+$$\overline{e}_G = \frac{\sum_{i: g_i = G} w_i e_i}{\sum_{i: g_i = G} w_i} \in \mathbb{R}, \qquad \mathcal{L}_{\text{task}} = \tfrac{1}{2}(\overline{e}_F + \overline{e}_M) + \lambda_{\text{fair}} \cdot |\overline{e}_F - \overline{e}_M| \in \mathbb{R}_+.$$
+
+#### Stratégie A — Sampler gender + importance reweighting
+
+```yaml
+sampler_strategy: gender
+loss_importance_reweight: true
+```
+
+- **Côté data** : `WeightedRandomSampler` avec poids $\propto 1/n_G$ → batches équilibrés F/M en attendu
+- **Effet** : $n_{\text{samples/epoch}} = 2 \cdot \min(n_F, n_M)$ → perte de 20-40 % de données par epoch selon imbalance
+- **Côté loss** : $w_i$ inclut $w^{\text{imp}}$ (corrige shift Y)
+- **Théoriquement** : la plus propre, sépare les préoccupations (data corrige gender, loss corrige Y)
+- **Pratiquement** : la perte de données peut dégrader la convergence vs D
+
+#### Stratégie D — No sampler + importance + gender_reweight (no-op)
+
+```yaml
+sampler_strategy: none
+loss_importance_reweight: true
+loss_gender_reweight: true     # ← no-op, voir §"Train↔test shift"
+```
+
+- **`gender_rw`** : multiplie $w_i$ par une constante par-genre $c_{g_i}$. Mais cette constante **se factorise** dans $\overline{e}_G$ → effet nul (preuve ci-dessus)
+- **Effet net** : équivalent à « no sampler + importance_rw seul »
+- **Empiriquement** : bat A car utilise 100 % des données par epoch
+
+#### Stratégie E — Cell reweight (joint Y × G)
+
+```yaml
+sampler_strategy: none
+loss_cell_reweight: true
+```
+
+Construit $W^{\text{cell}} \in \mathbb{R}^{2 \times B}$ avec :
+$$W^{\text{cell}}[g, b] = \frac{1}{\sqrt{|\{i : g_i = g \wedge b(y_i) = b\}|}}, \quad \text{normalisé à moyenne 1}.$$
+
+Puis $w_i \mathrel{\*}= W^{\text{cell}}[g_i, b(y_i)]$.
+
+- **Spécificité** : le poids **varie par bin Y à l'intérieur d'un genre** → **ne se factorise pas** dans $\overline{e}_G$ → c'est un vrai mécanisme actif (contrairement à `gender_rw`)
+- **Effet** : compense la sous-représentation des cellules $(g, b)$ rares, sans utiliser $P_{\text{test}}$ (pas de correction de shift Y explicite)
+- **Coût** : O($B$), nul à la création (poids pré-calculés)
+
+#### Stratégie F — Sampler occlusion + gender_reweight (partiel)
+
+```yaml
+sampler_strategy: occlusion
+loss_gender_reweight: true     # ← no-op
+```
+
+- **Sampler** : équilibre les buckets d'occlusion (10 buckets quantiles) → couverture uniforme sur Y → proxy implicite pour la correction de shift
+- **`gender_rw`** : toujours no-op (cf. D)
+- **Perte de données** : encore plus forte qu'A si les buckets sont déséquilibrés
+
+#### Stratégie G — Adversarial debiasing (DANN)
+
+```yaml
+sampler_strategy: none
+loss_importance_reweight: true
+loss_adv_debiasing: true       # → enable_adv_disc=True dans le model
+adv_lambda: ε ∈ [0.01, 1.0] (log scale)
+```
+
+Architecture additionnelle : un MLP discriminateur de genre.
+
+| Paramètre / tenseur | Shape | Description |
+|---|---|---|
+| $\Phi$ | $(B,\, D')$ | features pooled (input du disc) |
+| $W_1$ | $(256,\, D')$ | première couche linéaire |
+| $b_1$ | $(256,)$ | bias |
+| $W_2$ | $(2,\, 256)$ | deuxième couche linéaire (2 classes : F/M) |
+| $b_2$ | $(2,)$ | bias |
+| $\text{Disc}(\Phi)$ | $(B,\, 2)$ | logits gender |
+| $\text{CE}(\text{Disc}, g)$ | $()$ scalaire | cross-entropy moyenne sur batch |
+
+$$\underbrace{\text{Disc}(\Phi)}_{(B,2)} = \underbrace{W_2}_{(2,256)} \cdot \underbrace{\text{ReLU}\bigl(\underbrace{W_1}_{(256,D')} \cdot \underbrace{\Phi}_{(D',)} + b_1\bigr)}_{(256,)} + b_2 \quad \text{(broadcast sur le batch)}.$$
+
+Loss adversariale :
+$$\mathcal{L}_{\text{adv}} = \mathrm{CE}\bigl(\text{Disc}(\text{GRL}(\Phi)),\; g\bigr) \in \mathbb{R}_+, \qquad \mathcal{L}_{\text{tot}} = \mathcal{L}_{\text{task}} + \lambda_{\text{adv}} \cdot \mathcal{L}_{\text{adv}}.$$
+
+**Gradient Reversal Layer (GRL)** : identité au forward, sign-flip au backward.
+
+| Direction | Opération | Shape input → output |
+|---|---|---|
+| forward | $\Phi \to \Phi$ (identité) | $(B, D') \to (B, D')$ |
+| backward | $\nabla_\Phi \mathcal{L}_{\text{adv}} \to -\nabla_\Phi \mathcal{L}_{\text{adv}}$ | $(B, D') \to (B, D')$ |
+
+**Conséquence du sign-flip** :
+- Le **discriminateur** reçoit le gradient normal ($+\nabla$) → il **apprend à classifier** le genre depuis les features
+- Le **backbone** reçoit le gradient inversé ($-\nabla$) → il **apprend à produire des features dont le genre n'est pas décodable**
+- Équilibre dynamique entre les deux ; $\lambda_{\text{adv}}$ trop grand → backbone explose, $\lambda_{\text{adv}}$ trop petit → effet nul
+
+**Coût total disc** :
+- Pour pooling CLS/GeM/MHA ($D' = D = 768$) : $W_1$ a $256 \cdot 768 = 197$k params + $W_2$ a $2 \cdot 256 = 512$ params → ~198k params
+- Pour pooling attention K-query ($D' = K \cdot D = 4608$ avec $K=6$) : $W_1$ a $256 \cdot 4608 = 1.18$M params
+
+Négligeable vs backbone ViT-B (86M).
+
+#### Stratégie H — MMD alignment
+
+```yaml
+sampler_strategy: none
+loss_importance_reweight: true
+loss_mmd_alignment: true
+mmd_lambda: ε ∈ [0.01, 1.0] (log scale)
+```
+
+Aligne les distributions de features pooled entre F et M via Maximum Mean Discrepancy² dans un RKHS gaussien.
+
+| Tenseur | Shape | Description |
+|---|---|---|
+| $\Phi$ | $(B,\, D')$ | features pooled, $D'$ dépend du pooling |
+| $\Phi_F$ | $(n_F,\, D')$ | sous-matrice des samples F dans le batch |
+| $\Phi_M$ | $(n_M,\, D')$ | sous-matrice des samples M dans le batch ($n_F + n_M = B$) |
+| Matrice $K_{FF} = k(\Phi_F, \Phi_F^\top)$ | $(n_F,\, n_F)$ | kernel intra-F |
+| Matrice $K_{MM}$ | $(n_M,\, n_M)$ | kernel intra-M |
+| Matrice $K_{FM}$ | $(n_F,\, n_M)$ | kernel inter-genre |
+| $\widehat{\text{MMD}^2}$ | $()$ scalaire | estimateur empirique |
+
+Définition mathématique :
+$$\text{MMD}^2(\Phi_F, \Phi_M) = \mathbb{E}_{x, x' \sim \Phi_F}[k(x, x')] + \mathbb{E}_{y, y' \sim \Phi_M}[k(y, y')] - 2 \, \mathbb{E}_{x \sim \Phi_F, y \sim \Phi_M}[k(x, y)].$$
+
+Kernel RBF multi-bandwidth (somme de gaussiennes à différents $\sigma$ pour robustesse) :
+$$k(x, y) = \frac{1}{|S|} \sum_{\sigma \in S} \exp\!\left( -\frac{\|x - y\|^2}{2 \sigma^2} \right) \in \mathbb{R}, \quad S = \{1, 5, 10\},\; x, y \in \mathbb{R}^{D'}.$$
+
+Implémenté en batch via produits scalaires (formule de polarisation) :
+$$\underbrace{\|x - y\|^2}_{(n_F, n_M)} = \underbrace{\|x\|^2}_{(n_F, 1)} + \underbrace{\|y\|^2}_{(1, n_M)} - 2 \underbrace{\langle x, y \rangle}_{(n_F, n_M)}.$$
+
+**Estimateur empirique** sur batch :
+$$\widehat{\text{MMD}^2} = \underbrace{\frac{1}{n_F^2} \sum_{i,j \in F} k(\phi_i, \phi_j)}_{\text{mean}(K_{FF})} + \underbrace{\frac{1}{n_M^2} \sum_{i,j \in M} k(\phi_i, \phi_j)}_{\text{mean}(K_{MM})} - \underbrace{\frac{2}{n_F n_M} \sum_{i \in F, j \in M} k(\phi_i, \phi_j)}_{\text{mean}(K_{FM})}.$$
+
+Loss totale :
+$$\mathcal{L}_{\text{tot}} = \mathcal{L}_{\text{task}} + \lambda_{\text{MMD}} \cdot \widehat{\text{MMD}^2}(\Phi_F, \Phi_M).$$
+
+- **Coût** : O($(n_F^2 + n_M^2 + n_F n_M) \cdot D'$), soit ~$B^2 \cdot D'$ par batch. Pour $B=32, D'=4608$ : ~4.7M flops par bandwidth × 3 bandwidths = ~14M flops. Négligeable.
+- **Avantage vs DANN** : pas d'adversaire à entraîner → stable, peu de tuning
+- **Limite** : aligne **toute** la distribution feature-space, alors qu'on voudrait seulement aligner conditionnellement sur Y
+- **Edge case** : si $n_F = 0$ ou $n_M = 0$ dans le batch (rare avec sampler équilibré), MMD = 0 par convention
+
+#### Stratégie I — Inter-gender Mixup
+
+```yaml
+sampler_strategy: none
+loss_importance_reweight: true
+mixup_inter_gender: true
+mixup_alpha: ε ∈ [0.1, 0.5]
+```
+
+Pour chaque sample F dans le batch, on cherche un partenaire M dans le bucket Y le plus proche, puis on interpole.
+
+| Tenseur | Shape | Description |
+|---|---|---|
+| $x$ (pixel_values) | $(B,\, C,\, H, W)$ | images du batch, $C = 3$, $H = W = 224$ |
+| labels (concaténation y + g) | $(B,\, 2)$ | colonne 0 = y, colonne 1 = g |
+| $f_{\text{idx}}$ | $(n_F,)$ | indices des samples F |
+| $m_{\text{idx}}$ | $(n_M,)$ | indices des samples M |
+| matrice de distance $|b(y_i^F) - b(y_j^M)|$ | $(n_F,\, n_M)$ | distance en bins entre chaque F et chaque M |
+| $\lambda$ | $(n_F,)$ | poids du sample F, échantillonné par Beta |
+| $\lambda_x = \lambda$ reshape | $(n_F,\, 1,\, 1,\, 1)$ | broadcast vers $(C, H, W)$ |
+| $\lambda_y = \lambda$ | $(n_F,)$ | broadcast vers la dimension Y |
+| $\tilde x$ (mixed images) | $(B,\, C,\, H,\, W)$ | tenseur retourné, F-slots remixés |
+| $\tilde{\text{labels}}$ | $(B,\, 2)$ | labels retournés, F-slots avec Y interpolé |
+
+**Étape 1 — pairing** : pour chaque sample $i \in f_{\text{idx}}$, on cherche son partenaire :
+$$\text{partner}(i) = \arg\min_{j \in m_{\text{idx}}} |b(y_i) - b(y_j)|, \quad \text{tie-break par perm aléatoire}.$$
+
+**Étape 2 — sampling du poids de mix** :
+$$\lambda_i \sim \text{Beta}(\alpha, \alpha) \in (0, 1), \quad i \in f_{\text{idx}}.$$
+
+Pour $\alpha \in [0.1, 0.5]$, la distribution Beta est U-shaped → $\lambda$ concentré près de 0 ou 1 (mix doux : mostly-F ou mostly-M).
+
+**Étape 3 — interpolation** :
+$$\underbrace{\tilde x_i}_{(C,H,W)} = \lambda_i \cdot \underbrace{x_i^F}_{(C,H,W)} + (1 - \lambda_i) \cdot \underbrace{x_{\text{partner}(i)}^M}_{(C,H,W)},$$
+$$\tilde y_i = \lambda_i \cdot y_i^F + (1 - \lambda_i) \cdot y_{\text{partner}(i)}^M, \quad \tilde g_i = g_i^F = 0 \text{ (inchangé)}.$$
+
+**Étape 4 — sortie** : on retourne `(mixed_pixel_values, mixed_labels)`, les samples M restent intouchés ; ce nouveau batch est passé au forward+compute_loss normalement.
+
+- **Coût** : O($n_F \cdot n_M$) pour la matrice de distance argmin + O($n_F \cdot C \cdot H \cdot W$) pour les interpolations. Tout en GPU. Négligeable.
+- **Avantage** : zéro params nouveaux, juste de la data aug
+- **Si un batch n'a que F ou que M** : pas de mix possible, batch retourné tel quel (early-return dans `inter_gender_mixup`)
+
+---
+
+### Résumé : matrice méthode × objectif
+
+| | Strat. | Sampler | Imp_rw | Mécanisme actif | Cible théorique |
+|---|---|---|---|---|---|
+| A | gender | ✓ | ✓ | aucun (sampler suffit pour G) | shift Y + fairness G via sampler |
+| D | none | ✓ | gender_rw=no-op | aucun nouveau | shift Y + fairness G via aggregation par-groupe |
+| E | none | ✗ | cell_rw | cell joint $Y \times G$ | équité Y×G implicite |
+| F | occlusion | ✗ | gender_rw=no-op | aucun nouveau | shift Y via sampler |
+| **G** | none | ✓ | **DANN** | fairness G via features invariantes au gender |
+| **H** | none | ✓ | **MMD** | fairness G via alignement de distributions de features |
+| **I** | none | ✓ | **Mixup inter-G** | invariance par augmentation conditionnelle Y |
+
+→ **A et D** s'attaquent au shift Y avec la fairness G en sous-produit (sampler / aggregation).
+→ **E** est joint Y×G sans estimer $P_{\text{test}}$.
+→ **F** est l'inverse d'A (sampler sur Y, pas explicitement sur G).
+→ **G/H/I** ajoutent des mécanismes de fairness *au niveau des features*, qui complètent (et non remplacent) le shift Y handling via `loss_importance_reweight=True`.
+
+---
+
 ## External data (optional)
 
 Two slots for extra data, both supported by the existing infrastructure — just drop files in the right place.

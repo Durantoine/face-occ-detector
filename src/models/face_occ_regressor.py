@@ -14,14 +14,23 @@ def _is_dinov3(model_name: str) -> bool:
     return model_name.startswith("dinov3_")
 
 
-def _build_backbone(model_name: str, drop_path_rate: float = 0.0) -> Tuple[nn.Module, int]:
+def _build_backbone(
+    model_name: str,
+    drop_path_rate: float = 0.0,
+    pretrained: bool = True,
+) -> Tuple[nn.Module, int]:
     if _is_dinov3(model_name):
-        backbone = load_dinov3(model_name, drop_path_rate=drop_path_rate)
+        backbone = load_dinov3(model_name, drop_path_rate=drop_path_rate, pretrained=pretrained)
         return backbone, hidden_size_of(model_name)
     if is_sapiens2(model_name):
-        backbone = load_sapiens2(model_name, drop_rate=drop_path_rate)
+        backbone = load_sapiens2(model_name, drop_rate=drop_path_rate, pretrained=pretrained)
         return backbone, sapiens2_hidden_size_of(model_name)
-    backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    if pretrained:
+        backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    else:
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        backbone = AutoModel.from_config(cfg, trust_remote_code=True)
     return backbone, backbone.config.hidden_size
 
 
@@ -32,6 +41,45 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.
     if isinstance(out, (tuple, list)):
         return out[0]
     return out.last_hidden_state if hasattr(out, "last_hidden_state") else out
+
+
+class CLSPooling(nn.Module):
+    """First-token pooling (DINO-native [CLS])."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+
+    @property
+    def output_dim(self) -> int:
+        return self.dim
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return x[:, 0, :], None
+
+
+class GeMPooling(nn.Module):
+    """Generalized Mean Pooling (Radenović et al. 2018). p apprenable.
+
+    pooled = (mean_n( clamp(x, eps)^p ))^(1/p). p=1 → mean; p→∞ → max.
+    On patches only (skip [CLS] token at index 0).
+    """
+
+    def __init__(self, dim: int, p_init: float = 3.0, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.p = nn.Parameter(torch.tensor(float(p_init)))
+
+    @property
+    def output_dim(self) -> int:
+        return self.dim
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        patches = x[:, 1:, :]
+        p = F.softplus(self.p) + self.eps
+        pooled = patches.clamp(min=self.eps).pow(p).mean(dim=1).pow(1.0 / p)
+        return pooled, None
 
 
 class AttentionPooling(nn.Module):
@@ -114,10 +162,141 @@ class AttentionPooling(nn.Module):
         return flat, weights
 
 
-def _query_diversity_penalty(weights: torch.Tensor) -> torch.Tensor:
-    """Pairwise cosine similarity between attention distributions across queries.
+class MultiHeadAttentionPooling(nn.Module):
+    """Standard multi-head attention pooling with a single learnable query.
 
-    weights: (B, K, N). Returns a scalar in [0, 1] (penalize redundancy).
+    1 query ∈ ℝᴰ, split across H heads (each ∈ ℝ^(D/H)). No per-head τ. Diversity
+    emerges from random init of W_q^h, W_k^h, W_v^h per head. Output: ℝᴰ.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        attn_dropout: float = 0.0,
+        proj_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, f"MultiHeadAttentionPooling: dim={dim} not divisible by num_heads={num_heads}"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.query = nn.Parameter(torch.randn(dim) * 0.02)
+        self.proj_q = nn.Linear(dim, dim)
+        self.proj_k = nn.Linear(dim, dim)
+        self.proj_v = nn.Linear(dim, dim)
+        self.proj_out = nn.Linear(dim, dim)
+        self.attn_dropout = nn.Dropout(attn_dropout)
+        self.norm = nn.LayerNorm(dim)
+        self.proj_dropout = nn.Dropout(proj_dropout)
+
+    @property
+    def output_dim(self) -> int:
+        return self.dim
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """x: (B, N, D)  →  pooled: (B, D), attn_weights: (B, H, N)"""
+        B, N, D = x.shape
+        H, Hd = self.num_heads, self.head_dim
+
+        q = self.proj_q(self.query).view(H, Hd)
+        k = self.proj_k(x).view(B, N, H, Hd).transpose(1, 2)
+        v = self.proj_v(x).view(B, N, H, Hd).transpose(1, 2)
+
+        scores = torch.einsum("hd,bhnd->bhn", q, k) / (Hd ** 0.5)
+        weights = F.softmax(scores, dim=-1)
+        weights = self.attn_dropout(weights)
+
+        pooled = torch.einsum("bhn,bhnd->bhd", weights, v).reshape(B, D)
+        pooled = self.proj_out(pooled)
+        pooled = self.norm(pooled)
+        pooled = self.proj_dropout(pooled)
+        return pooled, weights
+
+
+def build_pooling(
+    pooling_type: str,
+    dim: int,
+    # K-query
+    n_focal: int = 2,
+    n_diffuse: int = 2,
+    n_free: int = 2,
+    tau_focal_init: float = 0.1,
+    tau_diffuse_init: float = 1.5,
+    tau_free_init: float = 1.0,
+    learnable_tau: bool = True,
+    # Multi-head
+    num_heads: int = 4,
+    # GeM
+    gem_p_init: float = 3.0,
+    # Common
+    pool_attn_dropout: float = 0.0,
+    pool_proj_dropout: float = 0.0,
+) -> nn.Module:
+    if pooling_type == "cls":
+        return CLSPooling(dim=dim)
+    if pooling_type == "gem":
+        return GeMPooling(dim=dim, p_init=gem_p_init)
+    if pooling_type == "attention_k_query":
+        return AttentionPooling(
+            dim=dim, n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
+            tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
+            tau_free_init=tau_free_init, learnable_tau=learnable_tau,
+            attn_dropout=pool_attn_dropout, proj_dropout=pool_proj_dropout,
+        )
+    if pooling_type == "multihead_attention":
+        return MultiHeadAttentionPooling(
+            dim=dim, num_heads=num_heads,
+            attn_dropout=pool_attn_dropout, proj_dropout=pool_proj_dropout,
+        )
+    raise ValueError(f"Unknown pooling_type: {pooling_type}")
+
+
+class _GradReverse(torch.autograd.Function):
+    """Gradient Reversal Layer (Ganin & Lempitsky 2015). Identity forward, sign-flipped
+    gradient backward scaled by alpha. The adversarial λ is applied as a loss weight
+    in compute_loss — alpha here is fixed to 1.0 so GRL is a pure sign-flipper.
+    """
+    @staticmethod
+    def forward(ctx: Any, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        return grad_output.neg() * ctx.alpha, None
+
+
+def grad_reverse(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+    return _GradReverse.apply(x, alpha)
+
+
+class GenderDiscriminator(nn.Module):
+    """Small MLP that predicts gender from features. Used with GRL for DANN-style
+    adversarial debiasing: backbone learns features that the disc cannot classify.
+    """
+    def __init__(self, in_dim: int, hidden: int = 256, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 2),
+        )
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _query_diversity_penalty(weights: torch.Tensor) -> torch.Tensor:
+    """Pairwise cosine similarity between attention distributions across queries/heads.
+
+    weights: (B, K, N) for K-query, (B, H, N) for MHA. Returns a scalar in [0, 1].
     """
     w = F.normalize(weights, p=2, dim=-1)
     K = w.size(1)
@@ -136,9 +315,12 @@ class FaceOccRegressor(nn.Module):
         head_dropout: float = 0.1,
         projection_size: Optional[int] = None,
         output_activation: str = "sigmoid",
-        # Backbone regularization
+        # Backbone
         backbone_drop_path_rate: float = 0.0,
-        # Attention pooling structure
+        pretrained: bool = True,
+        # Pooling dispatch
+        pooling_type: str = "attention_k_query",
+        # K-query
         n_focal: int = 2,
         n_diffuse: int = 2,
         n_free: int = 2,
@@ -146,29 +328,39 @@ class FaceOccRegressor(nn.Module):
         tau_diffuse_init: float = 1.5,
         tau_free_init: float = 1.0,
         learnable_tau: bool = True,
-        # Attention pooling regularization
+        # Multi-head
+        num_heads: int = 4,
+        # GeM
+        gem_p_init: float = 3.0,
+        # Common pool regularization
         pool_attn_dropout: float = 0.0,
         pool_proj_dropout: float = 0.0,
+        # Adversarial debiasing (DANN)
+        enable_adv_disc: bool = False,
+        adv_disc_hidden: int = 256,
+        adv_disc_dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.model_name = model_name
         self.output_dim = output_dim
         self.head_dropout = head_dropout
         self.output_activation = output_activation
+        self.pooling_type = pooling_type
+        self.enable_adv_disc = enable_adv_disc
 
-        self.backbone, hidden_size = _build_backbone(model_name, drop_path_rate=backbone_drop_path_rate)
+        self.backbone, hidden_size = _build_backbone(
+            model_name, drop_path_rate=backbone_drop_path_rate, pretrained=pretrained,
+        )
 
-        self.pool = AttentionPooling(
+        self.pool = build_pooling(
+            pooling_type=pooling_type,
             dim=hidden_size,
-            n_focal=n_focal,
-            n_diffuse=n_diffuse,
-            n_free=n_free,
-            tau_focal_init=tau_focal_init,
-            tau_diffuse_init=tau_diffuse_init,
-            tau_free_init=tau_free_init,
-            attn_dropout=pool_attn_dropout,
-            proj_dropout=pool_proj_dropout,
-            learnable_tau=learnable_tau,
+            n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
+            tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
+            tau_free_init=tau_free_init, learnable_tau=learnable_tau,
+            num_heads=num_heads,
+            gem_p_init=gem_p_init,
+            pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
         )
 
         if projection_size:
@@ -185,11 +377,17 @@ class FaceOccRegressor(nn.Module):
 
         self.dropout = nn.Dropout(head_dropout)
         self.head = nn.Linear(final_size, output_dim)
+        self.adv_disc: Optional[GenderDiscriminator] = (
+            GenderDiscriminator(in_dim=final_size, hidden=adv_disc_hidden, dropout=adv_disc_dropout)
+            if enable_adv_disc else None
+        )
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for m in [self.head, self.pool.proj_k, self.pool.proj_v]:
+        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        nn.init.zeros_(self.head.bias)
+        for m in self.pool.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
                 nn.init.zeros_(m.bias)
@@ -235,13 +433,17 @@ class FaceOccRegressor(nn.Module):
         pooled, attn_weights = self.pool(hidden)
         if self.projection is not None:
             pooled = self.projection(pooled)
-        pooled = self.dropout(pooled)
-        logits = self.head(pooled)
+        features = self.dropout(pooled)
+        logits = self.head(features)
         pred = self._activate(logits).squeeze(-1) if self.output_dim == 1 else self._activate(logits)
 
-        out = {"logits": pred}
+        out: Dict[str, torch.Tensor] = {"logits": pred}
         if self.training:
-            out["attn_weights"] = attn_weights
+            out["features"] = features
+            if attn_weights is not None:
+                out["attn_weights"] = attn_weights
+            if self.adv_disc is not None:
+                out["adv_logits"] = self.adv_disc(grad_reverse(features, 1.0))
         return out
 
     @classmethod

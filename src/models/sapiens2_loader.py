@@ -38,9 +38,8 @@ def load_sapiens2(
     arch: str = "sapiens2_0.8b",
     image_size: int = 224,
     drop_rate: float = 0.0,
+    pretrained: bool = True,
 ) -> torch.nn.Module:
-    from huggingface_hub import hf_hub_download
-    from safetensors.torch import load_file
     from sapiens.backbones.standalone.sapiens2 import Sapiens2
 
     if arch not in _HF_REPO_BY_ARCH:
@@ -55,6 +54,13 @@ def load_sapiens2(
         with_cls_token=True,
         drop_rate=drop_rate,
     )
+    if not pretrained:
+        print(f"Sapiens2 {arch}: random init (pretrained=False)")
+        return backbone
+
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
     ckpt_path = hf_hub_download(
         repo_id=_HF_REPO_BY_ARCH[arch],
         filename=_SAFETENSOR_FILENAME[arch],

@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -174,6 +176,82 @@ class GroupDROLoss(nn.Module):
         mean_loss = stacked.mean()
         worst_loss = stacked.max()
         return (1.0 - self.alpha) * mean_loss + self.alpha * worst_loss
+
+
+def mmd_rbf(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    sigmas: Tuple[float, ...] = (1.0, 5.0, 10.0),
+) -> torch.Tensor:
+    """Multi-bandwidth RBF Maximum Mean Discrepancy² between two sets of features.
+
+    x: (n_x, D), y: (n_y, D). Returns scalar MMD² ≥ 0.
+    Returns 0 if either side is empty (no group in batch).
+    """
+    if x.shape[0] == 0 or y.shape[0] == 0:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+
+    xx_sq = x.pow(2).sum(-1)
+    yy_sq = y.pow(2).sum(-1)
+    dxx = xx_sq.unsqueeze(1) + xx_sq.unsqueeze(0) - 2.0 * (x @ x.T)
+    dyy = yy_sq.unsqueeze(1) + yy_sq.unsqueeze(0) - 2.0 * (y @ y.T)
+    dxy = xx_sq.unsqueeze(1) + yy_sq.unsqueeze(0) - 2.0 * (x @ y.T)
+
+    mmd = torch.zeros((), device=x.device, dtype=x.dtype)
+    for sigma in sigmas:
+        denom = 2.0 * sigma * sigma
+        mmd = mmd + (-dxx / denom).exp().mean() + (-dyy / denom).exp().mean() - 2.0 * (-dxy / denom).exp().mean()
+    return mmd / len(sigmas)
+
+
+def inter_gender_mixup(
+    pixel_values: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = 0.2,
+    bin_width: float = 0.025,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """In-batch inter-gender mixup. For each F sample, pair with an M sample of
+    closest Y bucket; interpolate image + y. Gender of mixed sample = that of
+    the partner with the larger mix weight.
+
+    pixel_values: (B, C, H, W). labels: (B, 2) — col 0 = y, col 1 = gender ∈ {0,1}.
+    Samples without a same-bucket cross-gender partner are left unchanged.
+    Returns (mixed_pixel_values, mixed_labels) — both same shape as inputs.
+    """
+    if labels.dim() != 2 or labels.size(1) < 2 or alpha <= 0:
+        return pixel_values, labels
+
+    device = pixel_values.device
+    y = labels[:, 0]
+    g = labels[:, 1]
+    f_idx = torch.nonzero(g < 0.5, as_tuple=False).flatten()
+    m_idx = torch.nonzero(g >= 0.5, as_tuple=False).flatten()
+    if f_idx.numel() == 0 or m_idx.numel() == 0:
+        return pixel_values, labels
+
+    f_y = y[f_idx]
+    m_y = y[m_idx]
+    f_bin = (f_y / bin_width).floor()
+    m_bin = (m_y / bin_width).floor()
+    # For each F, find nearest M in bin space (|Δbin|), break ties by random order
+    diff = (f_bin.unsqueeze(1) - m_bin.unsqueeze(0)).abs()
+    perm = torch.randperm(m_idx.numel(), device=device)
+    diff = diff[:, perm]
+    nearest = diff.argmin(dim=1)
+    partner_idx = m_idx[perm[nearest]]
+
+    mix = pixel_values.clone()
+    new_labels = labels.clone()
+    lam = torch.distributions.Beta(alpha, alpha).sample((f_idx.numel(),)).to(device=device, dtype=pixel_values.dtype)
+    lam_x = lam.view(-1, 1, 1, 1)
+    lam_y = lam.view(-1)
+
+    mix[f_idx] = lam_x * pixel_values[f_idx] + (1.0 - lam_x) * pixel_values[partner_idx]
+    new_labels[f_idx, 0] = lam_y * y[f_idx] + (1.0 - lam_y) * y[partner_idx]
+    # Gender stays F: the mixed sample is "F image contaminated by M pixels", label remains F.
+    # This is the augmentation that forces features to predict Y invariantly to gender,
+    # without introducing label noise on the gender dimension.
+    return mix, new_labels
 
 
 def occlusion_bucket(labels, n_buckets: int = 5):

@@ -75,15 +75,27 @@ optuna:
   rotate_val_seed: true
   search_space:
     # === Always sampled ===
-    # pretrained_source: choisit entre les poids pré-entraînés "de base" (DINOv3
-    # LVD-1689M générique) et notre pretrain iBOT custom sur le domaine face.
-    # Format: "lvd" ou "ibot:<mlflow_model_uri>". Pas de random init (sans intérêt
-    # pour un ViT-B sur 100k images, voir README §Méthodes).
+    # pretrained_source: Optuna choisit la source des poids du backbone parmi :
+    #   - "lvd"                                    DINOv3 LVD-1689M générique (Meta)
+    #   - "ibot:runs:/<RUN_ID>/encoder_50000"     iBOT @ 50k steps  (~1.25 ep MS1MV3)
+    #   - "ibot:runs:/<RUN_ID>/encoder_100000"    iBOT @ 100k steps (~2.5  ep)
+    #   - "ibot:runs:/<RUN_ID>/encoder_150000"    iBOT @ 150k steps (~3.8  ep)
+    #   - "ibot:runs:/<RUN_ID>/encoder"           iBOT final @ 200k steps (~5 ep)
+    #
+    # Remplir <RUN_ID> avec le contenu de results/pretrain_vitb16/mlflow_run_id.txt
+    # après le pretrain. Snapshots via EncoderSnapshotCallback dans pretrain_ibot.py
+    # (FACE_OCC_PRETRAIN_SNAPSHOT_STEPS=50000,100000,150000, MAX_STEPS=200000).
+    #
+    # Le validateur _validate_pretrained_source_choices() rejette les placeholders
+    # __FILL_PRETRAIN_RUN_ID__ et les runs MLflow inexistants au démarrage du sweep.
     pretrained_source:
       type: categorical
       choices:
         - "lvd"
-        - "ibot:/home/infres/adurand-25/face-occ-detector/results/pretrain_vitb16/checkpoint-150000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_50000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_100000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_150000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]

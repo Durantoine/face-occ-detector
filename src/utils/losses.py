@@ -209,13 +209,14 @@ def inter_gender_mixup(
     labels: torch.Tensor,
     alpha: float = 0.2,
     bin_width: float = 0.025,
+    max_bucket_distance: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """In-batch inter-gender mixup. For each F sample, pair with an M sample of
-    closest Y bucket; interpolate image + y. Gender of mixed sample = that of
-    the partner with the larger mix weight.
+    """In-batch inter-gender mixup. For each F sample, pair with the M sample whose
+    Y bucket is closest (within `max_bucket_distance` bins of `bin_width`). Interpolate
+    image + y. Gender stays F (no label noise on the gender dimension).
 
     pixel_values: (B, C, H, W). labels: (B, 2) — col 0 = y, col 1 = gender ∈ {0,1}.
-    Samples without a same-bucket cross-gender partner are left unchanged.
+    F samples without a valid (close-Y) M partner are left unchanged.
     Returns (mixed_pixel_values, mixed_labels) — both same shape as inputs.
     """
     if labels.dim() != 2 or labels.size(1) < 2 or alpha <= 0:
@@ -238,19 +239,27 @@ def inter_gender_mixup(
     perm = torch.randperm(m_idx.numel(), device=device)
     diff = diff[:, perm]
     nearest = diff.argmin(dim=1)
-    partner_idx = m_idx[perm[nearest]]
+    nearest_dist = diff.gather(1, nearest.unsqueeze(1)).squeeze(1)
+    # Only mix F samples that found a partner within max_bucket_distance bins.
+    valid = nearest_dist <= float(max_bucket_distance)
+    if not valid.any():
+        return pixel_values, labels
+    f_idx_valid = f_idx[valid]
+    partner_idx = m_idx[perm[nearest[valid]]]
 
     mix = pixel_values.clone()
     new_labels = labels.clone()
-    lam = torch.distributions.Beta(alpha, alpha).sample((f_idx.numel(),)).to(device=device, dtype=pixel_values.dtype)
+    lam = torch.distributions.Beta(alpha, alpha).sample((f_idx_valid.numel(),)).to(
+        device=device, dtype=pixel_values.dtype,
+    )
     lam_x = lam.view(-1, 1, 1, 1)
     lam_y = lam.view(-1)
 
-    mix[f_idx] = lam_x * pixel_values[f_idx] + (1.0 - lam_x) * pixel_values[partner_idx]
-    new_labels[f_idx, 0] = lam_y * y[f_idx] + (1.0 - lam_y) * y[partner_idx]
-    # Gender stays F: the mixed sample is "F image contaminated by M pixels", label remains F.
-    # This is the augmentation that forces features to predict Y invariantly to gender,
-    # without introducing label noise on the gender dimension.
+    mix[f_idx_valid] = lam_x * pixel_values[f_idx_valid] + (1.0 - lam_x) * pixel_values[partner_idx]
+    new_labels[f_idx_valid, 0] = lam_y * y[f_idx_valid] + (1.0 - lam_y) * y[partner_idx]
+    # Gender stays F (label of the original slot, not the partner's). The mixed sample is
+    # "F image contaminated by M pixels", label remains F → forces features to predict Y
+    # invariantly to gender, without introducing label noise on the gender dimension.
     return mix, new_labels
 
 

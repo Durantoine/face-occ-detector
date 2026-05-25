@@ -12,6 +12,11 @@ from torch.utils.data import Dataset, IterableDataset
 
 from src.data.dataset import IMAGE_EXTS
 from src.models.dinov3_loader import get_image_processor, hidden_size_of, load_dinov3
+from src.models.sapiens2_loader import (
+    hidden_size_of as sapiens2_hidden_size_of,
+    is_sapiens2,
+    load_sapiens2,
+)
 from src.utils.environment import setup_environment
 
 setup_environment()
@@ -24,24 +29,24 @@ CONFIG: Dict[str, Any] = {
     "output_dir": os.environ.get("FACE_OCC_PRETRAIN_OUT", "./results/pretrain"),
     "tracking_uri": "sqlite:///mlflow.db",
     "mlflow_experiment": "face-occ-pretrain",
-    "num_train_epochs": 30,
-    "per_device_train_batch_size": 32,
-    "gradient_accumulation_steps": 2,
-    "learning_rate": 5.0e-5,
-    "mask_ratio": 0.5,
-    "warmup_ratio": 0.05,
-    "weight_decay": 0.05,
+    "num_train_epochs": int(os.environ.get("FACE_OCC_PRETRAIN_EPOCHS", "30")),
+    "per_device_train_batch_size": int(os.environ.get("FACE_OCC_PRETRAIN_BS", "32")),
+    "gradient_accumulation_steps": int(os.environ.get("FACE_OCC_PRETRAIN_GA", "2")),
+    "learning_rate": float(os.environ.get("FACE_OCC_PRETRAIN_LR", "5.0e-5")),
+    "mask_ratio": float(os.environ.get("FACE_OCC_PRETRAIN_MASK_RATIO", "0.5")),
+    "warmup_ratio": float(os.environ.get("FACE_OCC_PRETRAIN_WARMUP", "0.05")),
+    "weight_decay": float(os.environ.get("FACE_OCC_PRETRAIN_WD", "0.05")),
     "seed": 42,
     "bf16": True,
     "fp16": False,
     "gradient_checkpointing": True,
-    "image_size": 112,
+    "image_size": int(os.environ.get("FACE_OCC_PRETRAIN_IMG_SIZE", "112")),
     "patch_size": 16,
     "max_steps": int(os.environ.get("FACE_OCC_PRETRAIN_MAX_STEPS", "100000")),
     "save_steps": 5000,
     "logging_steps": 100,
-    "teacher_frozen": True,
-    "teacher_ema_decay": 0.999,
+    "teacher_frozen": os.environ.get("FACE_OCC_PRETRAIN_TEACHER_FROZEN", "1") != "0",
+    "teacher_ema_decay": float(os.environ.get("FACE_OCC_PRETRAIN_EMA_DECAY", "0.999")),
 }
 
 
@@ -129,6 +134,168 @@ class DinoV3IBoT(nn.Module):
             cls_drift = (1.0 - (cls_s * cls_t).sum(dim=-1)).mean()
 
         return {"loss": loss, "cls_drift": cls_drift.detach()}
+
+
+class Sapiens2IBoT(nn.Module):
+    """iBOT-style pretrain for Sapiens2 backbones.
+
+    Unlike DINOv3 (which exposes `forward_features(masks=...)` for proper token-level
+    masking), Sapiens2's standalone forward doesn't accept a mask argument. We use
+    pixel-space masking instead: the student sees an image with the corresponding
+    patch regions zeroed out, while the teacher sees the original image. The student
+    must reconstruct the masked patch features by attending to surrounding context.
+
+    Less clean than DINOv3's [MASK] token approach, but safer in terms of "ne pas
+    abîmer le backbone" — no structural modification, the model just sees masked
+    images as a strong cut-out augmentation.
+    """
+
+    def __init__(
+        self,
+        arch: str,
+        mask_ratio: float = 0.4,
+        image_size: int = 224,
+        patch_size: int = 16,
+        teacher_frozen: bool = True,
+        teacher_ema_decay: float = 0.9995,
+        drop_rate: float = 0.15,
+    ) -> None:
+        super().__init__()
+        self.student = load_sapiens2(arch, image_size=image_size, drop_rate=drop_rate)
+        self.teacher = load_sapiens2(arch, image_size=image_size, drop_rate=0.0)
+        self.teacher.load_state_dict(self.student.state_dict())
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        self.teacher.eval()
+        self.teacher_frozen = teacher_frozen
+        self.teacher_ema_decay = teacher_ema_decay
+        self.mask_ratio = mask_ratio
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_patches_side = image_size // patch_size
+        self.num_patches = self.num_patches_side ** 2
+        self.hidden = sapiens2_hidden_size_of(arch)
+        self._grad_ckpt_enabled = False
+
+    def gradient_checkpointing_enable(self, **kwargs: Any) -> None:
+        from torch.utils.checkpoint import checkpoint as ckpt
+        if self._grad_ckpt_enabled:
+            return
+        blocks_attr = next((a for a in ("blocks", "layers") if hasattr(self.student, a)), None)
+        if blocks_attr is None:
+            print(f"[Sapiens2IBoT] WARNING: cannot enable gradient_checkpointing (no .blocks/.layers)")
+            return
+        blocks = getattr(self.student, blocks_attr)
+        for block in blocks:
+            orig = block.forward
+
+            def _wrap(orig_forward):
+                def _ckpt_forward(*args, **kw):
+                    return ckpt(orig_forward, *args, use_reentrant=False, **kw)
+                return _ckpt_forward
+            block.forward = _wrap(orig)
+        self._grad_ckpt_enabled = True
+        print(f"[Sapiens2IBoT] gradient_checkpointing enabled on {len(blocks)} student blocks")
+
+    def gradient_checkpointing_disable(self) -> None:
+        self._grad_ckpt_enabled = False
+
+    @torch.no_grad()
+    def ema_update_teacher(self) -> None:
+        if self.teacher_frozen:
+            return
+        d = self.teacher_ema_decay
+        for ps, pt in zip(self.student.parameters(), self.teacher.parameters()):
+            pt.data.mul_(d).add_(ps.data, alpha=1.0 - d)
+
+    def _random_mask(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        n_mask = max(1, int(self.num_patches * self.mask_ratio))
+        noise = torch.rand(batch_size, self.num_patches, device=device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        mask = torch.zeros(batch_size, self.num_patches, dtype=torch.bool, device=device)
+        mask.scatter_(1, ids_shuffle[:, :n_mask], True)
+        return mask
+
+    def _apply_pixel_mask(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Zero out the pixel regions corresponding to masked patches.
+
+        x:    (B, C, H, W)  pixel values
+        mask: (B, num_patches)  True = masked
+        """
+        B, _, _, _ = x.shape
+        P = self.patch_size
+        S = self.num_patches_side
+        mask_2d = mask.view(B, S, S).to(x.dtype)
+        mask_full = (
+            mask_2d.unsqueeze(1)
+            .repeat_interleave(P, dim=2)
+            .repeat_interleave(P, dim=3)
+        )
+        return x * (1.0 - mask_full)
+
+    @staticmethod
+    def _extract_tokens(out: Any) -> torch.Tensor:
+        """Return (B, N, D). Sapiens2 returns either a Tensor, tuple/list, or dict."""
+        if isinstance(out, (tuple, list)):
+            return out[0]
+        if isinstance(out, dict):
+            for k in ("x", "tokens", "last_hidden_state", "x_norm_patchtokens"):
+                if k in out:
+                    return out[k]
+        if hasattr(out, "last_hidden_state"):
+            return out.last_hidden_state
+        return out
+
+    def forward(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
+        B = pixel_values.shape[0]
+        mask = self._random_mask(B, pixel_values.device)
+        masked_pixel_values = self._apply_pixel_mask(pixel_values, mask)
+
+        student_tokens = self._extract_tokens(self.student(masked_pixel_values))
+        with torch.no_grad():
+            teacher_tokens = self._extract_tokens(self.teacher(pixel_values))
+
+        # Skip CLS token at index 0; the remaining tokens align with our patch mask
+        student_patches = student_tokens[:, -self.num_patches:, :]
+        teacher_patches = teacher_tokens[:, -self.num_patches:, :]
+
+        s = F.normalize(student_patches.float(), dim=-1, eps=1e-6)
+        t = F.normalize(teacher_patches.float(), dim=-1, eps=1e-6)
+        cos = (s * t).sum(dim=-1)
+        per_pos_loss = 1.0 - cos
+        denom = mask.float().sum().clamp(min=1.0)
+        loss = (per_pos_loss * mask.float()).sum() / denom
+
+        with torch.no_grad():
+            cls_s = F.normalize(student_tokens[:, 0, :].float(), dim=-1, eps=1e-6)
+            cls_t = F.normalize(teacher_tokens[:, 0, :].float(), dim=-1, eps=1e-6)
+            cls_drift = (1.0 - (cls_s * cls_t).sum(dim=-1)).mean()
+
+        return {"loss": loss, "cls_drift": cls_drift.detach()}
+
+
+def build_ibot_model(
+    arch: str,
+    mask_ratio: float,
+    image_size: int,
+    patch_size: int,
+    teacher_frozen: bool,
+    teacher_ema_decay: float,
+    drop_rate: float = 0.15,
+) -> nn.Module:
+    """Dispatch the right iBOT wrapper based on the backbone arch."""
+    if arch.startswith("dinov3"):
+        return DinoV3IBoT(
+            arch=arch, mask_ratio=mask_ratio, image_size=image_size, patch_size=patch_size,
+            teacher_frozen=teacher_frozen, teacher_ema_decay=teacher_ema_decay,
+        )
+    if is_sapiens2(arch):
+        return Sapiens2IBoT(
+            arch=arch, mask_ratio=mask_ratio, image_size=image_size, patch_size=patch_size,
+            teacher_frozen=teacher_frozen, teacher_ema_decay=teacher_ema_decay,
+            drop_rate=drop_rate,
+        )
+    raise ValueError(f"Unknown arch for iBOT pretrain: {arch}")
 
 
 class ImageOnlyDataset(Dataset):
@@ -222,7 +389,7 @@ def pretrain_ibot(
     if hasattr(processor, "size"):
         processor.size = {"height": image_size, "width": image_size}
 
-    model = DinoV3IBoT(
+    model = build_ibot_model(
         arch=arch,
         mask_ratio=mask_ratio,
         image_size=image_size,
@@ -241,11 +408,38 @@ def pretrain_ibot(
         fp16 = False
 
     class EMACallback(TrainerCallback):
-        def __init__(self, m: DinoV3IBoT) -> None:
+        def __init__(self, m: nn.Module) -> None:
             self.m = m
 
         def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
             self.m.ema_update_teacher()
+
+    snapshot_env = os.environ.get("FACE_OCC_PRETRAIN_SNAPSHOT_STEPS", "").strip()
+    snapshot_steps = sorted({int(s) for s in snapshot_env.split(",") if s.strip()})
+
+    class EncoderSnapshotCallback(TrainerCallback):
+        """Log the student encoder to MLflow at each listed step as artifact
+        `encoder_<step>`. URI `runs:/<run_id>/encoder_<step>` plugs directly into
+        `pretrained_source` of finetune yamls — lets us A/B test multiple pretrain
+        checkpoints from a single run."""
+        def __init__(self, m: nn.Module, steps: List[int]) -> None:
+            import copy as _copy
+            self._copy = _copy
+            self.m = m
+            self.steps = set(steps)
+            self.done: set = set()
+
+        def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            step = state.global_step
+            if step not in self.steps or step in self.done:
+                return
+            self.done.add(step)
+            if int(os.environ.get("RANK", "0")) != 0:
+                return
+            snap = self._copy.deepcopy(self.m.student).to(torch.float32).cpu()
+            info = mlflow.pytorch.log_model(snap, f"encoder_{step}")
+            print(f"[snapshot] encoder_{step} logged: {info.model_uri}")
+            del snap
 
     if is_iterable and max_steps <= 0:
         raise ValueError("WebDataset is iterable — set max_steps>0 (env FACE_OCC_PRETRAIN_MAX_STEPS).")
@@ -308,7 +502,10 @@ def pretrain_ibot(
                 "teacher_ema_decay": teacher_ema_decay,
             })
 
-    callbacks = [] if teacher_frozen else [EMACallback(model)]
+    callbacks: List[TrainerCallback] = [] if teacher_frozen else [EMACallback(model)]
+    if snapshot_steps:
+        callbacks.append(EncoderSnapshotCallback(model, snapshot_steps))
+        print(f"Encoder snapshots will be logged at steps: {snapshot_steps}")
     trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     print(f"iBOT pretraining: {arch} @ {image_size}x{image_size} | mask_ratio={mask_ratio} | "
           f"teacher={'frozen' if teacher_frozen else f'EMA(decay={teacher_ema_decay})'} | "

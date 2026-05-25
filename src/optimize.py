@@ -52,7 +52,7 @@ _TRAINING_KEYS = {
 _MODEL_KEYS = {
     "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
     "backbone_drop_path_rate",
-    "pretrained", "pooling_type",
+    "pretrained", "pretrained_source", "pooling_type",
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
     "num_heads", "gem_p_init",
@@ -60,22 +60,50 @@ _MODEL_KEYS = {
     "attn_dropout", "proj_dropout",
 }
 
-_BALANCING_STRATEGY_MAP = {
-    "A": {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "D": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "E": {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True,  "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "F": {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    # G/H/I — feature-level fairness mechanisms on top of importance reweighting (no sampler reduction).
-    "G": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "H": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
-    "I": {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
+_BALANCING_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
+    # === Reweighting + sampler (classiques) ===
+    "gender_sampler_imp":   {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "imp_only":             {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "cell_joint_yg":        {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True,  "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "occ_sampler_gender":   {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    # === Feature-level fairness mechanisms on top of importance reweighting (no sampler reduction). ===
+    "dann":                 {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "mmd":                  {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
+    "mixup_gender":         {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
+}
+
+# Backward-compat aliases for legacy MLflow / Optuna studies using A/D/E/F/G/H/I.
+_BALANCING_STRATEGY_ALIASES: Dict[str, str] = {
+    "A": "gender_sampler_imp",
+    "D": "imp_only",
+    "E": "cell_joint_yg",
+    "F": "occ_sampler_gender",
+    "G": "dann",
+    "H": "mmd",
+    "I": "mixup_gender",
 }
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
     if name == "balancing_strategy":
-        for k, v in _BALANCING_STRATEGY_MAP[str(value)].items():
+        key = _BALANCING_STRATEGY_ALIASES.get(str(value), str(value))
+        if key not in _BALANCING_STRATEGY_MAP:
+            raise ValueError(f"Unknown balancing_strategy: {value!r}")
+        for k, v in _BALANCING_STRATEGY_MAP[key].items():
             cfg["training"][k] = v
+        return
+    if name == "pretrained_source":
+        # "lvd"            → default pretrained backbone, no MLflow override
+        # "ibot:runs:/..." → default pretrained backbone, THEN override with the
+        #                    MLflow-registered iBOT encoder from the given run.
+        s = str(value)
+        cfg["model"]["pretrained"] = True
+        if s == "lvd" or s == "sapiens_default":
+            cfg["model"]["init_backbone_from"] = None
+        elif s.startswith("ibot:"):
+            cfg["model"]["init_backbone_from"] = s[len("ibot:"):]
+        else:
+            raise ValueError(f"Unknown pretrained_source: {s}")
         return
     if name in _TRAINING_KEYS:
         cfg["training"][name] = value
@@ -293,6 +321,49 @@ class _MaxTrials:
             study.stop()
 
 
+def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_uri: str) -> None:
+    """Fail-fast validation of `pretrained_source` choices in the search space.
+
+    Catches two common errors before the sweep burns GPU hours:
+      - Forgotten placeholders like `__FILL_SAPIENS_IBOT_RUN_ID__` in the iBOT URI
+      - Non-existent MLflow runs (typo, wrong tracking URI, run deleted)
+
+    Choices follow the schema `"lvd" | "sapiens_default" | "ibot:runs:/<run_id>/<artifact>"`.
+    Only the `ibot:...` branch is validated against MLflow.
+    """
+    import re
+
+    ss = base_config.get("optuna", {}).get("search_space", {})
+    spec = ss.get("pretrained_source")
+    if not spec or spec.get("type") != "categorical":
+        return
+    choices = spec.get("choices") or []
+
+    placeholder_pattern = re.compile(r"__FILL[_A-Z0-9]*__")
+    run_id_pattern = re.compile(r"^ibot:runs:/([^/]+)/")
+
+    bad: List[str] = []
+    for c in choices:
+        s = str(c)
+        if placeholder_pattern.search(s):
+            bad.append(f"  ✗ '{s}' contains a placeholder — fill the MLflow run_id of the iBOT pretrain")
+            continue
+        m = run_id_pattern.match(s)
+        if m:
+            run_id = m.group(1)
+            try:
+                MlflowClient(tracking_uri=tracking_uri).get_run(run_id)
+            except Exception as e:
+                bad.append(f"  ✗ '{s}' → MLflow lookup of run {run_id} failed: {e}")
+
+    if bad:
+        msg = (
+            "Invalid pretrained_source choices in search_space — fix the yaml before starting the sweep:\n"
+            + "\n".join(bad)
+        )
+        raise ValueError(msg)
+
+
 def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna.Study:
     pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
     for _ in range(10):
@@ -336,6 +407,12 @@ def optimize_hyperparameters(
     objective_mode = optuna_cfg.get("objective_mode", objective_mode)
     rotate_val_seed = optuna_cfg.get("rotate_val_seed", rotate_val_seed)
     n_trials = optuna_cfg.get("n_trials", n_trials)
+
+    # Early validation: fail fast if pretrained_source choices reference placeholders
+    # or runs that don't resolve in MLflow. Avoid wasting 30 min of GPU on a trial
+    # that crashes at backbone load time.
+    if is_main() and use_mlflow:
+        _validate_pretrained_source_choices(base_config, tracking_uri)
     if study_name is None:
         study_name = f"optuna-{architecture}-{datetime.now().strftime('%Y%m%d')}"
 

@@ -61,8 +61,14 @@ class CLSPooling(nn.Module):
 class GeMPooling(nn.Module):
     """Generalized Mean Pooling (Radenović et al. 2018). p apprenable.
 
-    pooled = (mean_n( clamp(x, eps)^p ))^(1/p). p=1 → mean; p→∞ → max.
+    pooled = (mean_n( max(x, eps)^p ))^(1/p). p=1 → mean; p→∞ → max.
     On patches only (skip [CLS] token at index 0).
+
+    Pre-activation : GeM est défini pour features non-négatives (le paper original
+    travaille sur features CNN post-ReLU). Pour des features ViT brutes (qui peuvent
+    être négatives après le LayerNorm final du backbone), on applique softplus avant
+    le clamp pour préserver le signal des composantes négatives — sinon `clamp(min=eps)`
+    écraserait ~50% des composantes à epsilon et tuerait la moitié du gradient.
     """
 
     def __init__(self, dim: int, p_init: float = 3.0, eps: float = 1e-6) -> None:
@@ -77,8 +83,11 @@ class GeMPooling(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         patches = x[:, 1:, :]
+        # softplus maps R → R_+ smoothly; preserves the ordering of negative
+        # components instead of clipping them all to a single value.
+        patches_pos = F.softplus(patches)
         p = F.softplus(self.p) + self.eps
-        pooled = patches.clamp(min=self.eps).pow(p).mean(dim=1).pow(1.0 / p)
+        pooled = patches_pos.clamp(min=self.eps).pow(p).mean(dim=1).pow(1.0 / p)
         return pooled, None
 
 

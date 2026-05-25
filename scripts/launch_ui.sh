@@ -8,6 +8,7 @@ set -e
 
 MLFLOW_PORT="${MLFLOW_PORT:-5000}"
 OPTUNA_PORT="${OPTUNA_PORT:-8080}"
+QUAL_PORT="${QUAL_PORT:-8501}"
 GATEWAY="${GATEWAY:-adurand-25@gpu-gw}"
 
 cd "$(dirname "$0")/.."
@@ -37,17 +38,26 @@ fi
 cat <<EOF
 
 ================================================================================
-UI running on ${UI_NODE} (job ${UI_JOB})
+UIs running on ${UI_NODE} (job ${UI_JOB})
 
-Copy-paste this on your LAPTOP:
+  ▶ MLflow        : sqlite:///mlflow.db
+  ▶ Optuna        : sqlite:///optuna.db
+  ▶ Qualitative   : best/worst-K artifacts from MLflow (per-trial gallery)
 
-  ssh -N -L ${MLFLOW_PORT}:${UI_NODE}:${MLFLOW_PORT} -L ${OPTUNA_PORT}:${UI_NODE}:${OPTUNA_PORT} ${GATEWAY}
+Copy-paste this SSH tunnel on your LAPTOP:
+
+  ssh -N \\
+      -L ${MLFLOW_PORT}:${UI_NODE}:${MLFLOW_PORT} \\
+      -L ${OPTUNA_PORT}:${UI_NODE}:${OPTUNA_PORT} \\
+      -L ${QUAL_PORT}:${UI_NODE}:${QUAL_PORT} \\
+      ${GATEWAY}
 
 Then open in your browser:
   http://localhost:${MLFLOW_PORT}     (MLflow)
   http://localhost:${OPTUNA_PORT}     (Optuna dashboard)
+  http://localhost:${QUAL_PORT}     (Qualitative viewer — best/worst trial gallery)
 
-Stop the UI:
+Stop the UIs:
   scancel ${UI_JOB}
 ================================================================================
 EOF

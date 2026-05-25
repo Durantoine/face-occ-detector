@@ -211,17 +211,79 @@ On n'a pas cette estimation aujourd'hui, donc on s'en tient à l'hypothèse Y-on
 
 > Cette section donne pour chaque méthode du search space v3 : la formule, les dimensions, le coût et la motivation théorique. Elle utilise du LaTeX rendu en MathJax — viewable sur GitHub directement, ou en local avec une extension Markdown supportant MathJax.
 
-### Notations communes
+### Notations communes (glossaire complet)
 
-| Symbole | Définition | Dimensions |
+**Variables aléatoires et instances** — convention : *majuscule* pour la variable aléatoire, *minuscule indicée par $i$* pour la réalisation du sample $i$.
+
+| Symbole | Définition | Type / domaine |
+|---|---|---|
+| $Y$ | variable aléatoire d'**occlusion** : la quantité à prédire (% de visage occlus, normalisé) | continue, $Y \in [0, 1]$ |
+| $y_i$ | valeur d'occlusion observée pour le sample $i$ du dataset | $y_i \in [0, 1]$, scalaire |
+| $\hat y_i$ | prédiction du modèle pour le sample $i$ | $\hat y_i \in [0, 1]$, scalaire (sortie sigmoid) |
+| $G$ | variable aléatoire de **genre** | binaire, $G \in \{0, 1\}$ (0 = féminin, 1 = masculin) |
+| $g_i$ | genre observé pour le sample $i$ | $g_i \in \{0, 1\}$, scalaire |
+| $P_{\text{train}}(\cdot)$, $P_{\text{test}}(\cdot)$ | distributions de probabilité sur le train et le test set | mesures de probabilité |
+
+**Bin / histogramme sur $Y$** :
+
+| Symbole | Définition | Domaine |
+|---|---|---|
+| $B_{\text{bins}}$ | nombre de bins pour discrétiser $Y$ | $B_{\text{bins}} = 20$ |
+| $\delta$ | largeur d'un bin | $\delta = 0{,}025$, couvre $[0,\, 0{,}5]$ |
+| $b(y) = \lfloor y / \delta \rfloor$ | indice du bin contenant $y$ | $b(y) \in \{0, \dots, B_{\text{bins}} - 1\}$ |
+| $P_{\text{train}} \in \mathbb{R}^{B_{\text{bins}}}$, $P_{\text{test}} \in \mathbb{R}^{B_{\text{bins}}}$ | PMF empiriques sur les bins | vecteurs, somme à 1 |
+| $w^{\text{imp}} \in \mathbb{R}^{B_{\text{bins}}}$ | ratio d'importance $P_{\text{test}}[b] / P_{\text{train}}[b]$, clippé et normalisé | vecteur |
+
+**Architecture du modèle** :
+
+| Symbole | Définition | Dimensions / domaine |
 |---|---|---|
 | $B$ | taille du batch | scalaire |
-| $N$ | nombre de tokens en sortie du backbone (= 1 CLS + $N_p$ patches) | scalaire |
-| $D$ | dimension cachée du backbone | scalaire (768 ViT-B, 1024 ViT-L, 1280 ViT-H+) |
-| $X \in \mathbb{R}^{B \times N \times D}$ | sortie du backbone (CLS à l'index 0) | tenseur |
-| $\Phi \in \mathbb{R}^{B \times D'}$ | features après pooling (input du head) | $D'$ dépend du pooling |
-| $h \in \mathbb{R}^B$ | sortie du head, scalaire d'occlusion prédit | $\hat y = \sigma(h)$ |
-| $y_i \in [0, 1]$, $g_i \in \{0, 1\}$ | label et genre du sample $i$ | scalaires |
+| $N$ | nombre de tokens en sortie du backbone ($= 1$ CLS $+ N_p$ patches) | scalaire (= 197 pour ViT-B/16 à 224×224) |
+| $D$ | dimension cachée du backbone | $D \in \{768, 1024, 1280\}$ pour ViT-B / L / H+ |
+| $X$ | tenseur des features de sortie du backbone (CLS à l'index 0) | $\mathbb{R}^{B \times N \times D}$ |
+| $\Phi$ | features après pooling, input du head linéaire final | $\mathbb{R}^{B \times D'}$, $D'$ dépend du pooling |
+| $D'$ | dim de sortie du pool : $D$ pour CLS/GeM/MHA, $K \cdot D$ pour K-query | scalaire |
+| $h$ | sortie scalaire du head | $h \in \mathbb{R}^B$ |
+| $\sigma(h) = (1 + e^{-h})^{-1}$ | sigmoid, $\hat y = \sigma(h)$ | applique element-wise |
+
+**Métriques** :
+
+| Symbole | Définition | Type |
+|---|---|---|
+| $e_i = (\hat y_i - y_i)^2$ | erreur quadratique du sample $i$ | scalaire ≥ 0 |
+| $w_i^{\text{base}} = \tfrac{1}{30} + y_i$ | poids de la métrique du challenge | scalaire > 0 |
+| $w_i$ | poids effectif du sample dans la loss : $w_i = w_i^{\text{base}} \cdot w^{\text{imp}}[b(y_i)]$ si reweighting actif, sinon $w_i = w_i^{\text{base}}$ | scalaire > 0 |
+| $\overline{e}_G = \dfrac{\sum_{i: g_i = G} w_i \, e_i}{\sum_{i: g_i = G} w_i}$ | moyenne pondérée des erreurs dans le groupe $G$ | scalaire ≥ 0 |
+| $\text{score} = \tfrac{1}{2}(\overline{e}_F + \overline{e}_M) + |\overline{e}_F - \overline{e}_M|$ | **métrique officielle du challenge** | scalaire ≥ 0, à minimiser |
+| $\text{MSE} = \tfrac{1}{N}\sum_i e_i$ | Mean Squared Error (non-pondérée) | scalaire ≥ 0 |
+| $\text{MAE} = \tfrac{1}{N}\sum_i \lvert\hat y_i - y_i\rvert$ | Mean Absolute Error (référence intuitive : même unité que $y$) | scalaire ≥ 0 |
+| $\text{eval\_loss}$ | loss minimisée par le modèle ($= \tfrac{1}{2}(\overline{e}_F + \overline{e}_M) + \lambda_{\text{fair}} \cdot \lvert\overline{e}_F - \overline{e}_M\rvert$ avec $\lambda_{\text{fair}}$ tunable) | scalaire ≥ 0 |
+| $\text{eval\_score}$ | métrique du challenge évaluée sur val (avec $\lambda = 1$ fixe) | scalaire ≥ 0 |
+| $\text{eval\_score\_raw}$ | idem mais sans $w^{\text{imp}}$ (= métrique sur val sous l'hypothèse $P_{\text{val}} = P_{\text{test}}$) | scalaire ≥ 0 |
+
+### Ordres de grandeur — pourquoi le score est si petit ?
+
+Trois facteurs combinés :
+
+**1. La métrique est une MSE pondérée → erreurs au carré**. Avec $|\hat y - y| \approx 0{,}05$ (erreur typique d'un bon modèle), on a $e_i = 0{,}0025$.
+
+**2. Les valeurs de $Y$ sont concentrées près de 0**. La PMF test :
+$$P_{\text{test}} = [0{,}105,\, 0{,}090,\, 0{,}090,\, 0{,}090,\, 0{,}092,\, 0{,}088,\, 0{,}083,\, 0{,}072,\, 0{,}067,\, 0{,}063,\, 0{,}055,\, 0{,}045,\, 0{,}028,\, 0{,}017,\, 0{,}010,\, 0{,}003,\, 0{,}002,\, 0,\, 0,\, 0]$$
+donne $\mathbb{E}[Y_{\text{test}}] \approx 0{,}13$, avec 95 % des samples sous $0{,}3$. Donc même une prédiction médiocre ne s'éloigne pas tellement de $y$ en absolu.
+
+**3. Décomposition d'un score réel observé**. Pour `score=0.00268 | err_diff=0.00080` :
+$$\overline{e}_F \approx \overline{e}_M \approx 0{,}001,\quad |\overline{e}_F - \overline{e}_M| \approx 0{,}0008,$$
+$$\text{score} = \tfrac{1}{2}(0{,}001 + 0{,}001) + 0{,}0008 = 0{,}0027 \;\checkmark$$
+
+Conversion vers le MAE (intuition concrète) :
+$$\text{MAE} \approx \sqrt{\overline{e}_G} = \sqrt{0{,}001} \approx 0{,}032,$$
+soit le modèle prédit l'occlusion à **±3,2 points de pourcentage** près en moyenne. Pour la difficulté de la tâche, c'est bon.
+
+**Implication pour interpréter les trials Optuna** :
+- ne pas lire les scores en absolu : un passage de $0{,}00185$ à $0{,}00268$ semble petit mais c'est **+45 %** en relatif → trial nettement pire
+- activer l'**affichage log** sur l'axe Y dans MLflow / optuna-dashboard
+- les améliorations gagnantes se chiffrent en quelques $10^{-4}$ d'écart, c'est normal
 
 ---
 
@@ -711,7 +773,13 @@ Implementation: `src/pretrain_ibot.py:DinoV3IBoT` (~100 LOC core).
 | ViT-L/16 (300M) | ~14 GB | ~24 h |
 | **ViT-H+/16 (600M)** ⭐ | **~22 GB** (with grad-ckpt) | **~36 h** |
 
-Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `./scripts/chain_pretrain.sh 3` to chain three 30 h SLURM submissions). Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`. To use it for finetuning, fill that URI into `model.init_backbone_from` of `configs/architectures/dinov3-vith16plus-3090-ibot.yaml` and launch `sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh`. `train.py` then loads the weights into the backbone and copies all pretrain params into the finetune run for full provenance.
+Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `./scripts/chain_pretrain.sh 3` to chain three 30 h SLURM submissions). Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`.
+
+**v3 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v3.yaml`). Optuna comparera alors automatiquement :
+- `"lvd"` (ou `"sapiens_default"` pour Sapiens2) : poids de base Meta
+- `"ibot:runs:/<run_id>/encoder"` : notre pretrain custom par-dessus
+
+`train.py` charge les poids dans le backbone et copie tous les `pretrain_*` params dans la run finetune pour la traçabilité complète. Une validation runtime ([`_validate_pretrained_source_choices`](src/optimize.py)) vérifie l'existence des runs MLflow avant le démarrage du sweep — pas de trial gâché sur un `runs:/__FILL__/encoder` oublié.
 
 ### Why we noticed this late
 

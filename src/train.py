@@ -299,11 +299,22 @@ def _save_model_to_mlflow(
     run_id: str,
     model_register_name: str,
 ) -> str:
+    """Save the trained model + processor to MLflow.
+
+    mlflow.pytorch.log_model() requires an active run, so we resume the trial run
+    imperatively (NOT via a context manager — the latter calls end_run() on exit,
+    which would terminate the run *before* optimize.py has logged final_eval_loss /
+    best_score / err_*, producing the "FINISHED + late metrics" UI artifact).
+
+    The trial run is terminated exactly once, by optimize.py:
+        client.set_terminated(run_id, "FINISHED")
+    after all post-train metric calls succeed.
+    """
     import torch.nn as _nn
 
+    # Defensive cleanup if a previous trial leaked an active run into process state.
     while mlflow.active_run():
         mlflow.end_run()
-    mlflow.start_run(run_id=run_id)
 
     if hasattr(trainer, "accelerator") and trainer.accelerator:
         try:
@@ -314,6 +325,7 @@ def _save_model_to_mlflow(
         raw = _unwrap(trainer.model)
     raw = raw.to(torch.float32).cpu()
 
+    mlflow.start_run(run_id=run_id)
     _orig = _nn.Module.__dict__.get("__getstate__")
     _nn.Module.__getstate__ = lambda self: {k: v for k, v in self.__dict__.items()}
     try:
@@ -323,6 +335,9 @@ def _save_model_to_mlflow(
             registered_model_name=model_register_name,
         )
         model_uri = info.model_uri
+        with tempfile.TemporaryDirectory() as tmp:
+            processor.save_pretrained(tmp)
+            mlflow.log_artifacts(tmp, "processor")
     finally:
         if _orig is not None:
             _nn.Module.__getstate__ = _orig
@@ -331,12 +346,11 @@ def _save_model_to_mlflow(
                 delattr(_nn.Module, "__getstate__")
             except AttributeError:
                 pass
+        # Do NOT call mlflow.end_run() — leaving the active run set lets the next
+        # trial's defensive `while mlflow.active_run(): mlflow.end_run()` clean
+        # things up after optimize.py has already terminated this run via the
+        # client API.
 
-    with tempfile.TemporaryDirectory() as tmp:
-        processor.save_pretrained(tmp)
-        mlflow.log_artifacts(tmp, "processor")
-
-    mlflow.end_run()
     return model_uri
 
 
@@ -534,15 +548,26 @@ def train(
             print(f"WARNING: non-CUDA device — disabling bf16/fp16")
         forwarded["bf16"] = False
         forwarded["fp16"] = False
+    # EMA + load_best_model_at_end are incompatible in HF Trainer: the order is
+    # on_train_end (EMA swap) → _load_best_model (wipes the EMA swap by loading the
+    # vanilla best checkpoint). To make EMA actually do something, we disable
+    # load_best_model_at_end when EMA is active. The model retained at the end of
+    # training is therefore the EMA-swapped one (the last training state, not the
+    # best checkpoint). Early stopping still works correctly on the running loss.
+    ema_active = float(train_cfg.get("ema_decay", 0)) > 0
+    load_best_at_end = not ema_active
+    if ema_active:
+        print(f"EMA active (decay={train_cfg.get('ema_decay')}) → load_best_model_at_end disabled "
+              "(final model = EMA-swapped, not best checkpoint).")
     training_args = TrainingArguments(
         output_dir=output_dir,
         report_to=["mlflow"] if (use_mlflow and not use_client) else [],
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
-        load_best_model_at_end=True,
-        metric_for_best_model=best_metric,
-        greater_is_better=greater_is_better,
+        load_best_model_at_end=load_best_at_end,
+        metric_for_best_model=best_metric if load_best_at_end else None,
+        greater_is_better=greater_is_better if load_best_at_end else None,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=seed,

@@ -39,15 +39,30 @@ def compute_score(
     mask_f = gender < 0.5
     mask_m = gender >= 0.5
 
+    # Raw (no shift correction): metric as if train and test had same Y distribution.
+    err_f_raw = _weighted_err(pred[mask_f], gt[mask_f], w_imp=None)
+    err_m_raw = _weighted_err(pred[mask_m], gt[mask_m], w_imp=None)
+    score_raw = (err_f_raw + err_m_raw) / 2.0 + abs(err_f_raw - err_m_raw)
+
+    # Reweighted to P_test (the "honest" estimate of test-time performance).
     err_f = _weighted_err(pred[mask_f], gt[mask_f], w_imp=(w_imp[mask_f] if w_imp is not None else None))
     err_m = _weighted_err(pred[mask_m], gt[mask_m], w_imp=(w_imp[mask_m] if w_imp is not None else None))
     score = (err_f + err_m) / 2.0 + abs(err_f - err_m)
 
     return {
+        # Official metric (test-reweighted if importance_pmf_ratio is provided)
         "score": score,
         "err_F": err_f,
         "err_M": err_m,
         "err_diff": abs(err_f - err_m),
+        # Raw metric — same numbers as `score` when importance_pmf_ratio is None.
+        # When importance_pmf_ratio IS provided, this gives the un-corrected version
+        # so we can isolate the effect of the shift correction.
+        "score_raw": score_raw,
+        "err_F_raw": err_f_raw,
+        "err_M_raw": err_m_raw,
+        "err_diff_raw": abs(err_f_raw - err_m_raw),
+        # Unweighted reference metrics
         "mse": float(((pred - gt) ** 2).mean()),
         "mae": float(np.abs(pred - gt).mean()),
     }

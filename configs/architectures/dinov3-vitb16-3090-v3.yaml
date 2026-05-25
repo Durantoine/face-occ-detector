@@ -7,7 +7,8 @@ model:
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
-  pretrained: true
+  # `pretrained` est forcé à True par Optuna via le mapping pretrained_source
+  # (cf. _apply_trial_param) — pas la peine de le dupliquer ici.
   pooling_type: attention_k_query
   # Attention K-query
   n_focal: 2
@@ -74,15 +75,28 @@ optuna:
   rotate_val_seed: true
   search_space:
     # === Always sampled ===
-    pretrained:
+    # pretrained_source: choisit entre les poids pré-entraînés "de base" (DINOv3
+    # LVD-1689M générique) et notre pretrain iBOT custom sur le domaine face.
+    # Format: "lvd" ou "ibot:<mlflow_model_uri>". Pas de random init (sans intérêt
+    # pour un ViT-B sur 100k images, voir README §Méthodes).
+    pretrained_source:
       type: categorical
-      choices: [true, false]
+      choices:
+        - "lvd"
+        - "ibot:runs:/c2c396cae2f74566a413502633de7781/encoder"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]
     balancing_strategy:
       type: categorical
-      choices: [A, D, E, F, G, H, I]
+      choices:
+        - "gender_sampler_imp"
+        - "imp_only"
+        - "cell_joint_yg"
+        - "occ_sampler_gender"
+        - "dann"
+        - "mmd"
+        - "mixup_gender"
     learning_rate:
       type: float
       low: 1.0e-05
@@ -171,17 +185,17 @@ optuna:
       high: 1.0
       log: true
       conditional_on:
-        balancing_strategy: G
+        balancing_strategy: dann
     mmd_lambda:
       type: float
       low: 0.01
       high: 1.0
       log: true
       conditional_on:
-        balancing_strategy: H
+        balancing_strategy: mmd
     mixup_alpha:
       type: float
       low: 0.1
       high: 0.5
       conditional_on:
-        balancing_strategy: I
+        balancing_strategy: mixup_gender

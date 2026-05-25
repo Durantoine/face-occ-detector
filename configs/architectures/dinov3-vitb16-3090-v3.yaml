@@ -83,7 +83,7 @@ optuna:
       type: categorical
       choices:
         - "lvd"
-        - "ibot:runs:/c2c396cae2f74566a413502633de7781/encoder"
+        - "ibot:/home/infres/adurand-25/face-occ-detector/results/pretrain_vitb16/checkpoint-150000"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]

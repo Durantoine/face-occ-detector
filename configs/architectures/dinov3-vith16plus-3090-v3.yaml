@@ -1,16 +1,13 @@
-name: sapiens2-01b-3090-v3
-description: Sapiens2-0.1B (114M) v3 — extended search space mirroring DINO v3. 2x RTX 3090 24GB (BF16). pretrained_source ∈ {sapiens_default, ibot:runs:/...} sampled by Optuna.
+name: dinov3-vith16plus-3090-v3
+description: DINOv3 ViT-H+/16 (600M) v3 — le plus gros DINO faisable sur 2x RTX 3090. Memory-conservative (BS=8, grad_ckpt=true). Mirror du v3 vitb16 pour comparaison.
 
 model:
-  model_name: sapiens2_0.1b
+  model_name: dinov3_vith16plus
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
-  # `pretrained` est forcé à True par Optuna via le mapping pretrained_source
-  # (cf. _apply_trial_param) — pas la peine de le dupliquer ici.
   pooling_type: attention_k_query
-  # Attention K-query
   n_focal: 2
   n_diffuse: 2
   n_free: 2
@@ -18,17 +15,11 @@ model:
   tau_diffuse_init: 1.5
   tau_free_init: 1.0
   learnable_tau: true
-  # Multi-head
   num_heads: 4
-  # GeM
   gem_p_init: 3.0
-  # Common pool
   pool_attn_dropout: 0.0
   pool_proj_dropout: 0.0
   backbone_drop_path_rate: 0.0
-  # Default iBOT run for this arch (overridden via pretrained_source sampling).
-  # NOTE: replace with the actual MLflow run_id of the Sapiens2 iBOT pretrain
-  # once that job has completed (see scripts/pretrain_ibot_sapiens2_2x3090.sh).
   init_backbone_from: null
 
 data:
@@ -40,10 +31,10 @@ data:
   extra_train_csv: null
 
 training:
-  per_device_train_batch_size: 32
-  per_device_eval_batch_size: 64
-  gradient_accumulation_steps: 1
-  num_train_epochs: 8
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 2
+  num_train_epochs: 12
   learning_rate: 5.0e-05
   weight_decay: 0.05
   warmup_ratio: 0.1
@@ -56,7 +47,7 @@ training:
   greater_is_better: false
   bf16: true
   fp16: false
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   augmentation_level: medium
   sampler_strategy: gender
   loss_type: weighted_mse
@@ -74,28 +65,18 @@ training:
   layer_decay: 0.85
 
 optuna:
-  n_trials: 100
+  n_trials: 60
   objective_mode: score
   rotate_val_seed: true
   search_space:
-    # === Always sampled ===
-    # pretrained_source: Optuna choisit la source des poids du backbone parmi :
-    #   - "sapiens_default"                       Sapiens2-0.1B Meta (humans-pretrained)
-    #   - "ibot:runs:/<RUN_ID>/encoder_50000"     iBOT @ 50k steps  (~1.25 ep MS1MV3)
-    #   - "ibot:runs:/<RUN_ID>/encoder_100000"    iBOT @ 100k steps (~2.5  ep)
-    #   - "ibot:runs:/<RUN_ID>/encoder_150000"    iBOT @ 150k steps (~3.8  ep)
-    #   - "ibot:runs:/<RUN_ID>/encoder"           iBOT final @ 200k steps (~5 ep)
-    #
-    # Remplir <RUN_ID> avec le contenu de results/pretrain_sapiens2_01b/mlflow_run_id.txt
-    # (FACE_OCC_PRETRAIN_SNAPSHOT_STEPS=50000,100000,150000, MAX_STEPS=200000).
     pretrained_source:
       type: categorical
       choices:
-        - "sapiens_default"
-        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_50000"
-        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_100000"
-        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_150000"
-        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder"
+        - "lvd"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_50000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_100000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_150000"
+        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]
@@ -113,7 +94,7 @@ optuna:
     learning_rate:
       type: float
       low: 1.0e-05
-      high: 2.0e-04
+      high: 1.0e-04
       log: true
     weight_decay:
       type: float
@@ -121,8 +102,8 @@ optuna:
       high: 0.3
     num_train_epochs:
       type: int
-      low: 8
-      high: 15
+      low: 6
+      high: 12
     warmup_ratio:
       type: float
       low: 0.05
@@ -147,7 +128,6 @@ optuna:
       low: 0.0
       high: 0.2
 
-    # === Conditional on pooling_type ∈ {attention_k_query, multihead_attention} ===
     pool_attn_dropout:
       type: float
       low: 0.0
@@ -161,7 +141,6 @@ optuna:
       conditional_on:
         pooling_type: [attention_k_query, multihead_attention]
 
-    # === Conditional on pooling_type == attention_k_query ===
     loss_query_diversity_lambda:
       type: float
       low: 0.0
@@ -182,15 +161,12 @@ optuna:
       conditional_on:
         pooling_type: attention_k_query
 
-    # === Conditional on pooling_type == multihead_attention ===
     num_heads:
       type: categorical
-      # Divisors common to Sapiens2-0.1B (768) / 0.4B (1024) / 0.8B (1280) / 1B (1536) / 5B (2432).
       choices: [2, 4, 8, 16]
       conditional_on:
         pooling_type: multihead_attention
 
-    # === Conditional on balancing_strategy ∈ {G, H, I} (feature-level fairness) ===
     adv_lambda:
       type: float
       low: 0.01

@@ -1,3 +1,6 @@
+import json
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -8,7 +11,7 @@ import torch
 from PIL import Image
 from transformers import AutoImageProcessor
 
-from src.inference.calibration import apply_bias
+from src.inference.calibration import apply_bias, quantile_match_to_test_pmf
 from src.models.dinov3_loader import get_image_processor
 
 CONFIG: Dict[str, Any] = {
@@ -23,7 +26,104 @@ CONFIG: Dict[str, Any] = {
     "submission_format": True,
     "use_tta": True,
     "bias_correction": None,
+    "match_test_pmf": False,
 }
+
+
+def _collect_metadata(
+    model_uri: str,
+    tracking_uri: str,
+    predict_options: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "model_uri": model_uri,
+        "tracking_uri": tracking_uri,
+        "predict_options": predict_options,
+    }
+    m = re.match(r"runs:/([^/]+)/", model_uri)
+    if not m:
+        return metadata
+    run_id = m.group(1)
+    metadata["mlflow_run_id"] = run_id
+    try:
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient(tracking_uri=tracking_uri)
+        run = client.get_run(run_id)
+        metadata["mlflow_run_name"] = run.info.run_name
+        metadata["mlflow_status"] = run.info.status
+        metadata["mlflow_experiment_id"] = run.info.experiment_id
+        params = dict(run.data.params)
+        metadata["mlflow_params"] = params
+        relevant_keys = (
+            "challenge_score", "err_F", "err_M", "err_diff",
+            "mae", "mse", "r2_", "eval_loss",
+        )
+        metadata["mlflow_metrics_summary"] = {
+            k: float(v) for k, v in run.data.metrics.items()
+            if any(s in k for s in relevant_keys)
+        }
+        metadata["mlflow_tags"] = {
+            k: v for k, v in run.data.tags.items() if not k.startswith("mlflow.")
+        }
+        metadata["key_params"] = {
+            "architecture":         params.get("architecture"),
+            "model_name":           params.get("model_model_name"),
+            "pretrained":           params.get("model_pretrained"),
+            "init_backbone_from":   params.get("model_init_backbone_from"),
+            "pooling_type":         params.get("model_pooling_type"),
+            "sampler_strategy":     params.get("train_sampler_strategy"),
+            "loss_type":            params.get("train_loss_type"),
+            "loss_importance_reweight":  params.get("train_loss_importance_reweight"),
+            "loss_gender_reweight":      params.get("train_loss_gender_reweight"),
+            "loss_cell_reweight":        params.get("train_loss_cell_reweight"),
+            "loss_adv_debiasing":        params.get("train_loss_adv_debiasing"),
+            "loss_mmd_alignment":        params.get("train_loss_mmd_alignment"),
+            "mixup_inter_gender":        params.get("train_mixup_inter_gender"),
+            "loss_fairness_lambda":      params.get("train_loss_fairness_lambda"),
+            "learning_rate":             params.get("train_learning_rate"),
+            "num_train_epochs":          params.get("train_num_train_epochs"),
+            "augmentation_level":        params.get("train_augmentation_level"),
+            "layer_decay":               params.get("train_layer_decay"),
+        }
+    except Exception as e:
+        metadata["mlflow_fetch_error"] = str(e)
+    return metadata
+
+
+def _save_metadata(metadata: Dict[str, Any], output_csv: str) -> str:
+    meta_path = str(Path(output_csv).with_suffix("")) + ".meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+    return meta_path
+
+
+def _print_metadata_summary(metadata: Dict[str, Any]) -> None:
+    key = metadata.get("key_params", {})
+    opts = metadata.get("predict_options", {})
+    print("─" * 70)
+    print("Submission metadata summary :")
+    print(f"  Model URI         : {metadata.get('model_uri')}")
+    print(f"  Architecture      : {key.get('architecture')}")
+    print(f"  Backbone          : {key.get('model_name')}  pretrained={key.get('pretrained')}")
+    init = key.get("init_backbone_from") or "—"
+    print(f"  iBOT init         : {init}")
+    print(f"  Pooling           : {key.get('pooling_type')}")
+    print(f"  Sampler           : {key.get('sampler_strategy')}")
+    on = [k for k, v in {
+        "imp_rw":     key.get("loss_importance_reweight"),
+        "gender_rw":  key.get("loss_gender_reweight"),
+        "cell_rw":    key.get("loss_cell_reweight"),
+        "DANN":       key.get("loss_adv_debiasing"),
+        "MMD":        key.get("loss_mmd_alignment"),
+        "mixup_G":    key.get("mixup_inter_gender"),
+    }.items() if str(v).lower() == "true"]
+    print(f"  Balancing flags   : {', '.join(on) if on else 'none'}")
+    print(f"  λ_fairness        : {key.get('loss_fairness_lambda')}")
+    print(f"  Post-hoc          : TTA={opts.get('use_tta')}  "
+          f"bias={'on' if opts.get('bias_correction') else 'off'}  "
+          f"quantile_match={opts.get('match_test_pmf')}")
+    print("─" * 70)
 
 
 def load_model(model_uri: str, tracking_uri: str = "sqlite:///mlflow.db"):
@@ -84,6 +184,7 @@ def predict_csv(
     use_tta: bool = True,
     bias_correction: Optional[Dict[str, float]] = None,
     gender_col: str = "gender",
+    match_test_pmf: bool = False,
 ) -> None:
     model, processor = load_model(model_uri, tracking_uri)
     df = pd.read_csv(input_csv).dropna(subset=[image_col])
@@ -102,13 +203,36 @@ def predict_csv(
                            bias_correction.get("delta_f", 0.0),
                            bias_correction.get("delta_m", 0.0))
 
+    if match_test_pmf:
+        from src.utils.losses import _TEST_PMF_0025
+        before_mean = float(preds.mean())
+        preds = quantile_match_to_test_pmf(preds, _TEST_PMF_0025)
+        after_mean = float(preds.mean())
+        print(f"Quantile-matched to P_test : mean shift {before_mean:.3f} → {after_mean:.3f}")
+
     df["FaceOcclusion"] = preds
     if submission_format:
         df["gender"] = "x"
         df[[image_col, "FaceOcclusion", "gender"]].to_csv(output_csv, index=False)
     else:
         df.to_csv(output_csv, index=False)
-    print(f"Saved {len(df)} predictions to {output_csv}  (TTA={use_tta}, bias={bias_correction})")
+    print(f"Saved {len(df)} predictions to {output_csv}")
+
+    metadata = _collect_metadata(
+        model_uri=model_uri,
+        tracking_uri=tracking_uri,
+        predict_options={
+            "use_tta": use_tta,
+            "bias_correction": bias_correction,
+            "match_test_pmf": match_test_pmf,
+            "batch_size": batch_size,
+            "submission_format": submission_format,
+            "input_csv": input_csv,
+        },
+    )
+    meta_path = _save_metadata(metadata, output_csv)
+    _print_metadata_summary(metadata)
+    print(f"Metadata saved to {meta_path}")
 
 
 if __name__ == "__main__":
@@ -124,4 +248,5 @@ if __name__ == "__main__":
         use_tta=CONFIG["use_tta"],
         bias_correction=CONFIG["bias_correction"],
         gender_col=CONFIG["gender_col"],
+        match_test_pmf=CONFIG["match_test_pmf"],
     )

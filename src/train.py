@@ -129,8 +129,6 @@ class WeightedMSETrainer(Trainer):
             return super()._get_train_sampler()
 
     def training_step(self, model: Any, inputs: Dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        # Inter-gender Mixup (strategy I): replace F samples in-place with
-        # F⊕M interpolations of nearest Y bucket BEFORE the forward pass.
         if self._mixup_alpha > 0 and model.training and "labels" in inputs and "pixel_values" in inputs:
             from src.utils.losses import inter_gender_mixup
             inputs = dict(inputs)
@@ -152,15 +150,12 @@ class WeightedMSETrainer(Trainer):
             div = _query_diversity_penalty(outputs["attn_weights"])
             loss = loss + self._query_diversity_lambda * div
 
-        # Adversarial debiasing (strategy G): GRL is applied inside the model,
-        # so a normal CE here propagates an INVERTED gradient into the backbone.
         if self._adv_lambda > 0 and isinstance(outputs, dict) and "adv_logits" in outputs:
             if labels.dim() == 2 and labels.size(1) >= 2:
                 g_tgt = (labels[:, 1] >= 0.5).long()
                 adv = torch.nn.functional.cross_entropy(outputs["adv_logits"], g_tgt)
                 loss = loss + self._adv_lambda * adv
 
-        # MMD alignment (strategy H) on pooled features between F and M.
         if self._mmd_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
             if labels.dim() == 2 and labels.size(1) >= 2:
                 from src.utils.losses import mmd_rbf
@@ -359,6 +354,97 @@ def _safe_mean(series) -> float:
     return 0.0 if v != v else v
 
 
+def _save_diagnostic_charts(
+    qual_root: Path,
+    preds: np.ndarray,
+    gt: np.ndarray,
+    gender: np.ndarray,
+    bin_width: float = 0.025,
+) -> None:
+    """Save 2 PNG charts in `qual_root/diagnostics/` to interpret model errors.
+
+    Chart 1 — `error_vs_occlusion.png` :
+        Mean absolute error per Y bin, with 3 curves (overall, F, M). Shows
+        where the model struggles (low/mid/high occlusion) and whether the
+        F/M gap is constant or grows with occlusion level.
+
+    Chart 2 — `error_density_by_gender.png` :
+        Histogram of |pred - gt| split by F and M. Shows the full error
+        distribution, not just the mean — useful to spot heavy tails (a few
+        very bad predictions) vs systematic bias (whole distribution shifted).
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # headless backend (no $DISPLAY needed)
+    import matplotlib.pyplot as plt
+
+    out = qual_root / "diagnostics"
+    out.mkdir(parents=True, exist_ok=True)
+
+    abs_err = np.abs(preds - gt)
+    mask_f = gender < 0.5
+    mask_m = gender >= 0.5
+
+    # --- Chart 1 : MAE vs Y bin, with F/M curves ---
+    n_bins = 20
+    edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:]) * 100.0  # in pct points
+
+    def _binned_mean(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        means = np.full(n_bins, np.nan)
+        counts = np.zeros(n_bins)
+        if not mask.any():
+            return means, counts
+        bin_idx = np.clip((gt[mask] / bin_width).astype(int), 0, n_bins - 1)
+        for b in range(n_bins):
+            sel = bin_idx == b
+            counts[b] = sel.sum()
+            if counts[b] > 0:
+                means[b] = abs_err[mask][sel].mean()
+        return means, counts
+
+    overall_means, overall_counts = _binned_mean(np.ones_like(gt, dtype=bool))
+    f_means, f_counts = _binned_mean(mask_f)
+    m_means, m_counts = _binned_mean(mask_m)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(centers, overall_means * 100.0, "-o", lw=2, color="black", label="Overall")
+    ax1.plot(centers, f_means * 100.0, "-s", color="tab:red", alpha=0.7, label=f"Female (n={int(mask_f.sum())})")
+    ax1.plot(centers, m_means * 100.0, "-^", color="tab:blue", alpha=0.7, label=f"Male (n={int(mask_m.sum())})")
+    # Shaded background = sample count per bin (scaled to right y-axis)
+    ax1b = ax1.twinx()
+    ax1b.fill_between(centers, overall_counts, alpha=0.1, color="gray", step="mid")
+    ax1b.set_ylabel("Samples per bin", color="gray")
+    ax1b.tick_params(axis="y", labelcolor="gray")
+    ax1.set_xlabel("True occlusion Y (% points)")
+    ax1.set_ylabel("Mean absolute error (% points)")
+    ax1.set_title("Error vs occlusion level\n(does the model break at high occlusion? is the F/M gap constant?)")
+    ax1.grid(alpha=0.3)
+    ax1.legend(loc="upper left")
+
+    # --- Chart 2 : error density by gender ---
+    bins = np.linspace(0.0, max(0.3, float(abs_err.max() + 0.01)), 60)
+    ax2.hist(abs_err[mask_f], bins=bins, density=True, alpha=0.6, color="tab:red",
+             label=f"Female (n={int(mask_f.sum())})")
+    ax2.hist(abs_err[mask_m], bins=bins, density=True, alpha=0.6, color="tab:blue",
+             label=f"Male (n={int(mask_m.sum())})")
+    ax2.axvline(abs_err[mask_f].mean(), color="tab:red", linestyle="--", lw=1.5,
+                label=f"MAE_F = {abs_err[mask_f].mean()*100:.2f}%")
+    ax2.axvline(abs_err[mask_m].mean(), color="tab:blue", linestyle="--", lw=1.5,
+                label=f"MAE_M = {abs_err[mask_m].mean()*100:.2f}%")
+    ax2.set_xlabel("|pred - gt| (Y units)")
+    ax2.set_ylabel("Density")
+    ax2.set_title("Error density by gender\n(systematic bias vs heavy tails)")
+    ax2.grid(alpha=0.3)
+    ax2.legend(loc="upper right")
+
+    plt.tight_layout()
+    chart_path = out / "error_vs_occlusion_and_density.png"
+    plt.savefig(chart_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved diagnostic chart: {chart_path}")
+
+
 def train(
     architecture_name: str,
     data_csv: Optional[str] = None,
@@ -404,7 +490,17 @@ def train(
     )
 
     train_sampler = None
-    if sampler_strategy != "none" and "gender" in train_data.columns:
+    label_col_for_sampler = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+    if sampler_strategy == "test_pmf":
+        from src.data.dataset import create_test_pmf_sampler
+        from src.utils.losses import _TEST_PMF_0025
+        train_sampler = create_test_pmf_sampler(
+            train_data[label_col_for_sampler].astype(float).values,
+            test_pmf=_TEST_PMF_0025,
+        )
+        print(f"Sampler 'test_pmf': resampling train to match P_test marginal on Y. "
+              f"{train_sampler.num_samples} samples/epoch")
+    elif sampler_strategy != "none" and "gender" in train_data.columns:
         keys = make_sampler_keys(train_data, strategy=sampler_strategy, n_buckets=10)
         n_groups = int(keys.max()) + 1
         train_sampler = create_balanced_sampler(keys.tolist(), num_groups=n_groups)
@@ -548,12 +644,8 @@ def train(
             print(f"WARNING: non-CUDA device — disabling bf16/fp16")
         forwarded["bf16"] = False
         forwarded["fp16"] = False
-    # EMA + load_best_model_at_end are incompatible in HF Trainer: the order is
-    # on_train_end (EMA swap) → _load_best_model (wipes the EMA swap by loading the
-    # vanilla best checkpoint). To make EMA actually do something, we disable
-    # load_best_model_at_end when EMA is active. The model retained at the end of
-    # training is therefore the EMA-swapped one (the last training state, not the
-    # best checkpoint). Early stopping still works correctly on the running loss.
+    # EMA + load_best_model_at_end are incompatible: on_train_end (EMA swap)
+    # runs BEFORE _load_best_model → swap gets wiped. Disable load_best when EMA is on.
     ema_active = float(train_cfg.get("ema_decay", 0)) > 0
     load_best_at_end = not ema_active
     if ema_active:
@@ -616,11 +708,22 @@ def train(
 
     eval_results = trainer.evaluate()
     eval_loss = eval_results["eval_loss"]
-    eval_score = eval_results.get("eval_score", 0.0)
-    err_diff = eval_results.get("eval_err_diff", 0.0)
-    err_F = eval_results.get("eval_err_F", 0.0)
-    err_M = eval_results.get("eval_err_M", 0.0)
-    print(f"score={eval_score:.5f} | err_diff={err_diff:.5f} | loss={eval_loss:.5f}")
+    eval_score = eval_results.get("eval_challenge_score_test_estimated", 0.0)
+    err_diff   = eval_results.get("eval_err_diff_test_estimated", 0.0)
+    err_F      = eval_results.get("eval_err_F_test_estimated", 0.0)
+    err_M      = eval_results.get("eval_err_M_test_estimated", 0.0)
+    eval_score_val = eval_results.get("eval_challenge_score_val", 0.0)
+    err_diff_val   = eval_results.get("eval_err_diff_val", 0.0)
+    err_F_val      = eval_results.get("eval_err_F_val", 0.0)
+    err_M_val      = eval_results.get("eval_err_M_val", 0.0)
+    print(f"loss={eval_loss:.5f}")
+    print(f"  test-estimated : score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
+    print(f"  val direct     : score={eval_score_val:.5f}  err_F={err_F_val:.5f}  err_M={err_M_val:.5f}  err_diff={err_diff_val:.5f}")
+    mae_pct_te = eval_results.get("eval_mae_pct_test_estimated", 0.0)
+    mae_pct_va = eval_results.get("eval_mae_pct_val", 0.0)
+    r2_te = eval_results.get("eval_r2_test_estimated", 0.0)
+    r2_va = eval_results.get("eval_r2_val", 0.0)
+    print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
 
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
     if save_qualitative_k > 0:
@@ -681,6 +784,14 @@ def train(
 
                 _dump(worst_order, "worst")
                 _dump(best_order, "best")
+
+                # === Diagnostic charts : error vs occlusion + density by gender ===
+                # Saved alongside best/worst → uploaded as MLflow artifacts in one go.
+                try:
+                    _save_diagnostic_charts(qual_root, preds, gt, gender)
+                except Exception as e_chart:
+                    print(f"WARNING: could not save diagnostic charts: {e_chart}")
+
                 if use_mlflow and use_client and client and run_id:
                     client.log_artifacts(run_id, str(qual_root), "qualitative")
             except Exception as e:

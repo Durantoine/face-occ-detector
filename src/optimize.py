@@ -70,6 +70,8 @@ _BALANCING_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
     "dann":                 {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
     "mmd":                  {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
     "mixup_gender":         {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
+    # === Importance resampling : compensate the train↔test shift via the SAMPLER, not the loss ===
+    "test_pmf_sampler":     {"sampler_strategy": "test_pmf",  "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
 }
 
 # Backward-compat aliases for legacy MLflow / Optuna studies using A/D/E/F/G/H/I.

@@ -48,7 +48,7 @@ training:
   early_stopping_patience: 3
   seed: 42
   logging_steps: 50
-  metric_for_best_model: eval_score
+  metric_for_best_model: eval_challenge_score_test_estimated
   greater_is_better: false
   bf16: true
   fp16: false
@@ -109,6 +109,7 @@ optuna:
         - "dann"
         - "mmd"
         - "mixup_gender"
+        - "test_pmf_sampler"
     learning_rate:
       type: float
       low: 1.0e-05

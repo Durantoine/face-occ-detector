@@ -601,6 +601,240 @@ $$\tilde y_i = \lambda_i \cdot y_i^F + (1 - \lambda_i) \cdot y_{\text{partner}(i
 
 ---
 
+## Métriques — guide complet
+
+Cette section documente **les 14 métriques** que [`compute_score()`](src/utils/metrics.py) calcule à chaque évaluation. Comprendre ces métriques est fondamental pour interpréter les sweeps Optuna et le `qualitative_viewer`.
+
+### Convention de nommage
+
+Toutes les métriques v3 utilisent un **suffixe explicite** qui décrit comment elles sont calculées :
+
+| Suffixe | Calcul | À quoi ça sert |
+|---|---|---|
+| `_val` | mesure **directe** sur le validation set, sans pondération de shift | Voir la perf brute du modèle sur val |
+| `_test_estimated` | val reweighté par $w^{\text{imp}}[b(y_i)] = P_{\text{test}}[b]/P_{\text{train}}[b]$ | **Estimation non-biaisée** de la perf qu'on aurait sur le test set |
+
+→ Quand `loss_importance_reweight: false` et `eval_importance_reweight: false`, les deux versions sont identiques (pas de correction de shift activée).
+→ Quand le reweighting est activé, l'écart `_test_estimated` − `_val` mesure directement **l'effet de la correction de shift** sur la métrique.
+
+### Les 8 métriques officielles du challenge
+
+Formule du challenge :
+
+$$\text{score} = \tfrac{1}{2}(\overline{e}_F + \overline{e}_M) + \lvert\overline{e}_F - \overline{e}_M\rvert$$
+
+avec
+
+$$\overline{e}_G = \frac{\sum_{i:\, g_i = G} w_i \cdot (\hat y_i - y_i)^2}{\sum_{i:\, g_i = G} w_i}, \qquad w_i = \tfrac{1}{30} + y_i$$
+
+| Métrique | Sens | Type |
+|---|---|---|
+| `challenge_score_test_estimated` | **LA cible Optuna** — score du challenge, reweighté à $P_{\text{test}}$ | scalar, à minimiser |
+| `challenge_score_val` | Score du challenge sur val direct (sans correction shift) | scalar, diagnostic |
+| `err_F_test_estimated` | $\overline{e}_F$ reweighté à $P_{\text{test}}$ | scalar, plus grand = plus mauvais sur F |
+| `err_M_test_estimated` | $\overline{e}_M$ reweighté à $P_{\text{test}}$ | scalar, plus grand = plus mauvais sur M |
+| `err_diff_test_estimated` | $\lvert\overline{e}_F - \overline{e}_M\rvert$ reweighté | scalar, **mesure de fairness genre** |
+| `err_F_val`, `err_M_val`, `err_diff_val` | versions val direct | scalar |
+
+Le `metric_for_best_model: eval_challenge_score_test_estimated` dans les yaml v3 fait que **HF Trainer charge le meilleur checkpoint sur cette métrique**, et Optuna l'optimise.
+
+### Les 6 métriques de référence (interprétation humaine)
+
+Pas optimisées directement, mais essentielles pour comprendre **qualitativement** où en est le modèle.
+
+| Métrique | Formule | Lecture | Plage |
+|---|---|---|---|
+| `mse_val` | $\frac{1}{N}\sum (\hat y - y)^2$ | MSE non-pondérée — homogène à $Y^2$ (illisible) | $[0,\, 0{,}25]$ typique |
+| `mae_val` | $\frac{1}{N}\sum \lvert\hat y - y\rvert$ | MAE — même unité que $Y$ (fraction d'occlusion) | $[0,\, 0{,}5]$ typique |
+| **`mae_pct_val`** | $\text{MAE} \times 100$ | **"le modèle se trompe en moyenne de X points d'occlusion"** | $[0,\, 50]$ % typique |
+| **`mae_pct_test_estimated`** | idem, reweighté à $P_{\text{test}}$ | Même intuition mais estimation test perf | idem |
+| **`r2_val`** | $1 - \frac{\text{SS}_{\text{res}}}{\text{SS}_{\text{tot}}}$ | **0 = modèle trivial (prédire la moyenne), 1 = parfait** | $(-\infty, 1]$ |
+| **`r2_test_estimated`** | idem, reweighté à $P_{\text{test}}$ | Même intuition pour le test | $(-\infty, 1]$ |
+
+### Pourquoi pas `1 - MAE` comme "accuracy"
+
+Tentant mais **trompeur**. La distribution de $Y$ est concentrée près de 0 ($\mathbb{E}[Y] \approx 0{,}13$). Donc un modèle trivial qui prédit toujours 0 obtient :
+
+$$\text{MAE}_{\text{trivial}} = \mathbb{E}[\lvert 0 - Y\rvert] = \mathbb{E}[Y] \approx 0{,}13$$
+$$1 - \text{MAE}_{\text{trivial}} \approx 0{,}87 = \text{"87 % accuracy"}$$
+
+→ Le modèle inutile ressemble à du 87 % bon. **R² évite ce piège** car il normalise par la variance de $Y$ : un modèle trivial obtient $R^2 = 0$ par construction.
+
+### Ordres de grandeur typiques
+
+```
+Modèle bien entraîné (~5 epochs ViT-B/16 + iBOT) :
+  challenge_score_test_estimated ≈ 0.0025 - 0.0040
+  mae_pct_test_estimated         ≈ 3 - 5 points de %
+  r2_test_estimated              ≈ 0.85 - 0.95
+  err_diff_test_estimated        ≈ 0.0005 - 0.0010  (gap F-M résiduel)
+
+Modèle trivial (predict mean) :
+  challenge_score ~ 0.03
+  mae_pct ~ 13 %
+  r2 = 0
+```
+
+### Comment lire ça en pratique
+
+**Dans MLflow** :
+- Tous les noms apparaissent avec le préfixe `eval_` (par exemple `eval_challenge_score_test_estimated`)
+- Active l'**axe Y log** sur les courbes — les scores sont en $10^{-3}$, l'échelle linéaire écrase tout
+- Pour comparer 2 trials : un passage de 0,00185 à 0,00268 = **+45 % en relatif** (significatif), pas "petit" !
+
+**Dans Optuna dashboard** :
+- L'objectif est `challenge_score_test_estimated` (la métrique du challenge)
+- Les `user_attrs` exposent `err_F`, `err_M`, `err_diff`, `eval_loss`
+
+**Dans le qualitative_viewer** :
+- Le panneau "Métrique du challenge" affiche `score`, `err_F`, `err_M`, `err_diff` côte-à-côte avec leurs versions test-estimated
+- Le panneau "Métriques humaines" affiche `mae_pct` (en %) et `r2`
+- L'onglet 📊 **Diagnostic charts** affiche les deux graphes ci-dessous
+
+### Diagnostic charts (générés à chaque trial)
+
+Quand `save_qualitative_k > 0` dans le yaml, [`_save_diagnostic_charts()`](src/train.py) génère un PNG dans `qualitative/diagnostics/error_vs_occlusion_and_density.png`, automatiquement uploadé comme artifact MLflow.
+
+**Panneau gauche — MAE par bin de Y, séparé par genre**
+
+```
+y-axis : Mean absolute error (points de %)
+x-axis : True occlusion Y (points de %)
+        ┌────────────────────────┐
+   25 % │            ●            │ ← high-Y bins : peu de samples, erreur élevée
+        │         ●               │
+   10 % │       ●                 │
+        │   ▲ ●─●                 │ ▲ = Female  ● = Overall  ■ = Male
+    5 % │ ▲                       │
+        │■■                       │
+    1 % │■                        │
+        └─0───10───20───30───40───┘
+        zone de samples densement représentée
+```
+
+**Lecture** :
+- Si la courbe overall plafonne haut en bin-Y élevé → le modèle se casse sur les fortes occlusions (problème classique de régression sur cible déséquilibrée)
+- Si la courbe F est **systématiquement au-dessus** de M sur tous les bins → biais structurel
+- Si l'écart F-M **explose** dans les bins haut-Y → le problème de fairness vient des cas extrêmes
+
+**Panneau droit — Densité des erreurs par genre**
+
+Histogramme de $\lvert\hat y - y\rvert$ split F vs M, avec lignes verticales aux moyennes.
+
+**Lecture** :
+- Deux distributions superposées → modèle bien calibré sur les genres
+- Distribution F shiftée vers la droite → biais systématique
+- Queue lourde sur F (mais pas sur M) → quelques très mauvaises preds polluent la moyenne, pas un biais global
+
+→ Ces deux vues sont **complémentaires** : la courbe MAE-vs-Y dit *à quel niveau d'occlusion* le modèle pèche, la densité dit *à quelle fréquence* et *avec quelle ampleur*.
+
+---
+
+## Compenser le shift train→test — 3 mécanismes complémentaires
+
+Le challenge a un shift connu : la distribution d'occlusion Y dans le test diffère de celle du train (estimée via `_TEST_PMF_0025` dans `src/utils/losses.py`). Trois façons de compenser, chacune à un STAGE différent du pipeline.
+
+### Mécanisme 1 — Reweighter la loss (déjà utilisé dans v3)
+
+**Quand** : pendant l'entraînement, à chaque batch.
+
+**Comment** : chaque sample dans le batch reçoit un multiplicateur `w_imp = P_test(bin) / P_train(bin)`. Les samples haut-Y (rares sur train, sur-représentés sur test) voient leur loss multipliée par un grand nombre → le modèle leur prête plus d'attention.
+
+**Flag yaml** : `loss_importance_reweight: true` (déjà activé par défaut).
+
+**Avantages** :
+- Toutes les samples sont vues à chaque epoch (pas de perte de données)
+- Implémentation simple, pas de modification du sampler
+
+**Inconvénients** :
+- Les gradients deviennent bruyants quand les poids sont extrêmes
+- Les stats internes du modèle (BatchNorm running mean/var) sont calculées sur la distribution train, pas la distribution reweightée
+
+### Mécanisme 2 — Resampler les données (NOUVEAU en v3+)
+
+**Quand** : pendant l'entraînement, AU NIVEAU DU SAMPLER (avant que le batch arrive au modèle).
+
+**Comment** : au lieu de pondérer la loss, on échantillonne le train avec des probabilités telles que la **distribution effective** de Y dans chaque batch matche `P_test`. Les samples haut-Y sont tirés plus souvent (avec remise), les samples bas-Y moins. La loss reste standard.
+
+**Flag yaml** : `balancing_strategy: "test_pmf_sampler"` dans `_BALANCING_STRATEGY_MAP`. Active `sampler_strategy: "test_pmf"` qui construit un `WeightedRandomSampler` avec poids `P_test[bin] / P_train[bin]` clippés à [0.1, 10].
+
+**Avantages vs Mécanisme 1** :
+- Le modèle **voit effectivement** une distribution qui matche test à chaque batch
+- BatchNorm et stats internes calibrées correctement
+- Loss landscape propre (pas de poids extrêmes qui font exploser les gradients)
+- Théoriquement équivalent en espérance, mais **différent en pratique**
+
+**Inconvénients** :
+- Les samples haut-Y rares sont **vus plusieurs fois par epoch** (avec remise) → risque d'overfit sur ces quelques exemples — compensable par data augmentation forte
+- Les samples bas-Y sont vus moins souvent → certains peuvent être ratés sur une epoch donnée
+
+**Quand préférer 2 sur 1** : si le modèle a tendance à diverger avec `loss_importance_reweight` (gradients explosent), ou si tu utilises un backbone avec BatchNorm (DINOv3 / Sapiens2 utilisent LayerNorm, donc peu d'impact, mais bon à savoir pour d'autres archis).
+
+→ **Optuna comparera empiriquement** : les 8 stratégies dans le search_space incluent maintenant `test_pmf_sampler` à côté de `imp_only` (mécanisme 1). Si l'une bat l'autre systématiquement, on saura.
+
+### Mécanisme 3 — Calibration POST-INFERENCE (NOUVEAU en v3+)
+
+**Quand** : APRÈS le training, sur les prédictions finales du test set, juste avant de soumettre.
+
+**Idée** : aucune modification du modèle. On regarde la distribution empirique des prédictions du modèle sur le test set, et on applique une transformation monotone pour qu'elle matche exactement `P_test`. C'est du **histogram matching** (technique standard en traitement d'image).
+
+**Algorithme** :
+1. Le modèle prédit ŷ_1, ŷ_2, ..., ŷ_N sur le test set
+2. On trie les prédictions par ordre croissant
+3. La k-ième prédiction la plus basse correspond au quantile k/N de la distribution empirique
+4. On la **remplace** par la valeur de Y qui correspond au même quantile dans P_test
+5. Résultat : la distribution des prédictions matche exactement P_test, mais l'ORDRE est préservé
+
+**Code** : [`quantile_match_to_test_pmf()`](src/inference/calibration.py) (~30 lignes).
+
+**Flag** : `match_test_pmf: True` dans le CONFIG de `predict.py` (ou en argument programmatique).
+
+**Pourquoi ça aide** : la métrique du challenge est une MSE. Décomposition standard : erreur = biais² + variance. Si le modèle a tendance à **sous-prédire les hautes occlusions** (parce que Y haut est rare en train → le modèle "joue safe" en restant proche de la moyenne), le quantile mapping **rehausse ces prédictions** vers la vraie distribution test. Donc il **réduit le biais sans rien changer à la variance**.
+
+**Conditions de succès** :
+- ✅ Le modèle a un bon RANKING (préserve l'ordre des prédictions). Si oui, le mapping monotone garde la bonne structure et corrige juste les niveaux.
+- ❌ Si les erreurs sont purement aléatoires (bruit blanc), ça ne change rien — le mapping est monotone, il ne corrige pas du bruit non-systématique.
+
+**Comment vérifier que ça marche** : applique sur les prédictions val (qu'on a en GT), compare score brut vs score quantile-matché. Si l'écart est positif → applique sur test pour la soumission.
+
+```python
+from src.inference.calibration import quantile_match_to_test_pmf
+from src.utils.losses import _TEST_PMF_0025
+from src.utils.metrics import compute_score
+
+score_raw = compute_score(val_preds, val_gt, val_gender)["score"]
+val_preds_calibrated = quantile_match_to_test_pmf(val_preds, _TEST_PMF_0025)
+score_calibrated = compute_score(val_preds_calibrated, val_gt, val_gender)["score"]
+print(f"raw={score_raw:.5f}  calibrated={score_calibrated:.5f}  Δ={score_raw - score_calibrated:+.5f}")
+```
+
+Si `Δ > 0` (i.e., score calibré meilleur), active `match_test_pmf=True` dans `predict.py`.
+
+### Comment combiner les 3 mécanismes
+
+Ils sont **complémentaires**, pas exclusifs. Tu peux les empiler :
+
+| Stage | Action | Toujours actif ? |
+|---|---|---|
+| Training (loss) | `loss_importance_reweight: true` | optionnel, Optuna sample |
+| Training (sampler) | `balancing_strategy: "test_pmf_sampler"` | optionnel, Optuna sample (incompatible avec les autres samplers) |
+| Inference | `match_test_pmf: True` dans predict.py | **toujours essayer** sur val, activer si ça aide |
+
+Note : Mécanismes 1 et 2 sont **mutuellement exclusifs en pratique** (le sampler `test_pmf` désactive `loss_importance_reweight` car ils feraient double-emploi → la stratégie `test_pmf_sampler` met `loss_importance_reweight: False` automatiquement). Le mécanisme 3 est **toujours additif** — il s'applique aux prédictions finales quel que soit le mécanisme de training.
+
+### Subtilité : pourquoi pas juste le mécanisme 3 ?
+
+Question légitime : si la calibration post-hoc corrige le biais distributionnel, à quoi bon faire les mécanismes 1 et 2 pendant le training ?
+
+**Réponse** : le mécanisme 3 corrige UNIQUEMENT le biais marginal sur Y. Il ne corrige pas :
+- Les erreurs **dépendantes de l'image** (un visage difficile reste mal prédit après mapping)
+- Le **biais conditionnel sur le genre** (un modèle qui sous-estime systématiquement F et sur-estime M conserve ce biais après mapping — le mapping est appliqué SANS prendre en compte G)
+- Les **interactions Y × G** qui sont capturées par les samplers / loss reweighting au training
+
+Le mécanisme 3 est un **filet de sécurité** qui corrige les défauts résiduels après training. Les mécanismes 1 et 2 sont là pour que le modèle apprenne la bonne distribution dès le départ.
+
+---
+
 ## External data (optional)
 
 Two slots for extra data, both supported by the existing infrastructure — just drop files in the right place.
@@ -1262,3 +1496,71 @@ Aucune publication ne fait **exactement** notre tâche (Idemia metric `(Err_F + 
 | 2× RTX 3090 DDP | 48 GB | BF16 | ViT-H+/16 (requires manual weight DL) |
 
 All SLURM scripts use `torchrun --nproc_per_node=2`, 30 h time, with the right hardware tags. On Linux nodes `uv sync` pulls CUDA 12.6 wheels via the `[tool.uv.sources]` marker; on Mac it falls back to the default PyPI index (CPU/MPS). torch is pinned to `>=2.7,<3.0` to keep MPS autograd working for local sanity tests.
+
+---
+
+## Scaling — what fits on 2x RTX 3090 (24GB) and what doesn't
+
+### Backbones qui passent en DDP standard (v3)
+
+| Backbone | Params | Tient en DDP ? | BS effectif | Statut v3 |
+|---|---|---|---|---|
+| DINOv3 ViT-B/16 | 86M | ✅ | 128 | pretrain + finetune OK |
+| DINOv3 ViT-L/16 | 300M | ✅ (avec grad_ckpt) | 64 | non utilisé v3 |
+| **DINOv3 ViT-H+/16** | **600M** | ✅ (BS=8 + grad_ckpt) | 32 | **pretrain + finetune OK — le plus gros DINO sans refactor** |
+| Sapiens2 0.1B | 100M | ✅ | 128 | pretrain + finetune OK |
+| Sapiens2 0.4B | 400M | ✅ (BS=8 + grad_ckpt) | 32 | non utilisé v3 |
+| **Sapiens2 0.8B** | **800M** | ✅ (BS=4 + grad_ckpt) | 64 | **pretrain v3 — le plus gros Sapiens2 sans FSDP** |
+
+### Backbones bloqués sur v3 (besoin de refactor FSDP/ZeRO-3)
+
+| Backbone | Params | Pourquoi ça ne passe pas | Bloqueur |
+|---|---|---|---|
+| Sapiens2 1B | 1.5B | Adam fp32 (~12 GB) + student+teacher BF16 (~6 GB) + grads + activations > 24 GB / GPU | FSDP / DeepSpeed ZeRO-3 |
+| Sapiens2 5B | 5B | Modèle BF16 seul ~10 GB ; optim ~40 GB. Impossible même avec FSDP sur 2x 24GB | GPU ≥ A100 80GB, ou ZeRO-3 + offload CPU/NVMe |
+
+### Ce qu'il faudrait modifier pour débloquer Sapiens2 1B+ (v4 backlog)
+
+#### Option A — FSDP (PyTorch natif)
+
+Modifier `src/pretrain_ibot.py` :
+1. Wrapper student/teacher avec `FullyShardedDataParallel` au lieu de DDP (`sharding_strategy=FULL_SHARD`, `MixedPrecision(param_dtype=bfloat16)`)
+2. `EncoderSnapshotCallback` : utiliser `FullStateDictConfig(offload_to_cpu=True, rank0_only=True)` pour obtenir le state_dict avant `mlflow.pytorch.log_model`
+3. Si `teacher_frozen=False` : `ema_update_teacher` avec `summon_full_params` (les params sont shardés)
+4. Resumability : checkpoints FSDP (ne pas réutiliser le format HF Trainer par défaut)
+5. HF Trainer wrapper iBOT custom contient 2 nn.Modules (`student` + `teacher`) → wrapping manuel nécessaire (auto-wrap par taille ne va pas suffire)
+
+**Effort estimé** : 2-3 jours dev + debug. Risque de NaN à debug en BF16 sharded.
+
+#### Option B — DeepSpeed ZeRO-3
+
+Plus invasif mais mieux documenté.
+1. `pip install deepspeed`, ajouter à `pyproject.toml`
+2. Config `configs/deepspeed_zero3.json` (Adam offload, params offload, grad accumulation)
+3. `TrainingArguments(deepspeed="configs/deepspeed_zero3.json", ...)`
+4. Snapshots : `deepspeed.checkpoint_engine` + conversion vers state_dict standard
+
+**Effort estimé** : 1-2 jours. Plus stable que FSDP en pratique.
+
+### Pour Sapiens2 5B et plus
+
+Impossible sur 2x RTX 3090 même avec ZeRO-3. Pistes :
+- Migrer vers A100/H100 ≥ 80GB
+- ZeRO-3 + offload CPU + NVMe (très lent, ~10x facteur)
+- **Ne pas pretrain** : utiliser directement les poids Meta `sapiens2_5b` avec `pretrained_source: "sapiens_default"`. Sapiens2 est déjà human-centric par construction, donc l'iBOT custom apporte peut-être peu à cette taille.
+
+### Quand prendre la décision
+
+```
+Sweep v3 Optuna terminé → quelle source pretrained gagne ?
+│
+├── "lvd" / "sapiens_default" gagne → pas besoin d'iBOT custom aux grosses tailles
+│   → utiliser sapiens2_1b/5b directement avec sapiens_default
+│   → mais FSDP toujours nécessaire pour finetune 1B+
+│
+└── "ibot:encoder_*" gagne → l'iBOT custom apporte
+    → Option A (FSDP) ou B (DeepSpeed) pour pretrain 1B+
+    → ou rester à 0.8B comme plafond pratique
+```
+
+Liens : [PyTorch FSDP tutorial](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html) · [HF Trainer FSDP](https://huggingface.co/docs/transformers/main/en/fsdp) · [DeepSpeed ZeRO-3](https://www.deepspeed.ai/tutorials/zero/)

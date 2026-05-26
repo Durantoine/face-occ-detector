@@ -39,33 +39,64 @@ def compute_score(
     mask_f = gender < 0.5
     mask_m = gender >= 0.5
 
-    # Raw (no shift correction): metric as if train and test had same Y distribution.
     err_f_raw = _weighted_err(pred[mask_f], gt[mask_f], w_imp=None)
     err_m_raw = _weighted_err(pred[mask_m], gt[mask_m], w_imp=None)
     score_raw = (err_f_raw + err_m_raw) / 2.0 + abs(err_f_raw - err_m_raw)
 
-    # Reweighted to P_test (the "honest" estimate of test-time performance).
     err_f = _weighted_err(pred[mask_f], gt[mask_f], w_imp=(w_imp[mask_f] if w_imp is not None else None))
     err_m = _weighted_err(pred[mask_m], gt[mask_m], w_imp=(w_imp[mask_m] if w_imp is not None else None))
     score = (err_f + err_m) / 2.0 + abs(err_f - err_m)
 
+    abs_err = np.abs(pred - gt)
+    sq_err = (pred - gt) ** 2
+
     return {
-        # Official metric (test-reweighted if importance_pmf_ratio is provided)
-        "score": score,
-        "err_F": err_f,
-        "err_M": err_m,
-        "err_diff": abs(err_f - err_m),
-        # Raw metric — same numbers as `score` when importance_pmf_ratio is None.
-        # When importance_pmf_ratio IS provided, this gives the un-corrected version
-        # so we can isolate the effect of the shift correction.
-        "score_raw": score_raw,
-        "err_F_raw": err_f_raw,
-        "err_M_raw": err_m_raw,
-        "err_diff_raw": abs(err_f_raw - err_m_raw),
-        # Unweighted reference metrics
-        "mse": float(((pred - gt) ** 2).mean()),
-        "mae": float(np.abs(pred - gt).mean()),
+        "challenge_score_test_estimated": score,
+        "err_F_test_estimated":           err_f,
+        "err_M_test_estimated":           err_m,
+        "err_diff_test_estimated":        abs(err_f - err_m),
+        "challenge_score_val":            score_raw,
+        "err_F_val":                      err_f_raw,
+        "err_M_val":                      err_m_raw,
+        "err_diff_val":                   abs(err_f_raw - err_m_raw),
+        "mse_val":                _weighted_mean(sq_err, None),
+        "mae_val":                _weighted_mean(abs_err, None),
+        "mae_pct_val":            float(abs_err.mean() * 100.0),
+        "mae_pct_test_estimated": _weighted_mean(abs_err, w_imp) * 100.0,
+        "r2_val":                 _r2_weighted(pred, gt, None),
+        "r2_test_estimated":      _r2_weighted(pred, gt, w_imp),
     }
+
+
+def _weighted_mean(values: np.ndarray, weights: Optional[np.ndarray]) -> float:
+    if len(values) == 0:
+        return 0.0
+    if weights is None:
+        return float(values.mean())
+    den = float(weights.sum())
+    return float((weights * values).sum() / den) if den > 0 else 0.0
+
+
+def _r2_weighted(pred: np.ndarray, gt: np.ndarray, weights: Optional[np.ndarray]) -> float:
+    """R² = 1 - SS_res / SS_tot, with optional sample weights.
+    Returns 0.0 when var(gt) is zero (no signal to explain).
+    """
+    if len(gt) == 0:
+        return 0.0
+    if weights is None:
+        mean_y = float(gt.mean())
+        ss_res = float(((pred - gt) ** 2).sum())
+        ss_tot = float(((gt - mean_y) ** 2).sum())
+    else:
+        wsum = float(weights.sum())
+        if wsum <= 0:
+            return 0.0
+        mean_y = float((weights * gt).sum() / wsum)
+        ss_res = float((weights * (pred - gt) ** 2).sum())
+        ss_tot = float((weights * (gt - mean_y) ** 2).sum())
+    if ss_tot <= 0:
+        return 0.0
+    return 1.0 - ss_res / ss_tot
 
 
 def make_compute_metrics(importance_pmf_ratio: Optional[np.ndarray] = None, bin_width: float = 0.025):

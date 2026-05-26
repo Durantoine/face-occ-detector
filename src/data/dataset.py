@@ -25,6 +25,34 @@ def create_balanced_sampler(group_keys: List[int], num_groups: int = 2) -> Weigh
     return WeightedRandomSampler(weights=weights.tolist(), num_samples=n_samples, replacement=True)
 
 
+def create_test_pmf_sampler(
+    y: np.ndarray,
+    test_pmf: np.ndarray,
+    bin_width: float = 0.025,
+    clip: float = 10.0,
+    num_samples: Optional[int] = None,
+) -> WeightedRandomSampler:
+    """Sampler that resamples the training data so the effective distribution of Y
+    in each epoch matches `test_pmf`. Per-sample weight = P_test[b] / P_train[b]
+    where b is the Y-bin index. Clipped to [1/clip, clip] for stability.
+
+    Use this as an ALTERNATIVE to `loss_importance_reweight=True` — both compensate
+    the train↔test shift on Y, but at different stages :
+      * loss reweighting → all samples seen, gradients pondérés
+      * resampling (this) → effective batch distribution = P_test, loss standard
+    """
+    y_arr = np.asarray(y, dtype=np.float64).flatten()
+    test = np.asarray(test_pmf, dtype=np.float64).flatten()
+    n_bins = len(test)
+    bin_idx = np.clip((y_arr / bin_width).astype(int), 0, n_bins - 1)
+    train_pmf = np.bincount(bin_idx, minlength=n_bins).astype(np.float64) / max(len(y_arr), 1)
+    ratio = test / np.maximum(train_pmf, 1e-6)
+    ratio = np.clip(ratio, 1.0 / clip, clip)
+    weights = ratio[bin_idx]
+    n = int(num_samples if num_samples is not None else len(y_arr))
+    return WeightedRandomSampler(weights=weights.tolist(), num_samples=n, replacement=True)
+
+
 def _normalize_df(
     df: pd.DataFrame,
     image_col: str,

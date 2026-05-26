@@ -735,11 +735,6 @@ def train(
     r2_va = eval_results.get("eval_r2_val", 0.0)
     print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
 
-    # IMPORTANT: trainer.predict is a DDP collective — ALL ranks must call it,
-    # only rank 0 processes the result. Gating predict() on rank 0 only
-    # → other ranks skip the collective → NCCL timeout deadlock.
-    # Called unconditionally so we can (1) evaluate quantile-matched variant
-    # and (2) reuse the predictions for the qualitative-K dump below.
     try:
         pred_out = trainer.predict(val_dataset)
     except Exception as e:
@@ -756,12 +751,6 @@ def train(
         gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
 
-    # === Post-hoc quantile matching evaluation (free win or no-op) ===
-    # We log both the raw and matched challenge score; Optuna's objective is
-    # min(raw, matched), so each trial gets a free shot at calibration without
-    # doubling the training budget. `calibration_helps` records whether matching
-    # was beneficial for this run — at the end of the study, the share of True
-    # answers tells us whether to enable match_test_pmf by default in predict.
     used_matching = False
     if preds is not None:
         from src.inference.calibration import quantile_match_to_test_pmf

@@ -5,7 +5,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import optuna
 import torch
@@ -205,6 +205,7 @@ def objective(
     mode: str,
     rotate_val_seed: bool,
     test_data_csv: Optional[str],
+    keep_top_n: int = 3,
 ) -> Any:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -219,14 +220,8 @@ def objective(
         val_seed = (seed + trial.number * 13) if rotate_val_seed else None
         if client and experiment_id:
             run_id = _make_child_run(client, experiment_id, parent_run_id, base_arch, trial)
-        # Save model weights only if this trial would improve over current best.
-        # Pareto mode: skip the gate (multi-objective best is ambiguous).
-        try:
-            study = trial.study
-            best = float(study.best_value) if mode != "pareto" and study.best_trial is not None else float("inf")
-        except (ValueError, AttributeError):
-            best = float("inf")
-        min_score_to_save = None if mode == "pareto" else best
+        threshold = _top_n_threshold(trial.study, mode, keep_top_n) if mode != "pareto" else float("inf")
+        min_score_to_save = None if mode == "pareto" else threshold
         trial_data = {
             "arch": arch_name, "run_id": run_id, "seed": seed, "val_seed": val_seed,
             "n": trial.number, "min_score_to_save": min_score_to_save,
@@ -322,6 +317,70 @@ class _MaxTrials:
         done = [optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED]
         if sum(1 for t in study.trials if t.state in done) >= self.n:
             study.stop()
+
+
+def _completed_scores(study: optuna.Study, mode: str) -> List[Tuple[int, float]]:
+    if mode == "pareto":
+        return []
+    items: List[Tuple[int, float]] = []
+    for t in study.trials:
+        if t.state != optuna.trial.TrialState.COMPLETE or t.value is None:
+            continue
+        v = float(t.value)
+        if v == float("inf") or v != v:
+            continue
+        items.append((t.number, v))
+    items.sort(key=lambda x: x[1])
+    return items
+
+
+def _top_n_threshold(study: optuna.Study, mode: str, n: int) -> float:
+    scores = _completed_scores(study, mode)
+    if len(scores) < n:
+        return float("inf")
+    return scores[n - 1][1]
+
+
+class _PruneRegistryToTopN:
+    def __init__(
+        self,
+        client: Optional[MlflowClient],
+        base_arch: str,
+        mode: str,
+        n: int,
+    ) -> None:
+        self.client = client
+        self.base_arch = base_arch
+        self.mode = mode
+        self.n = n
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if self.client is None or self.mode == "pareto":
+            return
+        scores = _completed_scores(study, self.mode)
+        if len(scores) <= self.n:
+            return
+        top_trial_numbers = {tn for tn, _ in scores[: self.n]}
+        for trial_number, _ in scores[self.n:]:
+            if trial_number in top_trial_numbers:
+                continue
+            model_name = f"{self.base_arch}_trial{trial_number}"
+            try:
+                versions = self.client.search_model_versions(f"name='{model_name}'")
+            except Exception:
+                continue
+            if not versions:
+                continue
+            for v in versions:
+                try:
+                    self.client.delete_model_version(model_name, v.version)
+                except Exception as e:
+                    print(f"WARNING: could not delete {model_name} v{v.version}: {e}")
+            try:
+                self.client.delete_registered_model(model_name)
+                print(f"Pruned {model_name} (out of top-{self.n})")
+            except Exception as e:
+                print(f"WARNING: could not delete registered model {model_name}: {e}")
 
 
 def _validate_v4_search_space(base_config: Dict[str, Any]) -> None:
@@ -428,6 +487,7 @@ def optimize_hyperparameters(
     objective_mode = optuna_cfg.get("objective_mode", objective_mode)
     rotate_val_seed = optuna_cfg.get("rotate_val_seed", rotate_val_seed)
     n_trials = optuna_cfg.get("n_trials", n_trials)
+    keep_top_n = int(optuna_cfg.get("keep_top_n", 3))
 
     # Early validation: fail fast on common config bugs (legacy params, broken URIs).
     if is_main():
@@ -443,7 +503,7 @@ def optimize_hyperparameters(
 
     if is_main():
         study = _create_study_with_retry(study_name, storage, objective_mode)
-        print(f"Study={study_name} | Trials={n_trials} | Mode={objective_mode} | Dist={local_rank != -1}")
+        print(f"Study={study_name} | Trials={n_trials} | Mode={objective_mode} | KeepTopN={keep_top_n} | Dist={local_rank != -1}")
         if use_mlflow:
             client = MlflowClient(tracking_uri=tracking_uri)
             experiment_id = get_or_create_experiment(client, f"optuna-{architecture}")
@@ -460,9 +520,13 @@ def optimize_hyperparameters(
         assert study is not None
         study.optimize(
             lambda t: objective(t, architecture, base_config, client, experiment_id,
-                                parent_run_id, tracking_uri, objective_mode, rotate_val_seed, test_data_csv),
+                                parent_run_id, tracking_uri, objective_mode, rotate_val_seed,
+                                test_data_csv, keep_top_n),
             n_trials=n_trials,
-            callbacks=[_MaxTrials(n_trials)],
+            callbacks=[
+                _MaxTrials(n_trials),
+                _PruneRegistryToTopN(client, architecture, objective_mode, keep_top_n),
+            ],
         )
         broadcast(None)
     else:

@@ -48,6 +48,8 @@ _TRAINING_KEYS = {
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
     "adv_lambda", "mmd_lambda", "mixup_alpha",
+    "val_split_strategy",
+    "loss_rw_strategy", "feature_fairness",
 }
 _MODEL_KEYS = {
     "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
@@ -60,38 +62,37 @@ _MODEL_KEYS = {
     "attn_dropout", "proj_dropout",
 }
 
-_BALANCING_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
-    # === Reweighting + sampler (classiques) ===
-    "gender_sampler_imp":   {"sampler_strategy": "gender",    "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "imp_only":             {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "cell_joint_yg":        {"sampler_strategy": "none",      "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": True,  "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "occ_sampler_gender":   {"sampler_strategy": "occlusion", "loss_importance_reweight": False, "loss_gender_reweight": True,  "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    # === Feature-level fairness mechanisms on top of importance reweighting (no sampler reduction). ===
-    "dann":                 {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "mmd":                  {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
-    "mixup_gender":         {"sampler_strategy": "none",      "loss_importance_reweight": True,  "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
-    # === Importance resampling : compensate the train↔test shift via the SAMPLER, not the loss ===
-    "test_pmf_sampler":     {"sampler_strategy": "test_pmf",  "loss_importance_reweight": False, "loss_gender_reweight": False, "loss_cell_reweight": False, "loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+# Stratégies d'équilibrage v4 — décomposées sur 3 axes orthogonaux.
+# Optuna sample chaque axe indépendamment → on peut mesurer l'importance par axe
+# via optuna.importance.get_param_importances(study).
+# Voir README §"Stratégies d'équilibrage — 3 axes" pour la matrice complète des 4
+# aspects (déséquilibre F/M, Y, corrélation Y×G, shift train→test) couverts.
+
+_LOSS_RW_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
+    "none":       {"loss_importance_reweight": False, "loss_cell_reweight": False},
+    "imp_rw":     {"loss_importance_reweight": True,  "loss_cell_reweight": False},
+    "cell_joint": {"loss_importance_reweight": True,  "loss_cell_reweight": True},
 }
 
-# Backward-compat aliases for legacy MLflow / Optuna studies using A/D/E/F/G/H/I.
-_BALANCING_STRATEGY_ALIASES: Dict[str, str] = {
-    "A": "gender_sampler_imp",
-    "D": "imp_only",
-    "E": "cell_joint_yg",
-    "F": "occ_sampler_gender",
-    "G": "dann",
-    "H": "mmd",
-    "I": "mixup_gender",
+_FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
+    "none":         {"loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "dann":         {"loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "mmd":          {"loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
+    "mixup_gender": {"loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
 }
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    if name == "balancing_strategy":
-        key = _BALANCING_STRATEGY_ALIASES.get(str(value), str(value))
-        if key not in _BALANCING_STRATEGY_MAP:
-            raise ValueError(f"Unknown balancing_strategy: {value!r}")
-        for k, v in _BALANCING_STRATEGY_MAP[key].items():
+    if name == "loss_rw_strategy":
+        if str(value) not in _LOSS_RW_STRATEGY_MAP:
+            raise ValueError(f"Unknown loss_rw_strategy: {value!r}")
+        for k, v in _LOSS_RW_STRATEGY_MAP[str(value)].items():
+            cfg["training"][k] = v
+        return
+    if name == "feature_fairness":
+        if str(value) not in _FEATURE_FAIRNESS_MAP:
+            raise ValueError(f"Unknown feature_fairness: {value!r}")
+        for k, v in _FEATURE_FAIRNESS_MAP[str(value)].items():
             cfg["training"][k] = v
         return
     if name == "pretrained_source":
@@ -323,6 +324,24 @@ class _MaxTrials:
             study.stop()
 
 
+def _validate_v4_search_space(base_config: Dict[str, Any]) -> None:
+    """Reject legacy v3 yamls that use `balancing_strategy` (replaced by 3 axes in v4).
+
+    Fails fast with a clear migration message instead of silently ignoring the old
+    parameter and producing meaningless trials.
+    """
+    ss = base_config.get("optuna", {}).get("search_space", {})
+    if "balancing_strategy" in ss:
+        raise ValueError(
+            "This yaml uses the legacy `balancing_strategy` parameter (v3). "
+            "v4 decomposes this into 3 orthogonal axes :\n"
+            "  - sampler_strategy ∈ {none, gender, occlusion, gender_x_occ, test_pmf}\n"
+            "  - loss_rw_strategy ∈ {none, imp_rw, cell_joint}\n"
+            "  - feature_fairness ∈ {none, dann, mmd, mixup_gender}\n"
+            "Migrate the yaml, or use a v3 branch of the code if you need to reuse it."
+        )
+
+
 def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_uri: str) -> None:
     """Fail-fast validation of `pretrained_source` choices in the search space.
 
@@ -410,11 +429,11 @@ def optimize_hyperparameters(
     rotate_val_seed = optuna_cfg.get("rotate_val_seed", rotate_val_seed)
     n_trials = optuna_cfg.get("n_trials", n_trials)
 
-    # Early validation: fail fast if pretrained_source choices reference placeholders
-    # or runs that don't resolve in MLflow. Avoid wasting 30 min of GPU on a trial
-    # that crashes at backbone load time.
-    if is_main() and use_mlflow:
-        _validate_pretrained_source_choices(base_config, tracking_uri)
+    # Early validation: fail fast on common config bugs (legacy params, broken URIs).
+    if is_main():
+        _validate_v4_search_space(base_config)
+        if use_mlflow:
+            _validate_pretrained_source_choices(base_config, tracking_uri)
     if study_name is None:
         study_name = f"optuna-{architecture}-{datetime.now().strftime('%Y%m%d')}"
 

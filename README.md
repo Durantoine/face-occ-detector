@@ -209,7 +209,7 @@ On n'a pas cette estimation aujourd'hui, donc on s'en tient à l'hypothèse Y-on
 
 ## Méthodes — référence détaillée
 
-> Cette section donne pour chaque méthode du search space v3 : la formule, les dimensions, le coût et la motivation théorique. Elle utilise du LaTeX rendu en MathJax — viewable sur GitHub directement, ou en local avec une extension Markdown supportant MathJax.
+> Cette section donne pour chaque méthode du search space v4 : la formule, les dimensions, le coût et la motivation théorique. Elle utilise du LaTeX rendu en MathJax — viewable sur GitHub directement, ou en local avec une extension Markdown supportant MathJax.
 
 ### Notations communes (glossaire complet)
 
@@ -322,7 +322,7 @@ $$\Phi_{b, d} = \left( \frac{1}{N_p} \sum_{n=1}^{N_p} \max(X[b, n, d],\, \vareps
 - **Params appris dans le pool** : 1 (le scalaire $\tilde p$)
 - **Output dim** : $D' = D$
 - **Coût** : O($B \cdot N_p \cdot D$), négligeable
-- **Limite v2 → v3** : sur features ViT non-activées (peuvent être négatives), le clamp à $\varepsilon$ tue la moitié du signal. Acceptable comme baseline ; reconsidérer si GeM perd contre les autres.
+- **Limite v2 → v4** : sur features ViT non-activées (peuvent être négatives), le clamp à $\varepsilon$ tue la moitié du signal. Acceptable comme baseline ; reconsidérer si GeM perd contre les autres.
 
 #### Pooling 3 — Attention K-query (le v2 actuel)
 
@@ -607,7 +607,7 @@ Cette section documente **les 14 métriques** que [`compute_score()`](src/utils/
 
 ### Convention de nommage
 
-Toutes les métriques v3 utilisent un **suffixe explicite** qui décrit comment elles sont calculées :
+Toutes les métriques v4 utilisent un **suffixe explicite** qui décrit comment elles sont calculées :
 
 | Suffixe | Calcul | À quoi ça sert |
 |---|---|---|
@@ -636,7 +636,7 @@ $$\overline{e}_G = \frac{\sum_{i:\, g_i = G} w_i \cdot (\hat y_i - y_i)^2}{\sum_
 | `err_diff_test_estimated` | $\lvert\overline{e}_F - \overline{e}_M\rvert$ reweighté | scalar, **mesure de fairness genre** |
 | `err_F_val`, `err_M_val`, `err_diff_val` | versions val direct | scalar |
 
-Le `metric_for_best_model: eval_challenge_score_test_estimated` dans les yaml v3 fait que **HF Trainer charge le meilleur checkpoint sur cette métrique**, et Optuna l'optimise.
+Le `metric_for_best_model: eval_challenge_score_test_estimated` dans les yaml v4 fait que **HF Trainer charge le meilleur checkpoint sur cette métrique**, et Optuna l'optimise.
 
 ### Les 6 métriques de référence (interprétation humaine)
 
@@ -730,11 +730,133 @@ Histogramme de $\lvert\hat y - y\rvert$ split F vs M, avec lignes verticales aux
 
 ---
 
+## Stratégies d'équilibrage — 3 axes orthogonaux (v4)
+
+### Les 4 aspects à corriger
+
+Avant les mécanismes, on sépare les 4 problèmes distincts :
+
+| # | Aspect | Description |
+|---|---|---|
+| 1 | **Déséquilibre F/M sur train** | Plus d'un genre que l'autre dans le train set |
+| 2 | **Déséquilibre Y sur train** | Distribution d'occlusion concentrée près de 0 dans le train |
+| 3 | **Corrélation Y × G** | Les visages F ont en moyenne plus d'occlusion que M sur le train (hard correlation à décorréler) |
+| 4 | **Shift train→test sur Y** | Distribution Y du test diffère de celle du train (test plus chargé en haut-Y) |
+
+### Les 3 axes du search space
+
+Optuna sample **3 axes indépendamment** par trial, ce qui permet de mesurer l'**importance** de chaque axe via `optuna.importance.get_param_importances(study)` après le sweep.
+
+#### Axe 1 — `sampler_strategy` (équilibrage data-level)
+
+Quel sampler de batch utiliser ?
+
+| Valeur | Effet | Aspects adressés |
+|---|---|---|
+| `none` | DataLoader standard (séquentiel/random) | aucun |
+| `gender` | WeightedRandomSampler équilibrant F/M | **(1)** |
+| `occlusion` | WeightedRandomSampler équilibrant les buckets Y | **(2)** |
+| `gender_x_occ` | WeightedRandomSampler équilibrant les cellules (G × Y_bucket) | **(1), (2), (3)** — joint Y×G par data |
+| `test_pmf` | WeightedRandomSampler avec poids `P_test(Y)/P_train(Y)` | **(2), (4)** — distribution Y matche test directement |
+
+#### Axe 2 — `loss_rw_strategy` (reweighting dans la loss)
+
+Quel reweighting de la loss appliquer ?
+
+| Valeur | Effet | Aspects adressés |
+|---|---|---|
+| `none` | Loss standard (juste `w_i = 1/30 + y_i`) | aucun |
+| `imp_rw` | `w_i *= P_test(bin_y)/P_train(bin_y)` — importance reweighting | **(4)** — shift Y dans la loss |
+| `cell_joint` | imp_rw + cell_rw : `w_i *= P_test(bin_y)/P_train(bin_y) * 1/√count(G, bin_y)` | **(3), (4)** — hard decorrelation Y×G dans la loss |
+
+> Conditional : quand `sampler_strategy=test_pmf`, l'axe 2 est forcé à `none` (test_pmf corrige déjà le shift Y au niveau data, double-correction inutile).
+
+#### Axe 3 — `feature_fairness` (invariance genre au niveau features)
+
+Quel mécanisme de fairness G appliquer ?
+
+| Valeur | Effet | Aspects adressés |
+|---|---|---|
+| `none` | Aucune contrainte sur les features | aucun |
+| `dann` | Discriminateur G + Gradient Reversal Layer → features gender-invariantes | **(1), (3)** — hard decorrelation G par adversarial |
+| `mmd` | Pénalité MMD entre features F et M | **(1), (3)** — hard decorrelation G par alignement statistique |
+| `mixup_gender` | Mixup inter-genre dans le même bucket Y | **(1), (3)** — hard decorrelation G par data aug |
+
+### Combos couverts
+
+5 × 3 × 4 = **60 combinaisons théoriques**. Après filtrage du conditional (`test_pmf` force `loss_rw=none`) → **52 combinaisons valides**.
+
+Quelques combos notables :
+
+| Combo (sampler, loss_rw, feature_fairness) | Équivalent à l'ancienne stratégie | Sens |
+|---|---|---|
+| `(none, none, none)` | `no_balancing` | Baseline pur — aucune correction |
+| `(none, imp_rw, none)` | `imp_only` | Juste correction shift Y |
+| `(none, cell_joint, none)` | `cell_joint_yg` | Hard decorrelation loss-based Y×G |
+| `(gender_x_occ, imp_rw, none)` | (combo nouveau) | Sampler joint + correction shift |
+| `(none, imp_rw, dann)` | `dann` | Hard decorrelation features adversarial |
+| `(none, imp_rw, mmd)` | `mmd` | Hard decorrelation features géométrique |
+| `(none, imp_rw, mixup_gender)` | `mixup_gender` | Hard decorrelation par data aug |
+| `(test_pmf, none, none)` | `test_pmf_sampler` | Compensation shift Y au niveau sampler |
+| `(test_pmf, none, dann)` | (combo nouveau) | Sampler aligned + adversarial G |
+| `(test_pmf, none, mmd)` | (combo nouveau) | Sampler aligned + MMD G |
+
+→ Le 3-axes inclut **toutes les anciennes stratégies** comme points particuliers + **ouvre des combinaisons nouvelles** qui n'existaient pas (par exemple `test_pmf + dann`).
+
+### Budget Optuna et trial par combo
+
+```
+100 trials sur 52 combos valides = ~2 trials/combo en moyenne (TPE concentre vite sur les bons)
+TPE concentre vite sur les combos prometteurs après la phase exploratoire
+→ ~8-15 trials sur les 5-10 meilleurs combos, ~1-2 sur les mauvais
+```
+
+Suffisant pour identifier le gagnant. Pour mesurer rigoureusement chaque importance, lance 150-200 trials.
+
+### Pénalité fairness `loss_fairness_lambda` (toujours dans le search space)
+
+**Indépendamment** des 3 axes ci-dessus, Optuna sample un `loss_fairness_lambda ∈ [0, 2]` qui ajoute `λ · |err_F − err_M|` à la loss. C'est une 4e dimension de hard decorrelation (au niveau de l'aggregation des erreurs), toujours disponible.
+
+---
+
+## Choix du validation split — `val_split_strategy`
+
+Comment construire le val à partir du train ? Deux options dans v4 :
+
+### `stratified_yg` (default)
+
+Random split stratifié par `(gender × occlusion_bucket)`. Le val a **la même distribution que le train**, donc P_val ≠ P_test (shifted).
+
+- **Métriques** : `challenge_score_val` mesure la perf sur val (biaisée comme estimateur de test) ; `challenge_score_test_estimated` reweighte le val à `P_test` pour estimer la perf test sans biais.
+- **Avantages** : val maximal (20% des données = 20k samples), stable.
+- **Inconvénients** : l'estimation test (`*_test_estimated`) souffre de variance amplifiée sur les bins haut-Y rares.
+
+### `test_pmf` (nouveau)
+
+Resample le val à partir du train pour que **P_val(Y) = P_test(Y)** par construction. Chaque bin de Y reçoit `P_test(bin) × val_size` samples.
+
+- **Métriques** : `challenge_score_val` est **directement** l'estimateur de la perf test (pas de reweighting nécessaire). `challenge_score_test_estimated` ≈ `challenge_score_val`.
+- **Avantages** : éval propre, pas de magouille d'estimation, BatchNorm/stats internes au val matchent test, lecture plus intuitive.
+- **Inconvénients** : val plus petit (~10-15k au lieu de 20k, parce que les bins haut-Y rares limitent le tirage), plus de variance par trial.
+- **Implémentation** : [`_split_val_to_match_test_pmf()`](src/data/dataset.py).
+
+### Comment choisir
+
+| Si tu veux... | Utilise |
+|---|---|
+| Stabilité, gros val, courbes lisses | `stratified_yg` |
+| Estimation directe perf test, plus rigoureux | `test_pmf` |
+| Comparer empiriquement les 2 | Lance 2 sweeps en parallèle (un yaml pour chaque) |
+
+Configuration : `training.val_split_strategy: stratified_yg` ou `test_pmf` dans le yaml d'architecture.
+
+---
+
 ## Compenser le shift train→test — 3 mécanismes complémentaires
 
 Le challenge a un shift connu : la distribution d'occlusion Y dans le test diffère de celle du train (estimée via `_TEST_PMF_0025` dans `src/utils/losses.py`). Trois façons de compenser, chacune à un STAGE différent du pipeline.
 
-### Mécanisme 1 — Reweighter la loss (déjà utilisé dans v3)
+### Mécanisme 1 — Reweighter la loss (pilier v4 axe 2)
 
 **Quand** : pendant l'entraînement, à chaque batch.
 
@@ -750,7 +872,7 @@ Le challenge a un shift connu : la distribution d'occlusion Y dans le test diff�
 - Les gradients deviennent bruyants quand les poids sont extrêmes
 - Les stats internes du modèle (BatchNorm running mean/var) sont calculées sur la distribution train, pas la distribution reweightée
 
-### Mécanisme 2 — Resampler les données (NOUVEAU en v3+)
+### Mécanisme 2 — Resampler les données (NOUVEAU en v4)
 
 **Quand** : pendant l'entraînement, AU NIVEAU DU SAMPLER (avant que le batch arrive au modèle).
 
@@ -772,7 +894,7 @@ Le challenge a un shift connu : la distribution d'occlusion Y dans le test diff�
 
 → **Optuna comparera empiriquement** : les 8 stratégies dans le search_space incluent maintenant `test_pmf_sampler` à côté de `imp_only` (mécanisme 1). Si l'une bat l'autre systématiquement, on saura.
 
-### Mécanisme 3 — Calibration POST-INFERENCE (NOUVEAU en v3+)
+### Mécanisme 3 — Calibration POST-INFERENCE (NOUVEAU en v4)
 
 **Quand** : APRÈS le training, sur les prédictions finales du test set, juste avant de soumettre.
 
@@ -1009,7 +1131,7 @@ Implementation: `src/pretrain_ibot.py:DinoV3IBoT` (~100 LOC core).
 
 Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `./scripts/chain_pretrain.sh 3` to chain three 30 h SLURM submissions). Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`.
 
-**v3 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v3.yaml`). Optuna comparera alors automatiquement :
+**v4 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v4.yaml`). Optuna comparera alors automatiquement :
 - `"lvd"` (ou `"sapiens_default"` pour Sapiens2) : poids de base Meta
 - `"ibot:runs:/<run_id>/encoder"` : notre pretrain custom par-dessus
 
@@ -1552,7 +1674,7 @@ Impossible sur 2x RTX 3090 même avec ZeRO-3. Pistes :
 ### Quand prendre la décision
 
 ```
-Sweep v3 Optuna terminé → quelle source pretrained gagne ?
+Sweep v4 Optuna terminé → quelle source pretrained gagne ?
 │
 ├── "lvd" / "sapiens_default" gagne → pas besoin d'iBOT custom aux grosses tailles
 │   → utiliser sapiens2_1b/5b directement avec sapiens_default
@@ -1564,3 +1686,72 @@ Sweep v3 Optuna terminé → quelle source pretrained gagne ?
 ```
 
 Liens : [PyTorch FSDP tutorial](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html) · [HF Trainer FSDP](https://huggingface.co/docs/transformers/main/en/fsdp) · [DeepSpeed ZeRO-3](https://www.deepspeed.ai/tutorials/zero/)
+
+---
+
+## Audit v4 — leçons et limitations
+
+### Ce qu'on a fait mieux qu'en v3
+
+- **Décomposition en 3 axes orthogonaux** au lieu de 9 stratégies fixes : on peut mesurer l'importance Optuna axe par axe (`optuna.importance.get_param_importances(study)`)
+- **`no_balancing` baseline accessible** comme combo `(none, none, none)` → mesure l'apport des autres mécanismes
+- **Validation split flexible** : `stratified_yg` (default) ou `test_pmf` (val matche directement P_test)
+- **`pretrained_source` en search_space** : compare LVD vs iBOT snapshots @ 50k/100k/150k/200k dans le même study
+- **Quantile mapping post-inférence** : 3e mécanisme de compensation shift, indépendant du training
+- **Métriques nommées explicitement** : `challenge_score_test_estimated` vs `_val`, `mae_pct_*`, `r2_*` — pas d'aliases ambigus
+- **Diagnostic charts par trial** : MAE vs Y bin (split F/M) + densité des erreurs par genre, en PNG sauvé MLflow
+- **Sidecar `.meta.json`** par prédiction : trace complète du modèle + options inférence (pretrained_source, balancing flags, post-hoc, etc.)
+
+### Limitations qu'on assume
+
+| Limitation | Conséquence | Mitigation possible |
+|---|---|---|
+| **52 combos valides, 100 trials → 1.9 trials/combo en moyenne** | Importance Optuna par axe sera approximative | Bumper `n_trials` à 150-200 si on veut conclure rigoureusement |
+| `cell_joint` couple toujours `cell_rw + imp_rw` | On ne peut pas tester `cell_rw` seul (sans imp_rw) | Ajouter une 4e option `cell_only` à l'axe 2 |
+| Pas de migration des anciens yamls `balancing_strategy` | Erreur silencieuse si quelqu'un essaie un yaml v3 | Ajouter une validation au début d'`optimize_hyperparameters` |
+| Naming inconsistant : `loss_rw_strategy` (avec suffix) vs `feature_fairness` (sans) | Cognitive load mineur | Renommer en `loss_rw` + `feature_fairness` ou les deux avec `_strategy` |
+| Static defaults des flags piloté par 3 axes ont été retirés du yaml — défauts Python (`False`) prennent le relais | Si quelqu'un ajoute un nouveau flag sans le mettre dans le strategy map, il ne sera jamais activé | Documenter strictement que les flags pilotés par 3 axes ne doivent JAMAIS être en static config |
+| Zéro test unitaire sur `_LOSS_RW_STRATEGY_MAP` et `_FEATURE_FAIRNESS_MAP` | Régression silencieuse possible si on touche au code | `pytest tests/test_strategy_maps.py` à ajouter |
+
+### Ce qu'on aurait pu faire encore mieux
+
+**1. Source unique pour les flags d'équilibrage**
+
+Actuellement les flags `loss_importance_reweight`, `loss_cell_reweight`, etc. sont définis :
+- Dans les valeurs des strategy maps (`_LOSS_RW_STRATEGY_MAP` en optimize.py)
+- Comme paramètres de `WeightedMSETrainer` (avec défauts Python)
+- Lus depuis `train_cfg.get(..., default)` dans train.py
+
+Cette redondance est fragile. Une vraie source unique serait un `Pydantic.BaseModel` qui valide tout en un seul endroit.
+
+**2. Combos invalides au lieu de juste filtrer via `conditional_on`**
+
+Quand `sampler=test_pmf` ET `loss_rw=imp_rw`, c'est mathématiquement redondant mais pas illégal. Le `conditional_on` skip le sampling, donc on ne tombe jamais dans ce cas. Mieux : un check explicite qui RAISE si quelqu'un force ce combo manuellement.
+
+**3. Search space planifié de bout en bout AVANT de coder**
+
+Plusieurs itérations ont laissé des incohérences (no-ops, double-counts) qu'on a corrigées au fil de l'eau. Un plan complet sur papier avant de coder aurait évité ces allers-retours.
+
+**4. Nommage métier**
+
+`feature_fairness` est bien, `loss_rw_strategy` est un peu technique. Un nom comme `loss_decorrelation` (qui matche le mécanisme conceptuel) serait plus parlant.
+
+**5. Tests + CI**
+
+Aucun test automatisé sur les 3 axes. Un break silencieux est possible. Au minimum :
+```python
+def test_strategy_map_complete():
+    for k, v in _LOSS_RW_STRATEGY_MAP.items():
+        assert set(v.keys()) == {'loss_importance_reweight', 'loss_cell_reweight'}
+```
+
+**6. Documentation du conditional_on**
+
+La logique "si parent X = Y, ne pas sampler" n'est pas testée pour les cas d'edge (parent multi-niveaux, choix multi-conditions). À documenter.
+
+### Prochaines étapes (v5 ?)
+
+- Pydantic validation centralisée des flags d'équilibrage
+- Tests unitaires sur les strategy maps + le conditional sampling
+- Search space avec ~150-200 trials pour analyse rigoureuse de l'importance par axe
+- Migration des anciens yamls : validation au démarrage qui lit `balancing_strategy` et redirige vers les 3 axes (ou erreur explicite avec message clair)

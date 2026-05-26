@@ -64,6 +64,8 @@ _NON_HF_TRAIN_KEYS = {
     "group_dro_alpha", "layer_decay",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
     "adv_lambda", "mmd_lambda", "mixup_alpha",
+    "val_split_strategy",
+    "loss_rw_strategy", "feature_fairness",
 }
 
 
@@ -223,6 +225,7 @@ def _load_train_val(
     data_csv: Optional[str],
     val_data_csv: Optional[str],
     seed: int,
+    val_split_strategy: str = "stratified_yg",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     image_col = data_cfg.get("image_col", DEFAULT_IMAGE_COL)
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
@@ -240,7 +243,10 @@ def _load_train_val(
         print(f"Pre-split: train={len(train_df):,} val={len(val_df):,}")
         return train_df, val_df
 
-    return _load_data(train_path, **common, extra_train_csv=extra_train, seed=seed)
+    return _load_data(
+        train_path, **common, extra_train_csv=extra_train, seed=seed,
+        val_split_strategy=val_split_strategy,
+    )
 
 
 def _build_datasets(
@@ -484,7 +490,11 @@ def train(
     ml_log_params(client, run_id, {f"data_{k}": v for k, v in data_cfg.items()})
 
     processor = get_image_processor(model_name)
-    train_data, val_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
+    val_split_strategy = train_cfg.get("val_split_strategy", "stratified_yg")
+    train_data, val_data = _load_train_val(
+        data_cfg, data_csv, val_data_csv, val_seed or seed,
+        val_split_strategy=val_split_strategy,
+    )
     train_dataset, val_dataset = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
     )

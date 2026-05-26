@@ -1,8 +1,8 @@
-name: dinov3-vitb16-3090-v3
-description: DINOv3 ViT-B/16 (86M) v3 — extended search space (pooling_type, pretrained, qualitative best+worst). 2x RTX 3090 24GB (BF16).
+name: sapiens2-01b-3090-v4
+description: Sapiens2-0.1B (114M) v4 — 3-axis decomposition search space mirroring DINO v3. 2x RTX 3090 24GB (BF16). pretrained_source ∈ {sapiens_default, ibot:runs:/...} sampled by Optuna.
 
 model:
-  model_name: dinov3_vitb16
+  model_name: sapiens2_0.1b
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
@@ -26,6 +26,10 @@ model:
   pool_attn_dropout: 0.0
   pool_proj_dropout: 0.0
   backbone_drop_path_rate: 0.0
+  # Default iBOT run for this arch (overridden via pretrained_source sampling).
+  # NOTE: replace with the actual MLflow run_id of the Sapiens2 iBOT pretrain
+  # once that job has completed (see scripts/pretrain_ibot_sapiens2_2x3090.sh).
+  init_backbone_from: null
 
 data:
   image_col: filename
@@ -49,18 +53,15 @@ training:
   seed: 42
   logging_steps: 50
   metric_for_best_model: eval_challenge_score_test_estimated
+  val_split_strategy: stratified_yg
   greater_is_better: false
   bf16: true
   fp16: false
   gradient_checkpointing: false
   augmentation_level: medium
-  sampler_strategy: gender
   loss_type: weighted_mse
   loss_focal_gamma: 0.0
   loss_fairness_lambda: 1.0
-  loss_importance_reweight: true
-  loss_gender_reweight: false
-  loss_cell_reweight: false
   loss_query_diversity_lambda: 0.0
   eval_importance_reweight: true
   save_qualitative_k: 10
@@ -76,40 +77,55 @@ optuna:
   search_space:
     # === Always sampled ===
     # pretrained_source: Optuna choisit la source des poids du backbone parmi :
-    #   - "lvd"                                    DINOv3 LVD-1689M générique (Meta)
+    #   - "sapiens_default"                       Sapiens2-0.1B Meta (humans-pretrained)
     #   - "ibot:runs:/<RUN_ID>/encoder_50000"     iBOT @ 50k steps  (~1.25 ep MS1MV3)
     #   - "ibot:runs:/<RUN_ID>/encoder_100000"    iBOT @ 100k steps (~2.5  ep)
     #   - "ibot:runs:/<RUN_ID>/encoder_150000"    iBOT @ 150k steps (~3.8  ep)
     #   - "ibot:runs:/<RUN_ID>/encoder"           iBOT final @ 200k steps (~5 ep)
     #
-    # Remplir <RUN_ID> avec le contenu de results/pretrain_vitb16/mlflow_run_id.txt
-    # après le pretrain. Snapshots via EncoderSnapshotCallback dans pretrain_ibot.py
+    # Remplir <RUN_ID> avec le contenu de results/pretrain_sapiens2_01b/mlflow_run_id.txt
     # (FACE_OCC_PRETRAIN_SNAPSHOT_STEPS=50000,100000,150000, MAX_STEPS=200000).
-    #
-    # Le validateur _validate_pretrained_source_choices() rejette les placeholders
-    # __FILL_PRETRAIN_RUN_ID__ et les runs MLflow inexistants au démarrage du sweep.
     pretrained_source:
       type: categorical
       choices:
-        - "lvd"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_50000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_100000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_150000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder"
+        - "sapiens_default"
+        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_50000"
+        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_100000"
+        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder_150000"
+        - "ibot:runs:/__FILL_SAPIENS_IBOT_RUN_ID__/encoder"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]
-    balancing_strategy:
+    # === Stratégies d'équilibrage v4 — décomposées sur 3 axes orthogonaux ===
+    # Voir README §"Stratégies d'équilibrage — 3 axes" pour la matrice complète.
+    #   Axe 1 (sampler)       : équilibrage data-level
+    #   Axe 2 (loss reweight) : reweighting dans la loss
+    #   Axe 3 (feature fair)  : invariance genre au niveau features
+    sampler_strategy:
       type: categorical
       choices:
-        - "gender_sampler_imp"
-        - "imp_only"
-        - "cell_joint_yg"
-        - "occ_sampler_gender"
+        - "none"
+        - "gender"
+        - "occlusion"
+        - "gender_x_occ"
+        - "test_pmf"
+    loss_rw_strategy:
+      type: categorical
+      choices:
+        - "none"
+        - "imp_rw"
+        - "cell_joint"
+      # Quand sampler=test_pmf, le loss reweight n'a pas de sens (test_pmf corrige
+      # déjà le shift Y au niveau data) → forcer le default "none" (skip sampling).
+      conditional_on:
+        sampler_strategy: ["none", "gender", "occlusion", "gender_x_occ"]
+    feature_fairness:
+      type: categorical
+      choices:
+        - "none"
         - "dann"
         - "mmd"
         - "mixup_gender"
-        - "test_pmf_sampler"
     learning_rate:
       type: float
       low: 1.0e-05
@@ -185,30 +201,29 @@ optuna:
     # === Conditional on pooling_type == multihead_attention ===
     num_heads:
       type: categorical
-      # Divisors common to ViT-B (768) / ViT-L (1024) / ViT-H+ (1280) — keeps search space
-      # portable across backbones without arch-specific yaml duplication.
+      # Divisors common to Sapiens2-0.1B (768) / 0.4B (1024) / 0.8B (1280) / 1B (1536) / 5B (2432).
       choices: [2, 4, 8, 16]
       conditional_on:
         pooling_type: multihead_attention
 
-    # === Conditional on balancing_strategy ∈ {G, H, I} (feature-level fairness) ===
+    # === Conditional on feature_fairness (axe 3) — adv_lambda/mmd_lambda/mixup_alpha ===
     adv_lambda:
       type: float
       low: 0.01
       high: 1.0
       log: true
       conditional_on:
-        balancing_strategy: dann
+        feature_fairness: dann
     mmd_lambda:
       type: float
       low: 0.01
       high: 1.0
       log: true
       conditional_on:
-        balancing_strategy: mmd
+        feature_fairness: mmd
     mixup_alpha:
       type: float
       low: 0.1
       high: 0.5
       conditional_on:
-        balancing_strategy: mixup_gender
+        feature_fairness: mixup_gender

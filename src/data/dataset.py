@@ -87,6 +87,7 @@ def load_csv_data(
     split_ratio: float = 0.2,
     seed: int = 42,
     n_buckets: int = 10,
+    val_split_strategy: str = "stratified_yg",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(data_csv)
     df = _normalize_df(df, image_col, label_col, gender_col)
@@ -98,21 +99,68 @@ def load_csv_data(
     if split_ratio == 0 or len(df) < 2:
         return df.reset_index(drop=True), pd.DataFrame()
 
-    from src.utils.losses import stratify_key
-    stratify = None
-    if "gender" in df.columns and "FaceOcclusion" in df.columns:
+    if val_split_strategy == "test_pmf" and "FaceOcclusion" in df.columns:
+        train_df, val_df = _split_val_to_match_test_pmf(df, split_ratio, seed)
+        print(f"Val split = test_pmf (val matches P_test marginal on Y)")
+    else:
+        from src.utils.losses import stratify_key
+        stratify = None
+        if "gender" in df.columns and "FaceOcclusion" in df.columns:
+            try:
+                stratify = stratify_key(df["gender"], df["FaceOcclusion"], n_buckets=n_buckets)
+            except Exception:
+                stratify = None
         try:
-            stratify = stratify_key(df["gender"], df["FaceOcclusion"], n_buckets=n_buckets)
-        except Exception:
-            stratify = None
-
-    try:
-        train_df, val_df = train_test_split(df, test_size=split_ratio, random_state=seed, stratify=stratify)
-    except ValueError:
-        train_df, val_df = train_test_split(df, test_size=split_ratio, random_state=seed)
+            train_df, val_df = train_test_split(df, test_size=split_ratio, random_state=seed, stratify=stratify)
+        except ValueError:
+            train_df, val_df = train_test_split(df, test_size=split_ratio, random_state=seed)
 
     print(f"Train: {len(train_df):,} | Val: {len(val_df):,}")
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
+
+
+def _split_val_to_match_test_pmf(
+    df: pd.DataFrame,
+    split_ratio: float,
+    seed: int,
+    bin_width: float = 0.025,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build val by sampling per-Y-bin so that the val marginal P_val(Y) = P_test(Y).
+
+    Falls back to a smaller val when high-Y bins have too few samples on train.
+    """
+    from src.utils.losses import _TEST_PMF_0025
+    test_pmf = np.asarray(_TEST_PMF_0025, dtype=np.float64).flatten()
+    n_bins = len(test_pmf)
+    y = df["FaceOcclusion"].astype(float).values
+    bin_idx = np.clip((y / bin_width).astype(int), 0, n_bins - 1)
+
+    val_size_target = max(int(len(df) * split_ratio), 1)
+    target_per_bin = (test_pmf * val_size_target).astype(int)
+    rng = np.random.RandomState(seed)
+    val_indices: List[int] = []
+    skipped: List[Tuple[int, int, int]] = []
+    for b in range(n_bins):
+        in_bin = np.where(bin_idx == b)[0]
+        need = int(target_per_bin[b])
+        if need == 0:
+            continue
+        if len(in_bin) >= need:
+            val_indices.extend(rng.choice(in_bin, need, replace=False).tolist())
+        else:
+            val_indices.extend(in_bin.tolist())
+            skipped.append((b, need, len(in_bin)))
+
+    if skipped:
+        print(f"  WARNING: {len(skipped)} bins under-sampled for val (val will be slightly smaller):")
+        for b, need, got in skipped[:5]:
+            y_lo = b * bin_width
+            y_hi = y_lo + bin_width
+            print(f"    bin {b:2d} [Y∈{y_lo:.3f}-{y_hi:.3f}]: needed {need}, got {got}")
+
+    val_idx_arr = np.array(val_indices, dtype=int)
+    train_idx_arr = np.setdiff1d(np.arange(len(df)), val_idx_arr)
+    return df.iloc[train_idx_arr].copy(), df.iloc[val_idx_arr].copy()
 
 
 def _load_data(path: str, **kwargs: Any) -> Tuple[pd.DataFrame, pd.DataFrame]:

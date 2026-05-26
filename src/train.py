@@ -735,77 +735,117 @@ def train(
     r2_va = eval_results.get("eval_r2_val", 0.0)
     print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
 
+    # IMPORTANT: trainer.predict is a DDP collective — ALL ranks must call it,
+    # only rank 0 processes the result. Gating predict() on rank 0 only
+    # → other ranks skip the collective → NCCL timeout deadlock.
+    # Called unconditionally so we can (1) evaluate quantile-matched variant
+    # and (2) reuse the predictions for the qualitative-K dump below.
+    try:
+        pred_out = trainer.predict(val_dataset)
+    except Exception as e:
+        print(f"WARNING: trainer.predict failed: {e}")
+        pred_out = None
+
+    preds = gt = gender = None
+    if pred_out is not None and trainer.is_world_process_zero():
+        preds_raw = pred_out.predictions
+        if isinstance(preds_raw, (tuple, list)):
+            preds_raw = preds_raw[0]
+        preds = np.asarray(preds_raw).astype(np.float64).flatten()
+        labels = np.asarray(pred_out.label_ids).astype(np.float64)
+        gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
+        gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
+
+    # === Post-hoc quantile matching evaluation (free win or no-op) ===
+    # We log both the raw and matched challenge score; Optuna's objective is
+    # min(raw, matched), so each trial gets a free shot at calibration without
+    # doubling the training budget. `calibration_helps` records whether matching
+    # was beneficial for this run — at the end of the study, the share of True
+    # answers tells us whether to enable match_test_pmf by default in predict.
+    used_matching = False
+    if preds is not None:
+        from src.inference.calibration import quantile_match_to_test_pmf
+        from src.utils.losses import _TEST_PMF_0025
+        from src.utils.metrics import compute_score as _compute_score
+
+        preds_matched = quantile_match_to_test_pmf(preds, _TEST_PMF_0025)
+        matched = _compute_score(preds_matched, gt, gender, importance_pmf_ratio=eval_pmf_ratio)
+        s_raw, s_matched = float(eval_score), float(matched["challenge_score_test_estimated"])
+        used_matching = s_matched < s_raw
+
+        ml_log_metrics(client, run_id, {
+            "eval_challenge_score_matched_test_estimated": s_matched,
+            "eval_err_F_matched_test_estimated": matched["err_F_test_estimated"],
+            "eval_err_M_matched_test_estimated": matched["err_M_test_estimated"],
+            "eval_err_diff_matched_test_estimated": matched["err_diff_test_estimated"],
+            "eval_challenge_score_matched_val": matched["challenge_score_val"],
+            "eval_challenge_score_best_test_estimated": min(s_raw, s_matched),
+            "calibration_helps": 1.0 if used_matching else 0.0,
+            "calibration_delta": s_raw - s_matched,
+        })
+        ml_log_params(client, run_id, {"best_variant_uses_matching": used_matching})
+        print(f"  quantile match: raw={s_raw:.5f} matched={s_matched:.5f} "
+              f"→ {'matching helps' if used_matching else 'raw wins'} (Δ={s_raw-s_matched:+.5f})")
+
+        if used_matching:
+            eval_score = s_matched
+            err_diff = float(matched["err_diff_test_estimated"])
+            err_F = float(matched["err_F_test_estimated"])
+            err_M = float(matched["err_M_test_estimated"])
+
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
-    if save_qualitative_k > 0:
-        # IMPORTANT: trainer.predict is a DDP collective — ALL ranks must call it,
-        # only rank 0 processes the result. Gating predict() on rank 0 only
-        # → other ranks skip the collective → NCCL timeout deadlock.
+    if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():
         try:
-            pred_out = trainer.predict(val_dataset)
-        except Exception as e:
-            print(f"WARNING: trainer.predict failed: {e}")
-            pred_out = None
-        if pred_out is not None and trainer.is_world_process_zero():
+            w = 1.0 / 30.0 + gt
+            per_sample_err = w * (preds - gt) ** 2
+            worst_order = np.argsort(-per_sample_err)[:save_qualitative_k]
+            best_order = np.argsort(per_sample_err)[:save_qualitative_k]
+            paths_all = val_data["image_path"].values if "image_path" in val_data.columns else None
+            qual_root = Path(output_dir) / "qualitative"
+            base = Path(image_base_dir) if image_base_dir else None
+
+            def _dump(order: Any, label: str) -> None:
+                paths = paths_all[order] if paths_all is not None else None
+                df = pd.DataFrame({
+                    "rank": np.arange(1, len(order) + 1),
+                    "filename": paths if paths is not None else order,
+                    "gt": gt[order],
+                    "pred": preds[order],
+                    "abs_err": np.abs(preds[order] - gt[order]),
+                    "weighted_err": per_sample_err[order],
+                    "gender": gender[order],
+                })
+                sub = qual_root / label
+                sub.mkdir(parents=True, exist_ok=True)
+                df.to_csv(sub / f"{label}.csv", index=False)
+                img_dir = sub / "images"
+                img_dir.mkdir(exist_ok=True)
+                if paths is None:
+                    return
+                for rank, row in enumerate(df.itertuples(index=False), start=1):
+                    src = Path(row.filename)
+                    if base and not src.is_absolute():
+                        src = base / row.filename
+                    if not src.exists():
+                        continue
+                    dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
+                    if dst.exists():
+                        dst.unlink()
+                    shutil.copy(src, dst)
+                print(f"Saved {len(df)} {label} predictions: {sub}/{label}.csv + {img_dir}")
+
+            _dump(worst_order, "worst")
+            _dump(best_order, "best")
+
             try:
-                preds_raw = pred_out.predictions
-                if isinstance(preds_raw, (tuple, list)):
-                    preds_raw = preds_raw[0]
-                preds = np.asarray(preds_raw).astype(np.float64).flatten()
-                labels = np.asarray(pred_out.label_ids).astype(np.float64)
-                gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
-                gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
-                w = 1.0 / 30.0 + gt
-                per_sample_err = w * (preds - gt) ** 2
-                worst_order = np.argsort(-per_sample_err)[:save_qualitative_k]
-                best_order = np.argsort(per_sample_err)[:save_qualitative_k]
-                paths_all = val_data["image_path"].values if "image_path" in val_data.columns else None
-                qual_root = Path(output_dir) / "qualitative"
-                base = Path(image_base_dir) if image_base_dir else None
+                _save_diagnostic_charts(qual_root, preds, gt, gender)
+            except Exception as e_chart:
+                print(f"WARNING: could not save diagnostic charts: {e_chart}")
 
-                def _dump(order: Any, label: str) -> None:
-                    paths = paths_all[order] if paths_all is not None else None
-                    df = pd.DataFrame({
-                        "rank": np.arange(1, len(order) + 1),
-                        "filename": paths if paths is not None else order,
-                        "gt": gt[order],
-                        "pred": preds[order],
-                        "abs_err": np.abs(preds[order] - gt[order]),
-                        "weighted_err": per_sample_err[order],
-                        "gender": gender[order],
-                    })
-                    sub = qual_root / label
-                    sub.mkdir(parents=True, exist_ok=True)
-                    df.to_csv(sub / f"{label}.csv", index=False)
-                    img_dir = sub / "images"
-                    img_dir.mkdir(exist_ok=True)
-                    if paths is None:
-                        return
-                    for rank, row in enumerate(df.itertuples(index=False), start=1):
-                        src = Path(row.filename)
-                        if base and not src.is_absolute():
-                            src = base / row.filename
-                        if not src.exists():
-                            continue
-                        dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
-                        if dst.exists():
-                            dst.unlink()
-                        shutil.copy(src, dst)
-                    print(f"Saved {len(df)} {label} predictions: {sub}/{label}.csv + {img_dir}")
-
-                _dump(worst_order, "worst")
-                _dump(best_order, "best")
-
-                # === Diagnostic charts : error vs occlusion + density by gender ===
-                # Saved alongside best/worst → uploaded as MLflow artifacts in one go.
-                try:
-                    _save_diagnostic_charts(qual_root, preds, gt, gender)
-                except Exception as e_chart:
-                    print(f"WARNING: could not save diagnostic charts: {e_chart}")
-
-                if use_mlflow and use_client and client and run_id:
-                    client.log_artifacts(run_id, str(qual_root), "qualitative")
-            except Exception as e:
-                print(f"WARNING: could not save qualitative-K: {e}")
+            if use_mlflow and use_client and client and run_id:
+                client.log_artifacts(run_id, str(qual_root), "qualitative")
+        except Exception as e:
+            print(f"WARNING: could not save qualitative-K: {e}")
 
     if test_data_csv and trainer.is_world_process_zero():
         try:

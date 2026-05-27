@@ -264,6 +264,15 @@ def _render_trials_comparison() -> None:
 
     with st.sidebar:
         st.header("Trials comparison")
+        view_mode = st.radio(
+            "View",
+            ["Inter-trial (convergence)", "Intra-trial (training curves)"],
+            index=0,
+            help=(
+                "Inter-trial: 1 point per trial = score final, vue convergence d'Optuna.\n"
+                "Intra-trial: 1 courbe par trial = évolution training step-par-step."
+            ),
+        )
         exp_label_to_id = {name: eid for eid, name in experiments}
         default_labels = [name for _, name in default_exps]
         selected_labels = st.multiselect(
@@ -294,6 +303,12 @@ def _render_trials_comparison() -> None:
         max_per_exp = st.slider("Max trials per experiment", 5, 200, 50)
         log_y = st.checkbox("Log Y axis", value=True)
         show_running_only = st.checkbox("Hide finished trials", value=False)
+        if view_mode == "Inter-trial (convergence)":
+            show_best_so_far = st.checkbox("Show best-so-far envelope", value=True)
+            hide_inf = st.checkbox("Hide failed trials (score=inf/NaN)", value=True)
+        else:
+            show_best_so_far = False
+            hide_inf = False
         auto_refresh_sec = st.selectbox(
             "Auto-refresh",
             [0, 15, 30, 60, 120],
@@ -303,6 +318,217 @@ def _render_trials_comparison() -> None:
         if st.button("Refresh now"):
             st.cache_data.clear()
             st.rerun()
+
+    if view_mode == "Inter-trial (convergence)":
+        _render_inter_trial(
+            selected_labels, exp_label_to_id, selected_metric,
+            max_per_exp, log_y, show_running_only, show_best_so_far, hide_inf,
+        )
+    else:
+        _render_intra_trial(
+            selected_labels, exp_label_to_id, selected_metric,
+            max_per_exp, log_y, show_running_only,
+        )
+
+    if auto_refresh_sec > 0:
+        import time
+        time.sleep(auto_refresh_sec)
+        st.rerun()
+
+
+def _final_metric_value(
+    tracking_uri: str, run: Dict[str, Any], metric: str
+) -> Optional[float]:
+    """Return the final (last logged) value of `metric` for the given run.
+    Falls back to run.data.metrics if no history available."""
+    hist = _fetch_metric_history(tracking_uri, run["run_id"], metric)
+    if hist:
+        return float(hist[-1][1])
+    v = run["metrics"].get(metric)
+    return float(v) if v is not None else None
+
+
+def _render_inter_trial(
+    selected_labels: List[str],
+    exp_label_to_id: Dict[str, str],
+    selected_metric: str,
+    max_per_exp: int,
+    log_y: bool,
+    show_running_only: bool,
+    show_best_so_far: bool,
+    hide_inf: bool,
+) -> None:
+    import math
+    import plotly.graph_objects as go
+
+    st.title("Trials comparison — convergence (inter-trial)")
+    st.caption(
+        f"1 point = 1 trial (score final). Enveloppe noire = best-so-far. "
+        f"Hover pour les params. Source: `{TRACKING_URI}`"
+    )
+
+    fig = go.Figure()
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"]
+    rows_for_table: List[Dict[str, Any]] = []
+
+    for exp_idx, label in enumerate(selected_labels):
+        eid = exp_label_to_id[label]
+        runs = _list_runs_full(TRACKING_URI, eid)
+        if show_running_only:
+            runs = [r for r in runs if r["status"] == "RUNNING"]
+        runs = runs[:max_per_exp]
+        # Sort by start_time ASC so trial index = chronological order
+        runs = sorted(runs, key=lambda r: r.get("start_time", 0) or 0)
+
+        color = palette[exp_idx % len(palette)]
+        xs: List[int] = []
+        ys: List[float] = []
+        hovers: List[str] = []
+        for i, r in enumerate(runs, start=1):
+            val = _final_metric_value(TRACKING_URI, r, selected_metric)
+            if val is None:
+                continue
+            if hide_inf and (math.isinf(val) or math.isnan(val)):
+                continue
+            xs.append(i)
+            ys.append(val)
+            hovers.append(_build_hover_text(r["params"], r["name"], label))
+            rows_for_table.append({
+                "experiment": label,
+                "trial_idx": i,
+                "trial": r["name"],
+                "status": r["status"],
+                "final_value": val,
+                **{k: r["params"].get(k) for k in HOVER_PARAMS},
+            })
+
+        if not xs:
+            continue
+
+        # Scatter of per-trial finals
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="markers",
+            name=f"{label}  ({len(xs)} trials)",
+            marker=dict(color=color, size=8, opacity=0.7, line=dict(width=0.5, color="white")),
+            hovertext=hovers,
+            hovertemplate="trial=%{x}<br>"
+                          f"{selected_metric}=%{{y:.5g}}<br>"
+                          "%{hovertext}<extra></extra>",
+        ))
+
+        # Best-so-far envelope (running min)
+        if show_best_so_far and ys:
+            best = []
+            cur = float("inf")
+            for v in ys:
+                if v < cur:
+                    cur = v
+                best.append(cur)
+            fig.add_trace(go.Scatter(
+                x=xs, y=best, mode="lines",
+                name=f"best-so-far {label[:20]}",
+                line=dict(color=color, width=2, dash="dash"),
+                hoverinfo="skip",
+                showlegend=False,
+            ))
+
+    fig.update_layout(
+        height=600,
+        xaxis_title="Trial index (chronological)",
+        yaxis_title=selected_metric,
+        yaxis_type="log" if log_y else "linear",
+        hovermode="closest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if rows_for_table:
+        st.markdown("### Trials sweep table")
+        df = pd.DataFrame(rows_for_table).sort_values("final_value", na_position="last")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _render_intra_trial(
+    selected_labels: List[str],
+    exp_label_to_id: Dict[str, str],
+    selected_metric: str,
+    max_per_exp: int,
+    log_y: bool,
+    show_running_only: bool,
+) -> None:
+    import plotly.graph_objects as go
+
+    st.title("Trials comparison — training curves (intra-trial)")
+    st.caption(
+        f"1 courbe par trial = évolution step-par-step. "
+        f"Hover pour les params. Source: `{TRACKING_URI}`"
+    )
+
+    fig = go.Figure()
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"]
+    rows_for_table: List[Dict[str, Any]] = []
+
+    for exp_idx, label in enumerate(selected_labels):
+        eid = exp_label_to_id[label]
+        runs = _list_runs_full(TRACKING_URI, eid)
+        if show_running_only:
+            runs = [r for r in runs if r["status"] == "RUNNING"]
+        runs = runs[:max_per_exp]
+        color = palette[exp_idx % len(palette)]
+        trials_with_data = 0
+        for r in runs:
+            hist = _fetch_metric_history(TRACKING_URI, r["run_id"], selected_metric)
+            if not hist:
+                continue
+            trials_with_data += 1
+            steps = [pt[0] for pt in hist]
+            values = [pt[1] for pt in hist]
+            hover = _build_hover_text(r["params"], r["name"], label)
+            fig.add_trace(go.Scatter(
+                x=steps,
+                y=values,
+                mode="lines",
+                name=f"{label[:20]}/{r['name'][:12]}",
+                line=dict(width=1.5, color=color),
+                opacity=0.7,
+                hovertext=hover,
+                hovertemplate="step=%{x}<br>"
+                              f"{selected_metric}=%{{y:.5g}}<br>"
+                              "%{hovertext}<extra></extra>",
+                showlegend=False,
+            ))
+            rows_for_table.append({
+                "experiment": label,
+                "trial": r["name"],
+                "status": r["status"],
+                "last_step": steps[-1] if steps else None,
+                "last_value": values[-1] if values else None,
+                **{k: r["params"].get(k) for k in HOVER_PARAMS},
+            })
+
+        # Legend dummy per experiment
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            name=f"{label}  ({trials_with_data} trials)",
+            line=dict(color=color, width=3),
+        ))
+
+    fig.update_layout(
+        height=600,
+        xaxis_title="step",
+        yaxis_title=selected_metric,
+        yaxis_type="log" if log_y else "linear",
+        hovermode="closest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if rows_for_table:
+        st.markdown("### Trials sweep table")
+        df = pd.DataFrame(rows_for_table)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.title("Trials comparison — live")
     st.caption(

@@ -63,6 +63,10 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
     "pretrained_source",
+    "loss_type",
+    "group_dro_alpha",
+    "loss_focal_gamma",
+    "loss_fairness_lambda",
     "sampler_strategy",
     "loss_rw_strategy",
     "feature_fairness",
@@ -71,7 +75,6 @@ HOVER_PARAMS = [
     "weight_decay",
     "augmentation_level",
     "num_train_epochs",
-    "loss_fairness_lambda",
     "layer_decay",
 ]
 
@@ -491,23 +494,45 @@ def _render_inter_trial(
     if rows_for_table:
         df = pd.DataFrame(rows_for_table).sort_values("final_value", na_position="last")
 
-        # Top-N per experiment — focus on balancing params for cross-arch comparison
-        st.markdown("### Top trials per experiment")
         top_n = st.slider("Top N per experiment", 1, 20, 5, key="topn_per_exp")
-        top_per_exp = df.groupby("experiment", as_index=False).head(top_n)
-        # Re-sort: experiments alphabetically, then by final_value ASC within each
-        top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
-        # Focus columns on balancing for the comparison
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value",
-            "pretrained_source", "sampler_strategy", "loss_rw_strategy", "feature_fairness",
-            "pooling_type", "learning_rate", "loss_fairness_lambda",
+            "pretrained_source", "loss_type", "group_dro_alpha",
+            "loss_focal_gamma", "loss_fairness_lambda",
+            "sampler_strategy", "loss_rw_strategy", "feature_fairness",
+            "pooling_type", "learning_rate", "layer_decay",
         ]
-        focus_cols = [c for c in focus_cols if c in top_per_exp.columns]
-        st.dataframe(top_per_exp[focus_cols], use_container_width=True, hide_index=True)
+
+        def _family(name: str) -> str:
+            n = name.lower()
+            if "sapiens" in n:
+                return "sapiens"
+            if "dino" in n:
+                return "dino"
+            return "other"
+
+        df["_family"] = df["experiment"].map(_family)
+
+        for fam_label, fam_key in [("Dino", "dino"), ("Sapiens", "sapiens")]:
+            fam_df = df[df["_family"] == fam_key]
+            if fam_df.empty:
+                continue
+            st.markdown(f"### Top trials per experiment — {fam_label}")
+            top_per_exp = fam_df.groupby("experiment", as_index=False).head(top_n)
+            top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
+            cols = [c for c in focus_cols if c in top_per_exp.columns]
+            st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)
+
+        other_df = df[df["_family"] == "other"]
+        if not other_df.empty:
+            st.markdown("### Top trials per experiment — Other")
+            top_per_exp = other_df.groupby("experiment", as_index=False).head(top_n)
+            top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
+            cols = [c for c in focus_cols if c in top_per_exp.columns]
+            st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)
 
         st.markdown("### All trials")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df.drop(columns=["_family"]), use_container_width=True, hide_index=True)
 
 
 def _render_intra_trial(

@@ -11,10 +11,10 @@
 set -e
 
 echo "================================================================================"
-echo "iBOT pretraining - Sapiens2-0.8B (800M) - MS1MV3 (2x RTX 3090 DDP, BF16)"
+echo "iBOT pretraining - Sapiens2-0.8B (800M) @ 224x224 - pretrain_224 (2x RTX 3090 DDP, BF16)"
 echo "  ▶ Largest Sapiens2 fittable on 2x 24GB without FSDP/DeepSpeed"
-echo "  ▶ Conservative: BS=4, grad_accum=8 (eff_batch=64), grad_ckpt, teacher_frozen"
-echo "  ▶ 200k steps ≈ 30-40h → recommend chaining: ./scripts/chain_pretrain.sh 2 \$0"
+echo "  ▶ 224x224: BS=1, grad_accum=32 (eff_batch=64), grad_ckpt, teacher_frozen"
+echo "  ▶ ~4x slower per step than 112x112 → chain plusieurs jobs"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Started: $(date)"
@@ -38,20 +38,27 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=sapiens2_0.8b
-export FACE_OCC_PRETRAIN_SRC="data/pretrain/datasets--gaunernst--ms1mv3-wds/snapshots/cbe71fd17b8d1ed61e40508eba78aec6d4c8df46"
+export FACE_OCC_PRETRAIN_SRC="data/pretrain/pretrain_224"
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_sapiens2_08b"
+export FACE_OCC_PRETRAIN_IMG_SIZE=224
 
-# === Memory-conservative settings for 0.8B on 2x 24GB ===
-export FACE_OCC_PRETRAIN_BS=4               # vs 32 for 0.1B
-export FACE_OCC_PRETRAIN_GA=8               # eff_batch = 4 * 8 * 2 = 64
+# === Memory-conservative settings for 0.8B @ 224x224 on 2x 24GB ===
+# 224 → 196 patches (vs 49 at 112) → BS divisé par 4 vs 112x112 setting
+export FACE_OCC_PRETRAIN_BS=1               # vs 4 at 112x112
+export FACE_OCC_PRETRAIN_GA=32              # eff_batch = 1 * 32 * 2 = 64
 
 # === Pretrain hyperparams (conservative, anchored to Meta original) ===
-export FACE_OCC_PRETRAIN_MAX_STEPS=200000   # ~5 epochs MS1MV3 ; ~30-40h → chain 2 jobs
+# 100k steps @224 ≈ 8 chain links de 30h (≈10s/step avec GA=32). Stop-early possible :
+# scancel quand le sweep Optuna révèle qu'un snapshot intermédiaire suffit.
+# eff_batch=64 × 100k = 6.4M faces vues (~1.2 epoch MS1MV3)
+# Caveat cosine LR: schedule étalé sur 100k → si stop à 50k, LR final ~0.71 init (vs ~0 si MAX=50k).
+# Impact minime sur iBOT-light/frozen-teacher (teacher = anchor).
+export FACE_OCC_PRETRAIN_MAX_STEPS=100000
 export FACE_OCC_PRETRAIN_LR=1.0e-05
 export FACE_OCC_PRETRAIN_MASK_RATIO=0.4
 export FACE_OCC_PRETRAIN_EMA_DECAY=0.9995
-export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1   # teacher gelé sur Meta Sapiens2-0.8B
-export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000,150000"
+export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1
+export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="25000,50000,75000"
 export FACE_OCC_PRETRAIN_EPOCHS=5
 
 mkdir -p scripts/logs results/pretrain_sapiens2_08b
@@ -62,5 +69,5 @@ ${TORCHRUN} --nproc_per_node=2 --master_port=$MASTER_PORT src/pretrain_ibot.py
 echo "================================================================================"
 echo "COMPLETE - Finished: $(date)"
 echo "  ▶ run_id: cat results/pretrain_sapiens2_08b/mlflow_run_id.txt"
-echo "  ▶ Fill into configs/architectures/sapiens2-08b-3090-v3.yaml (pretrained_source)"
+echo "  ▶ Fill into configs/architectures/sapiens2-08b-3090-v4.yaml (pretrained_source)"
 echo "================================================================================"

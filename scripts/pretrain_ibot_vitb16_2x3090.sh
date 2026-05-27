@@ -36,10 +36,10 @@ export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=dinov3_vitb16
 export FACE_OCC_PRETRAIN_SRC="data/pretrain/datasets--gaunernst--ms1mv3-wds/snapshots/cbe71fd17b8d1ed61e40508eba78aec6d4c8df46"
-export FACE_OCC_PRETRAIN_MAX_STEPS=200000
+export FACE_OCC_PRETRAIN_MAX_STEPS=150000
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_vitb16"
 export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1
-export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000,150000"
+export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000"
 
 mkdir -p scripts/logs results/pretrain_vitb16
 

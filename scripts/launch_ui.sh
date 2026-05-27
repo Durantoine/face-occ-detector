@@ -42,7 +42,7 @@ UIs running on ${UI_NODE} (job ${UI_JOB})
 
   ▶ MLflow        : sqlite:///mlflow.db
   ▶ Optuna        : sqlite:///optuna.db
-  ▶ Qualitative   : best/worst-K artifacts from MLflow (per-trial gallery)
+  ▶ Analytics     : trials comparison (live) + qualitative best/worst-K viewer
 
 Copy-paste this SSH tunnel on your LAPTOP:
 
@@ -55,7 +55,7 @@ Copy-paste this SSH tunnel on your LAPTOP:
 Then open in your browser:
   http://localhost:${MLFLOW_PORT}     (MLflow)
   http://localhost:${OPTUNA_PORT}     (Optuna dashboard)
-  http://localhost:${QUAL_PORT}     (Qualitative viewer — best/worst trial gallery)
+  http://localhost:${QUAL_PORT}     (Analytics — trials comparison + qualitative viewer)
 
 Stop the UIs:
   scancel ${UI_JOB}

@@ -70,9 +70,9 @@ optuna:
       type: categorical
       choices:
         - "sapiens_default"
+        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder_25000"
         - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder_50000"
-        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder_100000"
-        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder_150000"
+        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder_75000"
         - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder"
     pooling_type:
       type: categorical

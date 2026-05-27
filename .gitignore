@@ -73,6 +73,11 @@ src/models/weights/*.pth
 src/models/weights/*.bin
 src/models/weights/*.safetensors
 !src/models/weights/.gitkeep
+# Large archives anywhere in the repo (catches src/models/weights.zip = 11GB)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
 
 # DINOv3 vendored repo — keep code, drop caches
 src/models/dinov3_repo/**/__pycache__/

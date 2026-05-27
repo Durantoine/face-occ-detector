@@ -70,10 +70,10 @@ optuna:
       type: categorical
       choices:
         - "lvd"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_50000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_100000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder_150000"
-        - "ibot:runs:/__FILL_PRETRAIN_RUN_ID__/encoder"
+        - "ibot:runs:/__FILL_VITH16PLUS_IBOT_RUN_ID__/encoder_25000"
+        - "ibot:runs:/__FILL_VITH16PLUS_IBOT_RUN_ID__/encoder_50000"
+        - "ibot:runs:/__FILL_VITH16PLUS_IBOT_RUN_ID__/encoder_75000"
+        - "ibot:runs:/__FILL_VITH16PLUS_IBOT_RUN_ID__/encoder"
     pooling_type:
       type: categorical
       choices: [cls, gem, attention_k_query, multihead_attention]

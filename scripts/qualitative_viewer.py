@@ -1,11 +1,13 @@
-"""Streamlit viewer for the qualitative best/worst-K examples logged per Optuna trial.
+"""Streamlit viewer — two modes:
 
-Reads the MLflow tracking DB (sqlite:///mlflow.db) to list experiments + runs, then
-downloads the `qualitative/` artifact subtree on demand and renders the images with
-their metadata (gt, pred, abs_err, gender) in a grid.
+1. **Trials comparison (live)** — overlay metric curves across active Optuna sweeps,
+   hover for trial params. Default view, auto-refresh.
+2. **Qualitative viewer (per-run)** — best/worst-K image gallery for a selected run.
+
+Reads the MLflow tracking DB (sqlite:///mlflow.db).
 
 Launch :
-    uvx --python 3.12 --with mlflow --with pandas --with pillow \
+    uvx --python 3.12 --with mlflow --with pandas --with pillow --with plotly \
         --from streamlit streamlit run scripts/qualitative_viewer.py \
         --server.port 8501 --server.address 0.0.0.0
 
@@ -25,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # "tracking DB unreadable" issues without needing to attach to the running process.
 print(f"[viewer] Python = {sys.version.split()[0]} at {sys.executable}", flush=True)
 print(f"[viewer] cwd = {os.getcwd()}", flush=True)
-for mod in ("streamlit", "pandas", "mlflow", "PIL"):
+for mod in ("streamlit", "pandas", "mlflow", "PIL", "plotly"):
     try:
         m = __import__(mod)
         ver = getattr(m, "__version__", "?")
@@ -46,8 +48,24 @@ import pandas as pd
 import streamlit as st
 
 
-st.set_page_config(page_title="Qualitative viewer", layout="wide")
+st.set_page_config(page_title="Face-occ analytics", layout="wide")
 TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
+
+# Params we show in hover tooltips on the trials comparison chart. Order matters
+# (top to bottom in the tooltip). Anything else still queryable via the param table.
+HOVER_PARAMS = [
+    "pretrained_source",
+    "sampler_strategy",
+    "loss_rw_strategy",
+    "feature_fairness",
+    "pooling_type",
+    "learning_rate",
+    "weight_decay",
+    "augmentation_level",
+    "num_train_epochs",
+    "loss_fairness_lambda",
+    "layer_decay",
+]
 
 
 @st.cache_resource(show_spinner=False)
@@ -170,7 +188,212 @@ def _render_grid(folder: Path, name: str, df: pd.DataFrame, cols_per_row: int = 
                 )
 
 
-# === UI ===
+# === Helpers for "Trials comparison" mode ===
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_runs_full(tracking_uri: str, experiment_id: str) -> List[Dict[str, Any]]:
+    """Like _list_runs but also returns params + final metrics for tooltip use."""
+    client = _get_client(tracking_uri)
+    runs = client.search_runs(
+        [experiment_id],
+        order_by=["attribute.start_time DESC"],
+        max_results=500,
+    )
+    out: List[Dict[str, Any]] = []
+    for r in runs:
+        out.append({
+            "run_id": r.info.run_id,
+            "name": r.info.run_name or r.info.run_id[:8],
+            "status": r.info.status,
+            "start_time": r.info.start_time,
+            "params": dict(r.data.params),
+            "metrics": dict(r.data.metrics),
+        })
+    return out
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _list_available_metrics(tracking_uri: str, experiment_ids: Tuple[str, ...]) -> List[str]:
+    """Union of metric keys logged across the latest few runs of the given experiments."""
+    client = _get_client(tracking_uri)
+    keys: set = set()
+    for eid in experiment_ids:
+        runs = client.search_runs([eid], max_results=20)
+        for r in runs:
+            keys.update(r.data.metrics.keys())
+    keys = {k for k in keys if k.startswith("eval_") or k in {"train_loss", "loss"}}
+    return sorted(keys)
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _fetch_metric_history(tracking_uri: str, run_id: str, metric: str) -> List[Tuple[int, float]]:
+    client = _get_client(tracking_uri)
+    try:
+        hist = client.get_metric_history(run_id, metric)
+    except Exception:
+        return []
+    return [(int(m.step), float(m.value)) for m in hist]
+
+
+def _build_hover_text(params: Dict[str, str], name: str, exp_name: str) -> str:
+    lines = [f"<b>{name}</b>", f"<i>{exp_name}</i>"]
+    for key in HOVER_PARAMS:
+        v = params.get(key)
+        if v is None:
+            continue
+        # truncate long values (e.g. full ibot:runs:/.../encoder paths)
+        v_str = str(v)
+        if len(v_str) > 60:
+            v_str = v_str[:57] + "..."
+        lines.append(f"{key}={v_str}")
+    return "<br>".join(lines)
+
+
+def _render_trials_comparison() -> None:
+    import plotly.graph_objects as go
+
+    experiments = _list_experiments(TRACKING_URI)
+    if not experiments:
+        st.error("No MLflow experiments found.")
+        return
+
+    # Default selection: keep optuna-* experiments (one per arch); fallback to all
+    default_exps = [(eid, name) for eid, name in experiments if name.startswith("optuna-")]
+    if not default_exps:
+        default_exps = experiments
+
+    with st.sidebar:
+        st.header("Trials comparison")
+        exp_label_to_id = {name: eid for eid, name in experiments}
+        default_labels = [name for _, name in default_exps]
+        selected_labels = st.multiselect(
+            "Experiments",
+            list(exp_label_to_id.keys()),
+            default=default_labels,
+        )
+        if not selected_labels:
+            st.info("Select at least one experiment.")
+            return
+        selected_exp_ids = tuple(exp_label_to_id[label] for label in selected_labels)
+
+        available_metrics = _list_available_metrics(TRACKING_URI, selected_exp_ids)
+        if not available_metrics:
+            st.warning("No eval_* metrics found yet.")
+            return
+        default_metric = (
+            "eval_challenge_score_test_estimated"
+            if "eval_challenge_score_test_estimated" in available_metrics
+            else available_metrics[0]
+        )
+        selected_metric = st.selectbox(
+            "Metric",
+            available_metrics,
+            index=available_metrics.index(default_metric),
+        )
+
+        max_per_exp = st.slider("Max trials per experiment", 5, 200, 50)
+        log_y = st.checkbox("Log Y axis", value=True)
+        show_running_only = st.checkbox("Hide finished trials", value=False)
+        auto_refresh_sec = st.selectbox(
+            "Auto-refresh",
+            [0, 15, 30, 60, 120],
+            index=2,
+            format_func=lambda s: "off" if s == 0 else f"every {s}s",
+        )
+        if st.button("Refresh now"):
+            st.cache_data.clear()
+            st.rerun()
+
+    st.title("Trials comparison — live")
+    st.caption(
+        f"Comparing curves across {len(selected_labels)} experiment(s). "
+        f"Hover for trial params. Source: `{TRACKING_URI}`"
+    )
+
+    fig = go.Figure()
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"]
+    rows_for_table: List[Dict[str, Any]] = []
+
+    for exp_idx, label in enumerate(selected_labels):
+        eid = exp_label_to_id[label]
+        runs = _list_runs_full(TRACKING_URI, eid)
+        if show_running_only:
+            runs = [r for r in runs if r["status"] == "RUNNING"]
+        runs = runs[:max_per_exp]
+        color = palette[exp_idx % len(palette)]
+        for r in runs:
+            hist = _fetch_metric_history(TRACKING_URI, r["run_id"], selected_metric)
+            if not hist:
+                continue
+            steps = [pt[0] for pt in hist]
+            values = [pt[1] for pt in hist]
+            hover = _build_hover_text(r["params"], r["name"], label)
+            fig.add_trace(go.Scatter(
+                x=steps,
+                y=values,
+                mode="lines",
+                name=f"{label[:20]}/{r['name'][:12]}",
+                line=dict(width=1.5, color=color),
+                opacity=0.7,
+                hovertext=hover,
+                hovertemplate="step=%{x}<br>"
+                              f"{selected_metric}=%{{y:.5g}}<br>"
+                              "%{hovertext}<extra></extra>",
+                showlegend=False,
+            ))
+            rows_for_table.append({
+                "experiment": label,
+                "trial": r["name"],
+                "status": r["status"],
+                "last_step": steps[-1] if steps else None,
+                "last_value": values[-1] if values else None,
+                **{k: r["params"].get(k) for k in HOVER_PARAMS},
+            })
+
+        # Legend dummy for the experiment (single entry instead of one per trial)
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="lines",
+            name=f"{label}  ({len([r for r in runs if _fetch_metric_history(TRACKING_URI, r['run_id'], selected_metric)])} trials)",
+            line=dict(color=color, width=3),
+        ))
+
+    fig.update_layout(
+        height=600,
+        xaxis_title="step",
+        yaxis_title=selected_metric,
+        yaxis_type="log" if log_y else "linear",
+        hovermode="closest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=20, t=40, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    if rows_for_table:
+        st.markdown("### Trials sweep table")
+        df = pd.DataFrame(rows_for_table)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if auto_refresh_sec > 0:
+        import time
+        time.sleep(auto_refresh_sec)
+        st.rerun()
+
+
+# === UI dispatcher ===
+
+with st.sidebar:
+    mode = st.radio(
+        "Mode",
+        ["Trials comparison (live)", "Qualitative viewer (per-run)"],
+        index=0,
+    )
+    st.divider()
+
+if mode == "Trials comparison (live)":
+    _render_trials_comparison()
+    st.stop()
+
+# === Qualitative viewer (legacy) ===
 
 st.title("Qualitative best/worst examples — per Optuna trial")
 st.caption(f"Reading from `{TRACKING_URI}`")

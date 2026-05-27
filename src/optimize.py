@@ -405,7 +405,7 @@ def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_ur
     """Fail-fast validation of `pretrained_source` choices in the search space.
 
     Catches two common errors before the sweep burns GPU hours:
-      - Forgotten placeholders like `__FILL_SAPIENS_IBOT_RUN_ID__` in the iBOT URI
+      - Forgotten placeholders like `__FILL_VITH16PLUS_IBOT_RUN_ID__` in the iBOT URI
       - Non-existent MLflow runs (typo, wrong tracking URI, run deleted)
 
     Choices follow the schema `"lvd" | "sapiens_default" | "ibot:runs:/<run_id>/<artifact>"`.

@@ -11,7 +11,9 @@
 set -e
 
 echo "================================================================================"
-echo "iBOT pretraining - DINOv3 ViT-H+/16 - MS1MV3 (2x RTX 3090 DDP, BF16)"
+echo "iBOT pretraining - DINOv3 ViT-H+/16 @ 224x224 - pretrain_224 (2x RTX 3090 DDP, BF16)"
+echo "  ▶ 224x224: BS=2, grad_accum=16 (eff_batch=64), grad_ckpt, teacher_frozen"
+echo "  ▶ ~4x slower per step than 112x112 → chain plusieurs jobs"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Started: $(date)"
@@ -35,11 +37,22 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=dinov3_vith16plus
-export FACE_OCC_PRETRAIN_SRC="data/pretrain/datasets--gaunernst--ms1mv3-wds/snapshots/cbe71fd17b8d1ed61e40508eba78aec6d4c8df46"
-export FACE_OCC_PRETRAIN_MAX_STEPS=200000
+export FACE_OCC_PRETRAIN_SRC="data/pretrain/pretrain_224"
+# 100k steps @224 ≈ 8 chain links de 30h (≈10s/step avec GA=16, BS=2). Stop-early possible :
+# scancel quand le sweep Optuna révèle qu'un snapshot intermédiaire suffit.
+# eff_batch=64 × 100k = 6.4M faces vues (~1.2 epoch MS1MV3)
+# Caveat cosine LR: schedule étalé sur 100k → si stop à 50k, LR final ~0.71 init (vs ~0 si MAX=50k).
+# Impact minime sur iBOT-light/frozen-teacher (teacher = anchor).
+export FACE_OCC_PRETRAIN_MAX_STEPS=100000
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_vith16plus"
 export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1
-export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000,150000"
+export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="25000,50000,75000"
+export FACE_OCC_PRETRAIN_IMG_SIZE=224
+
+# === Memory-conservative settings for ViT-H+/16 @ 224x224 on 2x 24GB ===
+# Default BS=32 OOM à 224 → divisé par 16. Eff_batch=64 (vs 128 défaut à 112)
+export FACE_OCC_PRETRAIN_BS=2
+export FACE_OCC_PRETRAIN_GA=16              # eff_batch = 2 * 16 * 2 = 64
 
 mkdir -p scripts/logs results/pretrain_vith16plus
 

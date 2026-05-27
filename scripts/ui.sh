@@ -29,15 +29,22 @@ if [ ! -x "$UI_VENV/bin/streamlit" ]; then
     echo "  using $PYBIN"
     "$PYBIN" -m venv "$UI_VENV"
     "$UI_VENV/bin/pip" install --quiet --upgrade pip
-    "$UI_VENV/bin/pip" install --quiet streamlit mlflow pandas pillow
+    "$UI_VENV/bin/pip" install --quiet streamlit mlflow pandas pillow plotly
     echo "  UI venv ready: $($UI_VENV/bin/streamlit --version)"
+fi
+
+# Ensure plotly is present (older UI venvs from before the trials-comparison feature
+# may not have it). Cheap no-op if already installed.
+if ! "$UI_VENV/bin/python" -c "import plotly" 2>/dev/null; then
+    echo "  Installing plotly into UI venv (one-time)"
+    "$UI_VENV/bin/pip" install --quiet plotly
 fi
 
 echo "================================================================================"
 echo "Combined UIs (MLflow + Optuna + Qualitative viewer) — node $(hostname)"
 echo "  MLflow      port: $MLFLOW_PORT   (sqlite:///mlflow.db)"
 echo "  Optuna      port: $OPTUNA_PORT   (sqlite:///optuna.db)"
-echo "  Qualitative port: $QUAL_PORT    (best/worst-K from MLflow artifacts)"
+echo "  Analytics   port: $QUAL_PORT    (trials comparison live + qualitative viewer)"
 echo "Job ID: $SLURM_JOB_ID | Started: $(date)"
 echo ""
 echo "Access from laptop:"

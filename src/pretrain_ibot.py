@@ -414,6 +414,30 @@ def pretrain_ibot(
         def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
             self.m.ema_update_teacher()
 
+    class SpeedCallback(TrainerCallback):
+        def __init__(self, target_steps: int) -> None:
+            self.target = target_steps
+            self._t0: Optional[float] = None
+            self._step0: Optional[int] = None
+
+        def on_log(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            import time
+            if int(os.environ.get("RANK", "0")) != 0:
+                return
+            now = time.time()
+            if self._t0 is None or self._step0 is None:
+                self._t0, self._step0 = now, state.global_step
+                return
+            ds = max(1, state.global_step - self._step0)
+            s_per_step = (now - self._t0) / ds
+            remaining = max(0, self.target - state.global_step) * s_per_step
+            print(
+                f"[speed] step={state.global_step} | {s_per_step:.2f}s/step | "
+                f"ETA_to_{self.target}={remaining / 3600:.1f}h",
+                flush=True,
+            )
+            self._t0, self._step0 = now, state.global_step
+
     snapshot_env = os.environ.get("FACE_OCC_PRETRAIN_SNAPSHOT_STEPS", "").strip()
     snapshot_steps = sorted({int(s) for s in snapshot_env.split(",") if s.strip()})
 
@@ -506,6 +530,8 @@ def pretrain_ibot(
     if snapshot_steps:
         callbacks.append(EncoderSnapshotCallback(model, snapshot_steps))
         print(f"Encoder snapshots will be logged at steps: {snapshot_steps}")
+    if max_steps > 0:
+        callbacks.append(SpeedCallback(max_steps))
     trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     print(f"iBOT pretraining: {arch} @ {image_size}x{image_size} | mask_ratio={mask_ratio} | "
           f"teacher={'frozen' if teacher_frozen else f'EMA(decay={teacher_ema_decay})'} | "

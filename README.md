@@ -49,27 +49,33 @@ inv optuna-dashboard   # http://localhost:8080
 
 ### Cluster workflow (SLURM, 2× RTX 3090)
 
-The three canonical sbatch scripts cover the full A/B comparison:
+Les 4 yamls v4 (`dinov3-vitb16/-vith16plus`, `sapiens2-01b/-08b`) intègrent `pretrained_source` en search_space Optuna → le baseline (`lvd` / `sapiens_default`) et les pretrains iBOT custom (`encoder_20000` / `encoder_40000` / `encoder`) sont comparés dans le **même sweep**. Il n'y a plus de "with/without pretrain" séparé.
 
 ```bash
-# A) Optimize without pretrain (baseline)
-sbatch scripts/optimize_dinov3_vith16plus_2x3090.sh
-#  → uses configs/architectures/dinov3-vith16plus-3090.yaml
+# 1) Pretrain iBOT custom (4 chain links de 30h, target 50k steps @224)
+./scripts/chain_pretrain.sh 4 scripts/pretrain_ibot_vith16plus_2x3090.sh
+./scripts/chain_pretrain.sh 4 scripts/pretrain_ibot_sapiens2_08b_2x3090.sh
+# Les petits modèles (01b, vitb16) tournent encore à 112 sur MS1MV3-WDS :
+sbatch scripts/pretrain_ibot_vitb16_2x3090.sh
+sbatch scripts/pretrain_ibot_sapiens2_01b_2x3090.sh
 
-# B) iBOT-light pretrain, then optimize from that encoder
-sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh           # single 30h chunk
-# OR
-./scripts/chain_pretrain.sh 3                                # chain 3× (90h cumulative)
-# After pretrain completes:
-#   1. read results/pretrain/mlflow_run_id.txt
-#   2. open configs/architectures/dinov3-vith16plus-3090-ibot.yaml
-#      and replace __FILL_PRETRAIN_RUN_ID__ with that run_id
-sbatch scripts/optimize_dinov3_vith16plus_from_pretrain_2x3090.sh
-#  → uses configs/architectures/dinov3-vith16plus-3090-ibot.yaml
-#  → train.py auto-loads runs:/<run_id>/encoder into the backbone and logs
-#    `model_init_backbone_from`, `init_backbone_pretrain_run_id`, all `pretrain_*`
-#    params from the pretrain run, and a `pretrain_run_id` tag for traceability.
+# 2) Récupérer les run_ids et remplir les yaml v4
+cat results/pretrain_vith16plus/mlflow_run_id.txt           # → ID pour __FILL_VITH16PLUS_IBOT_RUN_ID__
+cat results/pretrain_sapiens2_08b/mlflow_run_id.txt         # → ID pour __FILL_SAPIENS_08B_IBOT_RUN_ID__
+cat results/pretrain_vitb16/mlflow_run_id.txt               # → ID pour __FILL_VITB16_IBOT_RUN_ID__
+cat results/pretrain_sapiens2_01b/mlflow_run_id.txt         # → ID pour __FILL_SAPIENS_01B_IBOT_RUN_ID__
+# sed -i s/__FILL_*_RUN_ID__/<id>/ configs/architectures/<yaml>
+
+# 3) Lancer l'Optuna v4 — il samplera automatiquement entre baseline et iBOT snapshots
+sbatch scripts/optimize_dinov3_vith16plus_v4_2x3090.sh
+sbatch scripts/optimize_sapiens2_08b_v4_2x3090.sh
+
+# 4) Pour les petits modèles (130 trials), chainer 3 jobs SLURM via Optuna persistant
+./scripts/chain_optimize.sh 3 scripts/optimize_dinov3_vitb16_v4_2x3090.sh
+./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v4_2x3090.sh
 ```
+
+`train.py` charge l'encodeur sélectionné par Optuna et logue `model_init_backbone_from`, `init_backbone_pretrain_run_id`, tous les `pretrain_*` params, et un tag `pretrain_run_id` pour la traçabilité complète.
 
 ---
 
@@ -963,7 +969,12 @@ Two slots for extra data, both supported by the existing infrastructure — just
 
 ### A) Unlabeled faces → iBOT-light pretraining (`data/pretrain/`)
 
-Any directory of face images (recursive scan) OR a WebDataset of `.tar` shards (auto-detected). Set `pretrain_ibot.CONFIG["data_source"]` to point at it. The default expects the local MS1MV3 `.tar` shards.
+Any directory of face images (recursive scan) OR a WebDataset of `.tar` shards (auto-detected via [`_build_dataset`](src/pretrain_ibot.py)). Pointer la source via `FACE_OCC_PRETRAIN_SRC` dans le `.sh`. Deux corpus en place :
+
+- `data/pretrain/datasets--gaunernst--ms1mv3-wds/...` — MS1MV3 en WebDataset `.tar`, utilisé pour les **petits modèles à 112×112** (`vitb16`, `sapiens2_0.1b`)
+- `data/pretrain/pretrain_224/` — JPG 224×224, utilisé pour les **gros modèles à 224×224** (`vith16plus`, `sapiens2_0.8b`) pour matcher la résolution de finetune
+
+`FACE_OCC_PRETRAIN_IMG_SIZE` contrôle la résolution effective (default 112). Les scripts gros modèles le settent à 224.
 
 | Dataset | Size | Cost | Note |
 |---|---|---|---|
@@ -1069,11 +1080,12 @@ Updated dataset priority for `data/pretrain/`:
 
 | # | Dataset | Why |
 |---|---|---|
-| 1 ⭐ | **MS1MV3 WebDataset** (`gaunernst/ms1mv3-wds` on HF Hub, ~5M images, 100 `.tar` shards, 46 GB) | **Same distribution as `database3`** — optimal domain alignment, ready in WDS format |
-| 2 | VGGFace2 (3.3M images, 9k identities) | Available without licence drama, close to MS-Celeb in spirit |
-| 3 | CelebA (200k) | Good supplement, easy to get |
-| 4 | WIDER Face (400k) | In-the-wild diversity (covers `database1` style images) |
-| 5 | LFW (13k) | Too small for serious pretraining alone |
+| 1 ⭐ | **MS1MV3 @ 224×224 JPG** (`data/pretrain/pretrain_224/`) | Résolution finetune-matched → utilisé par les gros modèles iBOT |
+| 2 | **MS1MV3 WebDataset** (`gaunernst/ms1mv3-wds`, 100 `.tar`, 46 GB) | Toujours utilisé pour les petits modèles à 112×112 |
+| 3 | VGGFace2 (3.3M images, 9k identities) | Available without licence drama, close to MS-Celeb in spirit |
+| 4 | CelebA (200k) | Good supplement, easy to get |
+| 5 | WIDER Face (400k) | In-the-wild diversity (covers `database1` style images) |
+| 6 | LFW (13k) | Too small for serious pretraining alone |
 
 The raw MS-Celeb-1M was retired by Microsoft. InsightFace's cleaned MS1MV3 (5.1M images, 93k identities) is the practical equivalent; `gaunernst/ms1mv3-wds` packages it as WebDataset on HuggingFace Hub.
 
@@ -1107,7 +1119,7 @@ Full Meta iBOT uses Sinkhorn-Knopp centering, EMA teacher, multi-crop augmentati
 
 - **Student** = DINOv3 ViT-H+ (trainable)
 - **Teacher** = same DINOv3 weights, **frozen** (no EMA, no Sinkhorn-Knopp) — anchor for the student
-- **Mask ratio** = 0.5 (iBOT range, lower than MAE's 0.75)
+- **Mask ratio** = 0.4 (iBOT range, lower than MAE's 0.75)
 - For each batch:
   1. Random binary mask over patches
   2. Student forward **with mask** (uses DINOv3 native `prepare_tokens_with_masks` → masked patches replaced by `mask_token`)
@@ -1129,7 +1141,7 @@ Implementation: `src/pretrain_ibot.py:DinoV3IBoT` (~100 LOC core).
 | ViT-L/16 (300M) | ~14 GB | ~24 h |
 | **ViT-H+/16 (600M)** ⭐ | **~22 GB** (with grad-ckpt) | **~36 h** |
 
-Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (or `./scripts/chain_pretrain.sh 3` to chain three 30 h SLURM submissions). Output: an MLflow run with the student encoder logged as `runs:/<run_id>/encoder`.
+Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (ou `./scripts/chain_pretrain.sh 8 scripts/pretrain_ibot_vith16plus_2x3090.sh` pour chainer 8 links de 30h, target 100k steps @224 = ~1.2 epoch MS1MV3). Output : run MLflow avec snapshots `encoder_25000/50000/75000/encoder` (final à 100k) — stop-early possible via scancel.
 
 **v4 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v4.yaml`). Optuna comparera alors automatiquement :
 - `"lvd"` (ou `"sapiens_default"` pour Sapiens2) : poids de base Meta
@@ -1520,6 +1532,59 @@ scripts/
 
 ---
 
+## Stratégie compétitive — où sont les vrais gains
+
+> Auto-critique honnête (2026-05-27). Ce qu'on a fait est solide d'un point de vue ingénierie, mais
+> probablement **insuffisant pour gagner le challenge** sans investir aussi sur la donnée.
+
+### Ce qui est solide
+
+- **Fairness** : décomposition en 3 axes orthogonaux + preuve formelle que `gender_rw` est un no-op + multiple mécanismes (sampler, λ-penalty, Group-DRO, DANN, MMD, mixup, post-hoc). Mathématiquement propre.
+- **Shift Y** : `_TEST_PMF_0025` + `importance_reweight` + `test_pmf` sampler + val split test-like → estimation honnête de la perf test.
+- **iBOT-light vs MAE** : choix correct (continuité avec DINOv3, frozen teacher safe pour ne pas abîmer le backbone).
+- **Infra** : chain SLURM, MLflow continu, snapshot intermédiaires en search_space, sidecar `.meta.json`, validation runtime des choix `pretrained_source`. Niveau industriel.
+
+### Faiblesses stratégiques identifiées
+
+**1. Pretrain budget anémique pour les gros modèles** — 50k steps × eff_batch=64 = 3.2M faces vues = **0.6 epoch MS1MV3**. Court pour une domain adaptation iBOT.
+
+  *Nuance importante* : le pretrain part **bien de LVD / sapiens_default** (cf [src/models/dinov3_loader.py:60-66](src/models/dinov3_loader.py#L60-L66), `pretrained=True` par défaut + teacher frozen = LVD). Donc même après 0.6 epoch, l'encoder reste proche du baseline avec un petit drift — pas de risque de "100h gaspillées" au sens strict. Le risque réel est plus subtil : **le delta iBOT vs LVD peut être trop petit pour ressortir dans le sweep Optuna**, surtout que le bruit inter-trial (random seed, sampler, dropout) peut masquer un gain de ~0.1-0.3%. Augmenter à 100-150k steps maximise les chances que `ibot:encoder_*` batte `lvd` de façon mesurable.
+
+**2. Le plus gros levier (data labellisée) n'est pas pris** — Le label `FaceOcclusion` mixte deux régimes (occlusion physique + dégradation qualité, cf §"Understanding FaceOcclusion"). Aucune donnée externe avec recompute du label n'est intégrée :
+  - **MAFA** (occlusion physique annotée) → mapping `area(mask ∩ face) / area(face)` direct
+  - **RandomErasing avec label recompute** → patch synthétique sur visage, label incrémenté
+  - **Quality degradation** (blur, JPEG, noise, pixelation) avec proportional label increment → couvre le régime 2
+
+  Roadmap #14-15 estime ~1.5-2.5% combiné. **Probablement plus impactant que tout le sweep HPO réuni.**
+
+**3. Résolution sous-utilisée** — Sapiens2 natif est 1024×768, on l'utilise à 224. Lever #19 (résolution 384×384) estimé +0.5-1.5%, non implémenté.
+
+**4. Allocation déséquilibrée des trials** — 130 trials sur les petits modèles (vitb16/sapiens 0.1b, 100M) vs 60 trials sur les gros (vith16plus/sapiens 0.8b, 600M+). On sweep le plus là où l'upside est le plus faible. Pour gagner, l'inverse serait plus rationnel : un sweep grossier sur le gros modèle suffit, le petit n'a pas le ceiling.
+
+**5. Ensemble multi-arch pas encore généralisé** — `inv ensemble` fait du 5-fold sur **un seul yaml**. Le plan : faire un k-fold séparé sur chaque arch (vith16plus + sapiens 0.8b + best petit), puis moyenner les prédictions au submit time. Estimation +0.5-1% via diversité. Infra k-fold OK pour 1 arch, à généraliser pour N.
+
+**6. `_TEST_PMF` ni vérifié ni calibré** — La PMF cible [`_TEST_PMF_0025`](src/utils/losses.py#L8) est codée en dur dans le repo, vraisemblablement estimée par inférence baseline sur `test_students.csv`. Deux risques :
+  - **Méthodologie d'estimation incertaine** : si la PMF d'origine vient d'un modèle faible ou d'un sample non-représentatif, elle est biaisée → tout `importance_reweight` / `test_pmf` sampler tire le sweep dans la mauvaise direction.
+  - **Pas de calibration leaderboard** : une submission permettrait de fitter `_TEST_PMF` pour que `expected_score(val) ≈ leaderboard_score`. Lever #13, pas fait.
+
+  → **Action**: ré-estimer la PMF avec un baseline raisonnable, comparer à `_TEST_PMF_0025`, et cross-checker après la 1ère submission.
+
+### Ordre de priorité recommandé pour gagner
+
+| # | Action | Effort | Impact estimé | Statut |
+|---|---|---|---|---|
+| 1 | **MAFA + augm-with-label-recompute** (blur/JPEG/erase) | 1-2 jours | **+1.5-2.5%** | à faire — MAFA à télécharger (user va chercher) |
+| 2 | **Vérifier `_TEST_PMF_0025`** ([src/utils/losses.py:8](src/utils/losses.py#L8)) — méthodo d'origine, ré-estimation via inférence baseline sur `test_students.csv`, cross-check post-1ère submission | 2-4h | **+0.5-1.5%** si la PMF actuelle est fausse | à faire — risque de tirer le sweep dans la mauvaise direction |
+| 3 | **Ensemble multi-arch au submit time** — k-fold séparé sur 3 archis (vith16plus + sapiens 0.8b + best petit), puis moyenne des prédictions | 2-3h infra + N k-folds | **+0.5-1%** | planifié, infra k-fold OK pour 1 arch, à généraliser |
+| 4 | **1 submission baseline + fit `_TEST_PMF`** sur le score leaderboard | 1h | **+0.3-1%** | dépend de #2 ; bloque sur 1 submit |
+| 5 | **Résolution 384 pour les gros modèles** | 3-4h | **+0.5-1.5%** | non démarré ; ~3× coût compute |
+| 6 | **Plus de pretrain** (100-150k steps @224, ou EMA teacher) | budget cluster | +0.3-0.8% | en cours à 50k |
+| 7 | HPO sweep actuel (3 axes) | en cours | +0.2-0.5% | tourne, mais c'est de la finition |
+
+**Synthèse** : si on a une semaine d'investissement, **4 jours sur #1-#4** + **3 jours de sweep en parallèle** > l'inverse. Le challenge se gagne typiquement sur la donnée, pas sur le modèle.
+
+---
+
 ## Roadmap — next steps
 
 ### Implemented and runnable now
@@ -1696,7 +1761,7 @@ Liens : [PyTorch FSDP tutorial](https://pytorch.org/tutorials/intermediate/FSDP_
 - **Décomposition en 3 axes orthogonaux** au lieu de 9 stratégies fixes : on peut mesurer l'importance Optuna axe par axe (`optuna.importance.get_param_importances(study)`)
 - **`no_balancing` baseline accessible** comme combo `(none, none, none)` → mesure l'apport des autres mécanismes
 - **Validation split flexible** : `stratified_yg` (default) ou `test_pmf` (val matche directement P_test)
-- **`pretrained_source` en search_space** : compare LVD vs iBOT snapshots @ 50k/100k/150k/200k dans le même study
+- **`pretrained_source` en search_space** : compare LVD/sapiens_default vs iBOT snapshots @ 25k/50k/75k/encoder final (100k @224) dans le même study
 - **Quantile mapping post-inférence** : 3e mécanisme de compensation shift, indépendant du training
 - **Métriques nommées explicitement** : `challenge_score_test_estimated` vs `_val`, `mae_pct_*`, `r2_*` — pas d'aliases ambigus
 - **Diagnostic charts par trial** : MAE vs Y bin (split F/M) + densité des erreurs par genre, en PNG sauvé MLflow

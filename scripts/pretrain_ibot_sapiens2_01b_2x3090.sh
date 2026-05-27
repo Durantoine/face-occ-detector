@@ -38,17 +38,15 @@ export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=sapiens2_0.1b
 export FACE_OCC_PRETRAIN_SRC="data/pretrain/datasets--gaunernst--ms1mv3-wds/snapshots/cbe71fd17b8d1ed61e40508eba78aec6d4c8df46"
-export FACE_OCC_PRETRAIN_MAX_STEPS=200000   # ~5 epochs MS1MV3 (BS 128). 4 snapshots @ 50k/100k/150k/200k
+export FACE_OCC_PRETRAIN_MAX_STEPS=150000
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_sapiens2_01b"
 
-# Conservative overrides for Sapiens2 pretrain (already heavily pretrained on humans).
-# Tuned to avoid catastrophic forgetting of the Meta features.
-export FACE_OCC_PRETRAIN_LR=1.0e-05         # 5x lower than DINO pretrain (5e-5)
-export FACE_OCC_PRETRAIN_MASK_RATIO=0.4     # vs 0.5 DINO default
-export FACE_OCC_PRETRAIN_EMA_DECAY=0.9995   # very stable teacher (vs 0.999 DINO)
+export FACE_OCC_PRETRAIN_LR=1.0e-05
+export FACE_OCC_PRETRAIN_MASK_RATIO=0.4
+export FACE_OCC_PRETRAIN_EMA_DECAY=0.9995
 export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1
-export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000,150000"
-export FACE_OCC_PRETRAIN_EPOCHS=5           # short (vs 30 DINO)
+export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="50000,100000"
+export FACE_OCC_PRETRAIN_EPOCHS=5
 
 mkdir -p scripts/logs results/pretrain_sapiens2_01b
 
@@ -58,6 +56,6 @@ ${TORCHRUN} --nproc_per_node=2 --master_port=$MASTER_PORT src/pretrain_ibot.py
 echo "================================================================================"
 echo "COMPLETE - Finished: $(date)"
 echo "  ▶ Get the MLflow encoder run_id from results/pretrain_sapiens2_01b/mlflow_run_id.txt"
-echo "  ▶ Fill it into configs/architectures/sapiens2-01b-3090-v3.yaml"
-echo "    (search_space.pretrained_source.choices, replace __FILL_SAPIENS_IBOT_RUN_ID__)"
+echo "  ▶ Fill it into configs/architectures/sapiens2-01b-3090-v4.yaml"
+echo "    (search_space.pretrained_source.choices, replace __FILL_SAPIENS_01B_IBOT_RUN_ID__)"
 echo "================================================================================"

@@ -10,6 +10,14 @@ def get_or_create_experiment(client: MlflowClient, name: str) -> str:
     except Exception:
         exp = client.get_experiment_by_name(name)
         if exp:
+            # Auto-restore if soft-deleted via UI/API. Otherwise create_run() raises
+            # MlflowException("must be in 'active' state. Current state is deleted.")
+            if getattr(exp, "lifecycle_stage", "active") == "deleted":
+                try:
+                    client.restore_experiment(exp.experiment_id)
+                    print(f"[mlflow] restored soft-deleted experiment '{name}' (id={exp.experiment_id})")
+                except Exception as e:
+                    print(f"[mlflow] WARNING: could not restore experiment '{name}': {e}")
             return exp.experiment_id
         return client.create_experiment(name)
 

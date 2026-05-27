@@ -312,8 +312,8 @@ def _render_trials_comparison() -> None:
         auto_refresh_sec = st.selectbox(
             "Auto-refresh",
             [0, 15, 30, 60, 120],
-            index=2,
-            format_func=lambda s: "off" if s == 0 else f"every {s}s",
+            index=0,  # default off — sleep blocks UI thread, opt-in only
+            format_func=lambda s: "off" if s == 0 else f"every {s}s (freezes UI during sleep)",
         )
         if st.button("Refresh now"):
             st.cache_data.clear()

@@ -38,7 +38,7 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=sapiens2_0.8b
-export FACE_OCC_PRETRAIN_SRC="data/pretrain/pretrain_224"
+export FACE_OCC_PRETRAIN_SRC="data/pretrain_224"
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_sapiens2_08b"
 export FACE_OCC_PRETRAIN_IMG_SIZE=224
 

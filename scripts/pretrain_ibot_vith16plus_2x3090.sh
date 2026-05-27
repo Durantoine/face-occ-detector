@@ -37,7 +37,7 @@ export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
 export FACE_OCC_PRETRAIN_ARCH=dinov3_vith16plus
-export FACE_OCC_PRETRAIN_SRC="data/pretrain/pretrain_224"
+export FACE_OCC_PRETRAIN_SRC="data/pretrain_224"
 # 100k steps @224 ≈ 8 chain links de 30h (≈10s/step avec GA=16, BS=2). Stop-early possible :
 # scancel quand le sweep Optuna révèle qu'un snapshot intermédiaire suffit.
 # eff_batch=64 × 100k = 6.4M faces vues (~1.2 epoch MS1MV3)

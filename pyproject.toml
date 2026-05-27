@@ -123,3 +123,8 @@ disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pymupdf>=1.27.2.3",
+]

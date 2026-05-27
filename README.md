@@ -52,9 +52,12 @@ inv optuna-dashboard   # http://localhost:8080
 Les 4 yamls v4 (`dinov3-vitb16/-vith16plus`, `sapiens2-01b/-08b`) intègrent `pretrained_source` en search_space Optuna → le baseline (`lvd` / `sapiens_default`) et les pretrains iBOT custom (`encoder_20000` / `encoder_40000` / `encoder`) sont comparés dans le **même sweep**. Il n'y a plus de "with/without pretrain" séparé.
 
 ```bash
-# 1) Pretrain iBOT custom (4 chain links de 30h, target 50k steps @224)
-./scripts/chain_pretrain.sh 4 scripts/pretrain_ibot_vith16plus_2x3090.sh
-./scripts/chain_pretrain.sh 4 scripts/pretrain_ibot_sapiens2_08b_2x3090.sh
+# 1) Pretrain iBOT custom — les 2 gros modèles en INTERLEAVED (A1, B1, A2, B2, ...)
+#    pour qu'ils progressent en parallèle au lieu de séquentiel sur un nœud unique.
+#    8 links de 30h chacun → MAX_STEPS=100k @224 (stop-early possible via snapshots).
+./scripts/chain_pretrain_two.sh 8 \
+    scripts/pretrain_ibot_vith16plus_2x3090.sh \
+    scripts/pretrain_ibot_sapiens2_08b_2x3090.sh
 # Les petits modèles (01b, vitb16) tournent encore à 112 sur MS1MV3-WDS :
 sbatch scripts/pretrain_ibot_vitb16_2x3090.sh
 sbatch scripts/pretrain_ibot_sapiens2_01b_2x3090.sh

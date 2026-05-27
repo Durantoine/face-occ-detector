@@ -70,9 +70,16 @@ cat results/pretrain_sapiens2_01b/mlflow_run_id.txt         # → ID pour __FILL
 sbatch scripts/optimize_dinov3_vith16plus_v4_2x3090.sh
 sbatch scripts/optimize_sapiens2_08b_v4_2x3090.sh
 
-# 4) Pour les petits modèles (130 trials), chainer 3 jobs SLURM via Optuna persistant
-./scripts/chain_optimize.sh 3 scripts/optimize_dinov3_vitb16_v4_2x3090.sh
-./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v4_2x3090.sh
+# 4) Pour les petits modèles (130 trials), chainer 3 jobs SLURM en INTERLEAVED
+#    (A1, B1, A2, B2, A3, B3 → les 2 archs progressent en parallèle au lieu de
+#     faire tout A puis tout B). Optuna study persistant pour chaque arch.
+./scripts/chain_optimize_two.sh 3 \
+    scripts/optimize_dinov3_vitb16_v4_2x3090.sh \
+    scripts/optimize_sapiens2_01b_v4_2x3090.sh
+
+# Alternative: 2 chains indépendants (FIFO sur 1 nœud, parallèle sur 2 nœuds)
+# ./scripts/chain_optimize.sh 3 scripts/optimize_dinov3_vitb16_v4_2x3090.sh
+# ./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v4_2x3090.sh
 ```
 
 `train.py` charge l'encodeur sélectionné par Optuna et logue `model_init_backbone_from`, `init_backbone_pretrain_run_id`, tous les `pretrain_*` params, et un tag `pretrain_run_id` pour la traçabilité complète.

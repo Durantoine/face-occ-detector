@@ -495,7 +495,9 @@ def optimize_hyperparameters(
         if use_mlflow:
             _validate_pretrained_source_choices(base_config, tracking_uri)
     if study_name is None:
-        study_name = f"optuna-{architecture}-{datetime.now().strftime('%Y%m%d')}"
+        # No date suffix: chained SLURM links must resume the same study via load_if_exists=True.
+        # To start fresh, delete the study manually: `optuna delete-study --study-name optuna-<arch> --storage sqlite:///optuna.db`
+        study_name = f"optuna-{architecture}"
 
     study: Optional[optuna.Study] = None
     client: Optional[MlflowClient] = None

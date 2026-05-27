@@ -67,7 +67,7 @@ training:
   layer_decay: 0.85
 
 optuna:
-  n_trials: 130
+  n_trials: 200
   objective_mode: score
   rotate_val_seed: true
   search_space:
@@ -102,8 +102,11 @@ optuna:
         - "cell_joint"
       # Quand sampler=test_pmf, le loss reweight n'a pas de sens (test_pmf corrige
       # déjà le shift Y au niveau data) → forcer le default "none" (skip sampling).
+      # Quand loss_type=group_dro, le reweight n'est pas appliqué non plus (group_dro
+      # n'utilise pas importance_reweight / cell_reweight) → skip aussi.
       conditional_on:
         sampler_strategy: ["none", "gender", "occlusion", "gender_x_occ"]
+        loss_type: weighted_mse
     feature_fairness:
       type: categorical
       choices:
@@ -135,10 +138,29 @@ optuna:
     augmentation_level:
       type: categorical
       choices: [none, light, medium, strong]
+    loss_type:
+      type: categorical
+      choices: [weighted_mse, group_dro]
+    # Only sampled when loss_type=weighted_mse (group_dro ignores fairness_lambda + focal_gamma).
     loss_fairness_lambda:
       type: float
       low: 0.0
       high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    loss_focal_gamma:
+      type: float
+      low: 0.0
+      high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    # Only sampled when loss_type=group_dro.
+    group_dro_alpha:
+      type: float
+      low: 0.1
+      high: 1.0
+      conditional_on:
+        loss_type: group_dro
     layer_decay:
       type: float
       low: 0.65
@@ -180,6 +202,24 @@ optuna:
       type: float
       low: 1.0
       high: 3.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      low: 0
+      high: 3
       conditional_on:
         pooling_type: attention_k_query
 

@@ -366,83 +366,134 @@ def _save_diagnostic_charts(
     gt: np.ndarray,
     gender: np.ndarray,
     bin_width: float = 0.025,
+    importance_pmf_ratio: Optional[Any] = None,
 ) -> None:
-    """Save 2 PNG charts in `qual_root/diagnostics/` to interpret model errors.
+    """Save a 4-panel PNG diagnostic chart (`qual_root/diagnostics/`).
 
-    Chart 1 — `error_vs_occlusion.png` :
-        Mean absolute error per Y bin, with 3 curves (overall, F, M). Shows
-        where the model struggles (low/mid/high occlusion) and whether the
-        F/M gap is constant or grows with occlusion level.
-
-    Chart 2 — `error_density_by_gender.png` :
-        Histogram of |pred - gt| split by F and M. Shows the full error
-        distribution, not just the mean — useful to spot heavy tails (a few
-        very bad predictions) vs systematic bias (whole distribution shifted).
+    Panel A — MAE par bin × genre, **brute** (avec CI 95%).
+        Vue intrinsèque : où le modèle pèche absolument, sans pondération.
+    Panel B — Contribution au score par bin × genre (= Σ wᵢ·(p-y)² / Σ wᵢ_total).
+        Vue "réelle" dans la loss : un gros gap à haut-Y avec peu de samples → barre
+        microscopique ici → l'écart n'a pas d'impact sur le score officiel.
+    Panel C — Densité de samples par bin × genre.
+        Contexte : où vivent les données, où le ratio F/M se déforme.
+    Panel D — Distribution de |pred - gt| par genre.
+        Heavy tails (quelques mauvaises preds) vs shift systématique.
     """
     import matplotlib
-    matplotlib.use("Agg")  # headless backend (no $DISPLAY needed)
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     out = qual_root / "diagnostics"
     out.mkdir(parents=True, exist_ok=True)
 
     abs_err = np.abs(preds - gt)
+    sq_err = (preds - gt) ** 2
+    weight_offset = 1.0 / 30.0
+    # When importance_pmf_ratio is provided, Panel B contributions match err_*_test_estimated
+    # (the Optuna target). Otherwise they match err_*_val (no shift correction).
+    if importance_pmf_ratio is not None:
+        ratio = np.asarray(importance_pmf_ratio).astype(np.float64).flatten()
+        b_imp = np.clip((gt / bin_width).astype(int), 0, len(ratio) - 1)
+        w_sample = (weight_offset + gt) * ratio[b_imp]
+        contrib_label = "err_*_test_estimated"
+    else:
+        w_sample = weight_offset + gt
+        contrib_label = "err_*_val"
+
     mask_f = gender < 0.5
     mask_m = gender >= 0.5
 
-    # --- Chart 1 : MAE vs Y bin, with F/M curves ---
     n_bins = 20
     edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:]) * 100.0  # in pct points
+    centers = 0.5 * (edges[:-1] + edges[1:]) * 100.0  # pct points
 
-    def _binned_mean(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _binned_stats(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (mean_err, se_err, count, contribution) per bin for the subset under `mask`.
+
+        contribution[b] = Σ wᵢ·(pᵢ-yᵢ)² over (bin == b AND mask), divided by Σ wᵢ over mask
+            → fraction of the err_G that comes from this bin. Sums to err_G across bins."""
         means = np.full(n_bins, np.nan)
+        ses = np.full(n_bins, np.nan)
         counts = np.zeros(n_bins)
+        contrib = np.zeros(n_bins)
         if not mask.any():
-            return means, counts
-        bin_idx = np.clip((gt[mask] / bin_width).astype(int), 0, n_bins - 1)
+            return means, ses, counts, contrib
+        gt_sub = gt[mask]
+        err_sub = abs_err[mask]
+        sq_sub = sq_err[mask]
+        w_sub = w_sample[mask]
+        total_w = float(w_sub.sum())
+        bin_idx = np.clip((gt_sub / bin_width).astype(int), 0, n_bins - 1)
         for b in range(n_bins):
             sel = bin_idx == b
-            counts[b] = sel.sum()
-            if counts[b] > 0:
-                means[b] = abs_err[mask][sel].mean()
-        return means, counts
+            n = int(sel.sum())
+            counts[b] = n
+            if n > 0:
+                means[b] = err_sub[sel].mean()
+                ses[b] = err_sub[sel].std(ddof=1) / np.sqrt(n) if n > 1 else float("nan")
+                contrib[b] = float((w_sub[sel] * sq_sub[sel]).sum()) / total_w if total_w > 0 else 0.0
+        return means, ses, counts, contrib
 
-    overall_means, overall_counts = _binned_mean(np.ones_like(gt, dtype=bool))
-    f_means, f_counts = _binned_mean(mask_f)
-    m_means, m_counts = _binned_mean(mask_m)
+    f_means, f_se, f_counts, f_contrib = _binned_stats(mask_f)
+    m_means, m_se, m_counts, m_contrib = _binned_stats(mask_m)
+    overall_means, _, overall_counts, _ = _binned_stats(np.ones_like(gt, dtype=bool))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axA, axB = axes[0]
+    axC, axD = axes[1]
 
-    ax1.plot(centers, overall_means * 100.0, "-o", lw=2, color="black", label="Overall")
-    ax1.plot(centers, f_means * 100.0, "-s", color="tab:red", alpha=0.7, label=f"Female (n={int(mask_f.sum())})")
-    ax1.plot(centers, m_means * 100.0, "-^", color="tab:blue", alpha=0.7, label=f"Male (n={int(mask_m.sum())})")
-    # Shaded background = sample count per bin (scaled to right y-axis)
-    ax1b = ax1.twinx()
-    ax1b.fill_between(centers, overall_counts, alpha=0.1, color="gray", step="mid")
-    ax1b.set_ylabel("Samples per bin", color="gray")
-    ax1b.tick_params(axis="y", labelcolor="gray")
-    ax1.set_xlabel("True occlusion Y (% points)")
-    ax1.set_ylabel("Mean absolute error (% points)")
-    ax1.set_title("Error vs occlusion level\n(does the model break at high occlusion? is the F/M gap constant?)")
-    ax1.grid(alpha=0.3)
-    ax1.legend(loc="upper left")
+    # --- Panel A : MAE per Y bin × gender, raw (with 95% CI) ---
+    Z = 1.96
+    axA.plot(centers, overall_means * 100.0, "-", lw=1.5, color="black", alpha=0.5, label="Overall")
+    axA.errorbar(centers, f_means * 100.0, yerr=f_se * Z * 100.0, fmt="-s", color="tab:red",
+                 alpha=0.85, capsize=3, label=f"Female (n={int(mask_f.sum())})")
+    axA.errorbar(centers, m_means * 100.0, yerr=m_se * Z * 100.0, fmt="-^", color="tab:blue",
+                 alpha=0.85, capsize=3, label=f"Male (n={int(mask_m.sum())})")
+    axA.set_xlabel("True occlusion Y (% points)")
+    axA.set_ylabel("MAE (% points), ±95% CI")
+    axA.set_title("A — MAE brute par bin × genre (avec CI)\n"
+                  "Vue intrinsèque : où le modèle pèche par niveau d'occlusion")
+    axA.grid(alpha=0.3); axA.legend(loc="upper left")
 
-    # --- Chart 2 : error density by gender ---
+    # --- Panel B : Contribution to err_G per bin (Σwᵢ·sqErr / Σw_G) ---
+    bw_x = (centers[1] - centers[0]) * 0.4
+    axB.bar(centers - bw_x/2, f_contrib, width=bw_x, color="tab:red", alpha=0.85,
+            label=f"Female (err_F = Σ = {f_contrib.sum():.5f})")
+    axB.bar(centers + bw_x/2, m_contrib, width=bw_x, color="tab:blue", alpha=0.85,
+            label=f"Male (err_M = Σ = {m_contrib.sum():.5f})")
+    axB.set_xlabel("True occlusion Y (% points)")
+    axB.set_ylabel("Σwᵢ·(p-y)² in bin / Σw_G")
+    axB.set_title(f"B — Contribution au score par bin × genre ({contrib_label})\n"
+                  "Vue réelle dans la loss : c'est ÇA qui pilote err_F, err_M, err_diff")
+    axB.grid(alpha=0.3, axis="y"); axB.legend(loc="upper right")
+
+    # --- Panel C : Sample density per bin × gender ---
+    axC.bar(centers - bw_x/2, f_counts, width=bw_x, color="tab:red", alpha=0.75,
+            label=f"Female (Σ={int(f_counts.sum())})")
+    axC.bar(centers + bw_x/2, m_counts, width=bw_x, color="tab:blue", alpha=0.75,
+            label=f"Male (Σ={int(m_counts.sum())})")
+    axC.set_xlabel("True occlusion Y (% points)")
+    axC.set_ylabel("Sample count")
+    axC.set_title("C — Densité de samples par bin × genre\n"
+                  "Où vivent les données, où le ratio F/M se déforme")
+    axC.grid(alpha=0.3, axis="y"); axC.legend(loc="upper right")
+
+    # --- Panel D : Error distribution by gender ---
     bins = np.linspace(0.0, max(0.3, float(abs_err.max() + 0.01)), 60)
-    ax2.hist(abs_err[mask_f], bins=bins, density=True, alpha=0.6, color="tab:red",
+    axD.hist(abs_err[mask_f], bins=bins, density=True, alpha=0.6, color="tab:red",
              label=f"Female (n={int(mask_f.sum())})")
-    ax2.hist(abs_err[mask_m], bins=bins, density=True, alpha=0.6, color="tab:blue",
+    axD.hist(abs_err[mask_m], bins=bins, density=True, alpha=0.6, color="tab:blue",
              label=f"Male (n={int(mask_m.sum())})")
-    ax2.axvline(abs_err[mask_f].mean(), color="tab:red", linestyle="--", lw=1.5,
+    axD.axvline(abs_err[mask_f].mean(), color="tab:red", linestyle="--", lw=1.5,
                 label=f"MAE_F = {abs_err[mask_f].mean()*100:.2f}%")
-    ax2.axvline(abs_err[mask_m].mean(), color="tab:blue", linestyle="--", lw=1.5,
+    axD.axvline(abs_err[mask_m].mean(), color="tab:blue", linestyle="--", lw=1.5,
                 label=f"MAE_M = {abs_err[mask_m].mean()*100:.2f}%")
-    ax2.set_xlabel("|pred - gt| (Y units)")
-    ax2.set_ylabel("Density")
-    ax2.set_title("Error density by gender\n(systematic bias vs heavy tails)")
-    ax2.grid(alpha=0.3)
-    ax2.legend(loc="upper right")
+    axD.set_xlabel("|pred - gt| (Y units)")
+    axD.set_ylabel("Density")
+    axD.set_title("D — Distribution d'erreur par genre\n"
+                  "Heavy tails (quelques mauvaises preds) vs shift systématique")
+    axD.grid(alpha=0.3); axD.legend(loc="upper right")
 
     plt.tight_layout()
     chart_path = out / "error_vs_occlusion_and_density.png"
@@ -829,7 +880,10 @@ def train(
             _dump(best_order, "best")
 
             try:
-                _save_diagnostic_charts(qual_root, preds, gt, gender)
+                _save_diagnostic_charts(
+                    qual_root, preds, gt, gender,
+                    importance_pmf_ratio=eval_pmf_ratio,
+                )
             except Exception as e_chart:
                 print(f"WARNING: could not save diagnostic charts: {e_chart}")
 
@@ -868,8 +922,8 @@ def train(
 
     ml_log_metrics(client, run_id, {
         "val_score": eval_score,
-        "val_err_F": eval_results.get("eval_err_F", 0.0),
-        "val_err_M": eval_results.get("eval_err_M", 0.0),
+        "val_err_F": eval_results.get("eval_err_F_test_estimated", 0.0),
+        "val_err_M": eval_results.get("eval_err_M_test_estimated", 0.0),
         "val_err_diff": err_diff,
         "final_eval_loss": eval_loss,
     })

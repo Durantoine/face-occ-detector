@@ -281,10 +281,27 @@ def objective(
             print(f"WARNING: post-train MLflow logging failed (trial value preserved): {e}")
         print(f"Trial {trial_data['n']}: score={score:.5f} err_F={err_F:.5f} err_M={err_M:.5f} err_diff={err_diff:.5f}")
     try:
+        trial.set_user_attr("score", float(score))
         trial.set_user_attr("err_F", float(err_F))
         trial.set_user_attr("err_M", float(err_M))
         trial.set_user_attr("err_diff", float(err_diff))
         trial.set_user_attr("eval_loss", float(eval_loss))
+        # Pull additional diagnostic metrics from MLflow (already logged by train.py)
+        if client and run_id:
+            try:
+                run_data = client.get_run(run_id).data.metrics
+                for k in [
+                    "eval_mae_pct_test_estimated",
+                    "eval_r2_test_estimated",
+                    "eval_challenge_score_val",
+                    "eval_challenge_score_matched_test_estimated",
+                    "eval_challenge_score_best_test_estimated",
+                    "eval_err_diff_matched_test_estimated",
+                ]:
+                    if k in run_data:
+                        trial.set_user_attr(k.replace("eval_", ""), float(run_data[k]))
+            except Exception as e_pull:
+                print(f"WARNING: could not pull metrics from MLflow to user_attrs: {e_pull}")
     except Exception as e:
         print(f"WARNING: trial.set_user_attr failed: {e}")
     finally:

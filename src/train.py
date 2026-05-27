@@ -656,6 +656,8 @@ def train(
         forwarded["fp16"] = False
     # EMA + load_best_model_at_end are incompatible: on_train_end (EMA swap)
     # runs BEFORE _load_best_model → swap gets wiped. Disable load_best when EMA is on.
+    # NOTE: metric_for_best_model stays set even when load_best is disabled — it's still
+    # needed by EarlyStoppingCallback to know which metric to monitor.
     ema_active = float(train_cfg.get("ema_decay", 0)) > 0
     load_best_at_end = not ema_active
     if ema_active:
@@ -668,8 +670,8 @@ def train(
         save_strategy="epoch",
         save_total_limit=1,
         load_best_model_at_end=load_best_at_end,
-        metric_for_best_model=best_metric if load_best_at_end else None,
-        greater_is_better=greater_is_better if load_best_at_end else None,
+        metric_for_best_model=best_metric,
+        greater_is_better=greater_is_better,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=seed,

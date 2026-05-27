@@ -251,11 +251,14 @@ def objective(
             test_data_csv=test_data_csv,
             min_score_to_save=min_score_to_save,
         )
-    except Exception:
+    except Exception as exc:
         eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
         if is_main():
+            import sys
             import traceback
-            traceback.print_exc()
+            print(f"!!! TRIAL {trial_data['n']} FAILED: {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc(file=sys.stdout)  # visible in .out alongside the silent score=inf
+            traceback.print_exc()                 # also stderr (.err) for legacy log scrapers
             if client and run_id:
                 try:
                     client.set_terminated(run_id, "FAILED")

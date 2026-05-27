@@ -804,8 +804,13 @@ def train(
         gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
 
+    # Quantile matching evaluation: only meaningful when P_val ≈ P_test (val_split_strategy=test_pmf).
+    # Sur stratified_yg, P_val ≈ P_train ≠ P_test → matched preds (forcés à P_test marginal)
+    # sont systématiquement éloignés des val GTs → s_matched explose par construction.
+    # → On gate l'évaluation pour ne pas logger des métriques trompeuses.
     used_matching = False
-    if preds is not None:
+    matching_eligible = val_split_strategy == "test_pmf"
+    if preds is not None and matching_eligible:
         from src.inference.calibration import quantile_match_to_test_pmf
         from src.utils.losses import _TEST_PMF_0025
         from src.utils.metrics import compute_score as _compute_score
@@ -834,6 +839,9 @@ def train(
             err_diff = float(matched["err_diff_test_estimated"])
             err_F = float(matched["err_F_test_estimated"])
             err_M = float(matched["err_M_test_estimated"])
+    elif preds is not None:
+        print(f"  quantile match: skipped (val_split_strategy={val_split_strategy} → "
+              f"P_val ≠ P_test, matched eval would be misleading by construction)")
 
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
     if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():

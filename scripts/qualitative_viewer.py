@@ -44,6 +44,14 @@ if _tracking_uri.startswith("sqlite:///"):
               f"viewer will show 'No experiments'.", flush=True)
 print(f"[viewer] All imports OK, launching Streamlit UI on MLFLOW_TRACKING_URI={_tracking_uri}", flush=True)
 
+try:
+    from streamlit_autorefresh import st_autorefresh  # non-blocking JS-timer rerun
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
+    print(f"[viewer] streamlit-autorefresh not installed → auto-refresh falls back to manual", flush=True)
+
+import re
 import pandas as pd
 import streamlit as st
 
@@ -235,6 +243,26 @@ def _fetch_metric_history(tracking_uri: str, run_id: str, metric: str) -> List[T
     return [(int(m.step), float(m.value)) for m in hist]
 
 
+_TRIAL_NUM_RE = re.compile(r"_trial(\d+)$")
+
+
+def _parse_trial_number(run_name: str, fallback: int) -> int:
+    """Extract the real Optuna trial number from run names like
+    `dinov3-vitb16-3090-v4_trial28` → 28. Falls back to the provided index
+    when the name doesn't match (e.g. legacy runs)."""
+    m = _TRIAL_NUM_RE.search(run_name or "")
+    return int(m.group(1)) if m else fallback
+
+
+def _clear_trials_caches() -> None:
+    """Clear only the caches relevant to the trials-comparison view, not the
+    expensive qualitative-artifact cache."""
+    _list_experiments.clear()
+    _list_runs_full.clear()
+    _list_available_metrics.clear()
+    _fetch_metric_history.clear()
+
+
 def _build_hover_text(params: Dict[str, str], name: str, exp_name: str) -> str:
     lines = [f"<b>{name}</b>", f"<i>{exp_name}</i>"]
     for key in HOVER_PARAMS:
@@ -309,15 +337,25 @@ def _render_trials_comparison() -> None:
         else:
             show_best_so_far = False
             hide_inf = False
-        auto_refresh_sec = st.selectbox(
-            "Auto-refresh",
-            [0, 15, 30, 60, 120],
-            index=0,  # default off — sleep blocks UI thread, opt-in only
-            format_func=lambda s: "off" if s == 0 else f"every {s}s (freezes UI during sleep)",
-        )
+        if _HAS_AUTOREFRESH:
+            auto_refresh_sec = st.selectbox(
+                "Auto-refresh",
+                [0, 15, 30, 60, 120],
+                index=2,  # default 30s — non-blocking via JS timer
+                format_func=lambda s: "off" if s == 0 else f"every {s}s",
+            )
+        else:
+            auto_refresh_sec = 0
+            st.caption("Auto-refresh disabled (streamlit-autorefresh not installed)")
         if st.button("Refresh now"):
-            st.cache_data.clear()
+            _clear_trials_caches()
             st.rerun()
+
+    # Schedule non-blocking JS-timer rerun BEFORE rendering so the timer survives
+    # any subsequent st.stop() or exceptions in the render path.
+    if _HAS_AUTOREFRESH and auto_refresh_sec > 0:
+        st_autorefresh(interval=auto_refresh_sec * 1000, key="trials_auto_refresh")
+        _clear_trials_caches()  # ensure each refresh tick fetches fresh data
 
     if view_mode == "Inter-trial (convergence)":
         _render_inter_trial(
@@ -329,11 +367,6 @@ def _render_trials_comparison() -> None:
             selected_labels, exp_label_to_id, selected_metric,
             max_per_exp, log_y, show_running_only,
         )
-
-    if auto_refresh_sec > 0:
-        import time
-        time.sleep(auto_refresh_sec)
-        st.rerun()
 
 
 def _final_metric_value(
@@ -390,12 +423,16 @@ def _render_inter_trial(
                 continue
             if hide_inf and (math.isinf(val) or math.isnan(val)):
                 continue
-            xs.append(i)
+            # Use the real Optuna trial number when parseable (e.g. "_trial28" → 28),
+            # so x-axis matches MLflow run names & Optuna dashboard. Falls back to
+            # chronological index for legacy runs without the suffix.
+            trial_idx = _parse_trial_number(r["name"], i)
+            xs.append(trial_idx)
             ys.append(val)
             hovers.append(_build_hover_text(r["params"], r["name"], label))
             rows_for_table.append({
                 "experiment": label,
-                "trial_idx": i,
+                "trial_idx": trial_idx,
                 "trial": r["name"],
                 "status": r["status"],
                 "final_value": val,

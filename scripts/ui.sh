@@ -29,7 +29,7 @@ if [ ! -x "$UI_VENV/bin/streamlit" ]; then
     echo "  using $PYBIN"
     "$PYBIN" -m venv "$UI_VENV"
     "$UI_VENV/bin/pip" install --quiet --upgrade pip
-    "$UI_VENV/bin/pip" install --quiet streamlit mlflow pandas pillow plotly
+    "$UI_VENV/bin/pip" install --quiet streamlit mlflow pandas pillow plotly streamlit-autorefresh
     echo "  UI venv ready: $($UI_VENV/bin/streamlit --version)"
 fi
 
@@ -38,6 +38,11 @@ fi
 if ! "$UI_VENV/bin/python" -c "import plotly" 2>/dev/null; then
     echo "  Installing plotly into UI venv (one-time)"
     "$UI_VENV/bin/pip" install --quiet plotly
+fi
+# Same for streamlit-autorefresh (non-blocking JS-timer reruns).
+if ! "$UI_VENV/bin/python" -c "import streamlit_autorefresh" 2>/dev/null; then
+    echo "  Installing streamlit-autorefresh into UI venv (one-time)"
+    "$UI_VENV/bin/pip" install --quiet streamlit-autorefresh
 fi
 
 echo "================================================================================"

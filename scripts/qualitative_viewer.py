@@ -494,7 +494,6 @@ def _render_inter_trial(
     if rows_for_table:
         df = pd.DataFrame(rows_for_table).sort_values("final_value", na_position="last")
 
-        top_n = st.slider("Top N per experiment", 1, 20, 5, key="topn_per_exp")
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value",
             "pretrained_source", "loss_type", "group_dro_alpha",
@@ -513,20 +512,24 @@ def _render_inter_trial(
 
         df["_family"] = df["experiment"].map(_family)
 
-        for fam_label, fam_key in [("Dino", "dino"), ("Sapiens", "sapiens")]:
+        families = [("Dino", "dino"), ("Sapiens", "sapiens"), ("Other", "other")]
+        for fam_label, fam_key in families:
             fam_df = df[df["_family"] == fam_key]
             if fam_df.empty:
                 continue
+            n_per_exp = fam_df.groupby("experiment").size()
+            max_n = int(n_per_exp.max())
             st.markdown(f"### Top trials per experiment — {fam_label}")
+            st.caption(
+                f"{len(fam_df)} trials across {len(n_per_exp)} expé · "
+                f"max/expé={max_n} · min/expé={int(n_per_exp.min())}"
+            )
+            top_n = st.slider(
+                f"Top N per experiment — {fam_label}",
+                1, max(20, max_n), min(5, max_n),
+                key=f"topn_per_exp_{fam_key}",
+            )
             top_per_exp = fam_df.groupby("experiment", as_index=False).head(top_n)
-            top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
-            cols = [c for c in focus_cols if c in top_per_exp.columns]
-            st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)
-
-        other_df = df[df["_family"] == "other"]
-        if not other_df.empty:
-            st.markdown("### Top trials per experiment — Other")
-            top_per_exp = other_df.groupby("experiment", as_index=False).head(top_n)
             top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
             cols = [c for c in focus_cols if c in top_per_exp.columns]
             st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)

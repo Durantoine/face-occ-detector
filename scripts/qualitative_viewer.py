@@ -618,26 +618,35 @@ def _fmt_val(v: Any, decimals: int = 5, suffix: str = "") -> str:
 
 
 if show_metrics:
-    st.markdown("### Métrique du challenge")
-    st.caption("`(err_F + err_M)/2 + |err_F - err_M|` avec `err_G = Σwᵢ(predᵢ-yᵢ)² / Σwᵢ`, `wᵢ = 1/30 + yᵢ`")
-    cols = st.columns(5)
-    cols[0].metric("score (test-estimated)",  _fmt_val(selected_run["challenge_score_test_estimated"]),
-                   help="Score officiel — val reweightée par P_test(y)/P_train(y) → estimation perf test")
-    cols[1].metric("score (val direct)",       _fmt_val(selected_run["challenge_score_val"]),
-                   help="Même formule mais sans correction du shift train→test. Diff vs test-estimated = effet shift")
-    cols[2].metric("err_F (test-est.)",        _fmt_val(selected_run["err_F_test_estimated"]),
-                   help="MSE pondérée sur les samples Female")
-    cols[3].metric("err_M (test-est.)",        _fmt_val(selected_run["err_M_test_estimated"]),
-                   help="MSE pondérée sur les samples Male")
-    cols[4].metric("err_diff (test-est.)",     _fmt_val(selected_run["err_diff_test_estimated"]),
-                   help="|err_F - err_M| — pénalité de disparité genre du challenge")
-
-    st.markdown("### Métriques humaines (interprétables)")
+    st.markdown("### Score total")
+    st.caption("`Score = (err_F + err_M)/2 + |err_F - err_M|` (formule officielle). `test-estimated` = val reweightée par `P_test/P_train` (estimation perf test) — c'est ce que pilote Optuna. `val direct` = même formule sans reweight (diagnostic).")
     cols = st.columns(2)
-    cols[0].metric("MAE (test-estimated)",     _fmt_val(selected_run["mae_pct_test_estimated"], decimals=2, suffix=" %"),
-                   help="Erreur absolue moyenne en POINTS DE % d'occlusion : 'le modèle se trompe en moyenne de X points'")
-    cols[1].metric("R² (test-estimated)",      _fmt_val(selected_run["r2_test_estimated"], decimals=3),
-                   help="0 = modèle trivial (moyenne constante), 1 = parfait. Invariant à l'échelle de Y")
+    cols[0].metric("Score (test-estimated)",   _fmt_val(selected_run["challenge_score_test_estimated"]),
+                   help="LA cible Optuna. Plus c'est bas, mieux c'est.")
+    cols[1].metric("Score (val direct)",       _fmt_val(selected_run["challenge_score_val"]),
+                   help="Pas de correction du shift Y. Diff vs test-estimated = magnitude du shift.")
+
+    # Decompose score = mean_err + |err_diff|  (because (err_F+err_M)/2 + |err_F-err_M| = mean + diff)
+    err_f = selected_run["err_F_test_estimated"]
+    err_m = selected_run["err_M_test_estimated"]
+    mean_err = (err_f + err_m) / 2 if isinstance(err_f, (int, float)) and isinstance(err_m, (int, float)) else None
+    st.markdown("### Composantes du score (test-estimated)")
+    cols = st.columns(4)
+    cols[0].metric("mean_err",       _fmt_val(mean_err),
+                   help="(err_F + err_M) / 2 — performance moyenne sur les 2 genres")
+    cols[1].metric("err_diff",       _fmt_val(selected_run["err_diff_test_estimated"]),
+                   help="|err_F - err_M| — pénalité de fairness genre")
+    cols[2].metric("err_F",          _fmt_val(err_f),
+                   help="Σwᵢ(pᵢ-yᵢ)² / Σwᵢ sur les samples Female (wᵢ=1/30+yᵢ)")
+    cols[3].metric("err_M",          _fmt_val(err_m),
+                   help="Σwᵢ(pᵢ-yᵢ)² / Σwᵢ sur les samples Male")
+
+    st.markdown("### Métriques humaines (test-estimated)")
+    cols = st.columns(2)
+    cols[0].metric("MAE",            _fmt_val(selected_run["mae_pct_test_estimated"], decimals=2, suffix=" %"),
+                   help="Erreur absolue moyenne en points de % d'occlusion : le modèle se trompe en moyenne de X points")
+    cols[1].metric("R²",             _fmt_val(selected_run["r2_test_estimated"], decimals=3),
+                   help="0 = modèle trivial (moyenne constante), 1 = parfait")
 
 qual_dir = _download_qualitative(TRACKING_URI, selected_run["run_id"])
 if qual_dir is None:

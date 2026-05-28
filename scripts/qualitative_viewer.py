@@ -67,8 +67,13 @@ HOVER_PARAMS = [
     "group_dro_alpha",
     "loss_focal_gamma",
     "loss_fairness_lambda",
-    "sampler_strategy",
-    "loss_rw_strategy",
+    # v6.5 paired-α design — anciens axes (sampler_strategy/loss_rw_strategy) retirés
+    # car remplacés par ce duo. Toujours visibles dans le dump complet (tab Training params).
+    "correction_strategy",
+    "correction_alpha",
+    "correction_strength",  # v7+ : intensité totale (effet combiné = r^β)
+    "sampler_power",
+    "loss_power",
     "feature_fairness",
     "pooling_type",
     "learning_rate",
@@ -125,13 +130,15 @@ def _list_runs(tracking_uri: str, experiment_id: str) -> List[Dict[str, Any]]:
             "run_id": r.info.run_id,
             "name": r.info.run_name or r.info.run_id[:8],
             "status": r.info.status,
-            "challenge_score_test_estimated": pick("eval_challenge_score_test_estimated", "eval_score", "val_score"),
-            "challenge_score_val":            pick("eval_challenge_score_val", "eval_score_raw"),
-            "err_F_test_estimated":           pick("eval_err_F_test_estimated", "eval_err_F"),
-            "err_M_test_estimated":           pick("eval_err_M_test_estimated", "eval_err_M"),
-            "err_diff_test_estimated":        pick("eval_err_diff_test_estimated", "eval_err_diff"),
-            "mae_pct_test_estimated":         pick("eval_mae_pct_test_estimated"),
-            "r2_test_estimated":              pick("eval_r2_test_estimated"),
+            # v6.5 rename : on lit en priorité les nouveaux noms (sans _test_estimated),
+            # fallback sur les anciens pour les runs v4/v5/v6-pre-rename.
+            "challenge_score":  pick("eval_challenge_score", "eval_challenge_score_test_estimated", "eval_score", "val_score"),
+            "challenge_score_raw": pick("eval_challenge_score_raw", "eval_challenge_score_val", "eval_score_raw"),
+            "err_F":            pick("eval_err_F", "eval_err_F_test_estimated"),
+            "err_M":            pick("eval_err_M", "eval_err_M_test_estimated"),
+            "err_diff":         pick("eval_err_diff", "eval_err_diff_test_estimated"),
+            "mae_pct":          pick("eval_mae_pct", "eval_mae_pct_test_estimated"),
+            "r2":               pick("eval_r2", "eval_r2_test_estimated"),
         })
     return out
 
@@ -312,8 +319,14 @@ def _render_trials_comparison() -> None:
         st.error("No MLflow experiments found.")
         return
 
-    # Default selection: keep optuna-* experiments (one per arch); fallback to all
-    default_exps = [(eid, name) for eid, name in experiments if name.startswith("optuna-")]
+    # Default selection: v6+ optuna experiments only (exclude legacy v4/v5).
+    # Fallback ladders: optuna-*v6+ → all optuna-* → all experiments.
+    import re
+    _CURRENT_VERSION_RE = re.compile(r"-v([6-9]|\d{2,})$")
+    default_exps = [(eid, name) for eid, name in experiments
+                    if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
+    if not default_exps:
+        default_exps = [(eid, name) for eid, name in experiments if name.startswith("optuna-")]
     if not default_exps:
         default_exps = experiments
 
@@ -344,11 +357,13 @@ def _render_trials_comparison() -> None:
         if not available_metrics:
             st.warning("No eval_* metrics found yet.")
             return
-        default_metric = (
-            "eval_challenge_score_test_estimated"
-            if "eval_challenge_score_test_estimated" in available_metrics
-            else available_metrics[0]
-        )
+        # v6.5: nouveau nom `eval_challenge_score` ; fallback sur legacy pour runs v4/v5.
+        if "eval_challenge_score" in available_metrics:
+            default_metric = "eval_challenge_score"
+        elif "eval_challenge_score_test_estimated" in available_metrics:
+            default_metric = "eval_challenge_score_test_estimated"
+        else:
+            default_metric = available_metrics[0]
         selected_metric = st.selectbox(
             "Metric",
             available_metrics,
@@ -533,7 +548,9 @@ def _render_inter_trial(
             "experiment", "trial_idx", "trial", "final_value",
             "pretrained_source", "loss_type", "group_dro_alpha",
             "loss_focal_gamma", "loss_fairness_lambda",
-            "sampler_strategy", "loss_rw_strategy", "feature_fairness",
+            "correction_strategy", "correction_alpha", "correction_strength",
+            "sampler_power", "loss_power",
+            "feature_fairness",
             "pooling_type", "learning_rate", "layer_decay",
         ]
 
@@ -577,8 +594,9 @@ def _render_inter_trial(
         # (best/avg/n_trials) par valeur. Permet de voir d'un coup d'œil quels choix
         # gagnent et lesquels sont à pruner.
         AXIS_PARAMS = [
-            "pretrained_source", "pooling_type", "sampler_strategy",
-            "loss_rw_strategy", "feature_fairness", "loss_type",
+            "pretrained_source", "pooling_type",
+            "correction_strategy",
+            "feature_fairness", "loss_type",
         ]
         for fam_label, fam_key in families:
             fam_df = df[df["_family"] == fam_key]
@@ -749,7 +767,7 @@ with st.sidebar:
 
     # Sort by score ASC (best first); runs without score go to the bottom.
     def _score_key(r: Dict[str, Any]) -> float:
-        s = r.get("challenge_score_test_estimated")
+        s = r.get("challenge_score")
         return float(s) if isinstance(s, (int, float)) and s == s else float("inf")
     runs = sorted(runs, key=_score_key)
 
@@ -761,7 +779,7 @@ with st.sidebar:
         runs = _list_runs(TRACKING_URI, selected_exp_id)
 
     def _fmt(r: Dict[str, Any]) -> str:
-        s = r["challenge_score_test_estimated"]
+        s = r["challenge_score"]
         score_str = f"{s:.5f}" if isinstance(s, (int, float)) else "n/a"
         return f"{r['name']}  ·  score={score_str}  ·  [{r['status']}]"
 
@@ -776,33 +794,33 @@ def _fmt_val(v: Any, decimals: int = 5, suffix: str = "") -> str:
 
 if show_metrics:
     st.markdown("### Score total")
-    st.caption("`Score = (err_F + err_M)/2 + |err_F - err_M|` (formule officielle). `test-estimated` = val reweightée par `P_test/P_train` (estimation perf test) — c'est ce que pilote Optuna. `val direct` = même formule sans reweight (diagnostic).")
+    st.caption("`Score = (err_F + err_M)/2 + |err_F - err_M|` (formule officielle). v6 (B'): val matche P_test → `Score` est directement l'estimateur de la perf test. `Score raw` = même formule sans aucune correction (diagnostic, identique au principal en v6).")
     cols = st.columns(2)
-    cols[0].metric("Score (test-estimated)",   _fmt_val(selected_run["challenge_score_test_estimated"]),
+    cols[0].metric("Score",                    _fmt_val(selected_run["challenge_score"]),
                    help="LA cible Optuna. Plus c'est bas, mieux c'est.")
-    cols[1].metric("Score (val direct)",       _fmt_val(selected_run["challenge_score_val"]),
-                   help="Pas de correction du shift Y. Diff vs test-estimated = magnitude du shift.")
+    cols[1].metric("Score raw (sans reweight)", _fmt_val(selected_run["challenge_score_raw"]),
+                   help="v6 (B'): identique au Score principal car val matche déjà P_test. v4/v5: ancien `_val` (avant correction).")
 
     # Decompose score = mean_err + |err_diff|  (because (err_F+err_M)/2 + |err_F-err_M| = mean + diff)
-    err_f = selected_run["err_F_test_estimated"]
-    err_m = selected_run["err_M_test_estimated"]
+    err_f = selected_run["err_F"]
+    err_m = selected_run["err_M"]
     mean_err = (err_f + err_m) / 2 if isinstance(err_f, (int, float)) and isinstance(err_m, (int, float)) else None
-    st.markdown("### Composantes du score (test-estimated)")
+    st.markdown("### Composantes du score")
     cols = st.columns(4)
     cols[0].metric("mean_err",       _fmt_val(mean_err),
                    help="(err_F + err_M) / 2 — performance moyenne sur les 2 genres")
-    cols[1].metric("err_diff",       _fmt_val(selected_run["err_diff_test_estimated"]),
+    cols[1].metric("err_diff",       _fmt_val(selected_run["err_diff"]),
                    help="|err_F - err_M| — pénalité de fairness genre")
     cols[2].metric("err_F",          _fmt_val(err_f),
                    help="Σwᵢ(pᵢ-yᵢ)² / Σwᵢ sur les samples Female (wᵢ=1/30+yᵢ)")
     cols[3].metric("err_M",          _fmt_val(err_m),
                    help="Σwᵢ(pᵢ-yᵢ)² / Σwᵢ sur les samples Male")
 
-    st.markdown("### Métriques humaines (test-estimated)")
+    st.markdown("### Métriques humaines")
     cols = st.columns(2)
-    cols[0].metric("MAE",            _fmt_val(selected_run["mae_pct_test_estimated"], decimals=2, suffix=" %"),
+    cols[0].metric("MAE",            _fmt_val(selected_run["mae_pct"], decimals=2, suffix=" %"),
                    help="Erreur absolue moyenne en points de % d'occlusion : le modèle se trompe en moyenne de X points")
-    cols[1].metric("R²",             _fmt_val(selected_run["r2_test_estimated"], decimals=3),
+    cols[1].metric("R²",             _fmt_val(selected_run["r2"], decimals=3),
                    help="0 = modèle trivial (moyenne constante), 1 = parfait")
 
 qual_dir = _download_qualitative(TRACKING_URI, selected_run["run_id"])
@@ -850,10 +868,12 @@ with tab_params:
         # Highlight panel : Optuna search-space params (the things that actually vary).
         OPTUNA_KEYS = [
             "pretrained_source", "pooling_type",
-            "sampler_strategy", "loss_rw_strategy", "feature_fairness",
+            "correction_strategy", "correction_alpha", "correction_strength",
+            "sampler_power", "loss_power",
+            "feature_fairness",
             "loss_type", "loss_fairness_lambda", "loss_focal_gamma",
             "group_dro_alpha", "loss_query_diversity_lambda",
-            "mmd_lambda", "mixup_alpha", "adv_lambda",
+            "mmd_lambda", "mixup_alpha",
             "learning_rate", "weight_decay", "num_train_epochs",
             "warmup_ratio", "head_dropout", "layer_decay",
             "backbone_drop_path_rate", "augmentation_level",

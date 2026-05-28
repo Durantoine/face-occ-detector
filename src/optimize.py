@@ -46,7 +46,7 @@ _TRAINING_KEYS = {
     "loss_focal_gamma", "loss_fairness_lambda",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
     "loss_cell_within_target",
-    "sampler_power", "loss_power",
+    "sampler_power", "loss_power", "correction_alpha", "correction_strength",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
     "adv_lambda", "mmd_lambda", "mixup_alpha",
@@ -102,12 +102,28 @@ _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _refresh_correction_powers(cfg: Dict[str, Any]) -> None:
+    """Recompute sampler_power and loss_power from correction_alpha × correction_strength.
+
+    Combined gradient effect = r^((α + (1-α)) × β) = r^β.
+      * β=1 : full correction (default, v6 behavior with α tuning).
+      * β<1 : partial correction (v7+) — useful pour test des approches moins agressives
+              sans switcher complètement vers correction_strategy=none.
+    Called whenever α or β is set so order of param application n'a pas d'importance.
+    """
+    a = float(cfg["training"].get("correction_alpha", 1.0))
+    b = float(cfg["training"].get("correction_strength", 1.0))
+    cfg["training"]["sampler_power"] = a * b
+    cfg["training"]["loss_power"] = (1.0 - a) * b
+
+
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
     if name == "correction_strategy":
         # v6.5 paired-α : translate the high-level "correction target" to the legacy
         # (sampler_strategy, loss_rw_strategy) pair. Both are activated simultaneously ;
         # `correction_alpha` (sampled conditional on correction_strategy != "none")
-        # then sets sampler_power = α and loss_power = 1-α.
+        # then sets sampler_power = α × β and loss_power = (1-α) × β where β is
+        # `correction_strength` (default 1.0 = full correction, v6 behavior).
         s = str(value)
         if s not in _CORRECTION_STRATEGY_PAIRS:
             raise ValueError(f"Unknown correction_strategy: {value!r}")
@@ -117,9 +133,12 @@ def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
             cfg["training"][k] = v
         return
     if name == "correction_alpha":
-        a = float(value)
-        cfg["training"]["sampler_power"] = a
-        cfg["training"]["loss_power"] = 1.0 - a
+        cfg["training"]["correction_alpha"] = float(value)
+        _refresh_correction_powers(cfg)
+        return
+    if name == "correction_strength":
+        cfg["training"]["correction_strength"] = float(value)
+        _refresh_correction_powers(cfg)
         return
     if name == "loss_rw_strategy":
         if str(value) not in _LOSS_RW_STRATEGY_MAP:
@@ -328,13 +347,17 @@ def objective(
         if client and run_id:
             try:
                 run_data = client.get_run(run_id).data.metrics
-                for k in [
-                    "eval_mae_pct_test_estimated",
-                    "eval_r2_test_estimated",
-                    "eval_challenge_score_val",
-                ]:
-                    if k in run_data:
-                        trial.set_user_attr(k.replace("eval_", ""), float(run_data[k]))
+                # v6.5 rename : nouveaux noms d'abord, fallback legacy.
+                METRIC_FALLBACKS = [
+                    ("mae_pct",          ["eval_mae_pct", "eval_mae_pct_test_estimated"]),
+                    ("r2",               ["eval_r2", "eval_r2_test_estimated"]),
+                    ("challenge_score_raw", ["eval_challenge_score_raw", "eval_challenge_score_val"]),
+                ]
+                for attr_name, candidates in METRIC_FALLBACKS:
+                    for k in candidates:
+                        if k in run_data:
+                            trial.set_user_attr(attr_name, float(run_data[k]))
+                            break
             except Exception as e_pull:
                 print(f"WARNING: could not pull metrics from MLflow to user_attrs: {e_pull}")
     except Exception as e:

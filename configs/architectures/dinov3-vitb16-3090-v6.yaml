@@ -64,7 +64,7 @@ training:
   early_stopping_patience: 3
   seed: 42
   logging_steps: 50
-  metric_for_best_model: eval_challenge_score_test_estimated
+  metric_for_best_model: eval_challenge_score
   # v6 (Option B') : val_split=test_pmf + eval_importance_reweight=false.
   # Rationale : on rebalance le training pour matcher P_test ; pour rester cohérent
   # end-to-end, on évalue aussi sur une distribution test-like. Conséquences :

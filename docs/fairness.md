@@ -595,3 +595,19 @@ Le sampler est **discret** (sélection de samples → batch), pas différentiabl
 - [src/data/dataset.py](../src/data/dataset.py) — `create_test_pmf_sampler(..., power)`, `create_gender_within_bin_sampler(..., power)` : idem côté sampler.
 - [src/optimize.py](../src/optimize.py) — `_CORRECTION_STRATEGY_PAIRS` map les 4 corrections vers leur paire (sampler, loss). `_apply_trial_param` propage `correction_alpha` → `sampler_power=α`, `loss_power=1-α`.
 - [src/train.py](../src/train.py) — short-circuit propre quand power=0 (skip sampler/loss respectivement).
+
+### Extension v7 : `correction_strength` (β)
+
+v7 ajoute un coefficient β ∈ [0.3, 1.0] qui contrôle l'**intensité totale** de la correction (orthogonal à α qui contrôle la répartition sampler/loss) :
+
+$$p_{\text{sampler}} \propto r^{\alpha \cdot \beta} \qquad w_{\text{loss}} \propto r^{(1-\alpha) \cdot \beta}$$
+
+$$\text{Effet combiné sur le gradient} = r^{\alpha\beta + (1-\alpha)\beta} = r^{\beta}$$
+
+- β=1 : correction complète (= v6, équivalent r^1)
+- β=0.5 : √r, correction à mi-puissance (utile si la correction complète overfit sur les bins rares high-Y)
+- β=0.3 : r^0.3, correction très douce (limite basse, on s'approche du cas "presque pas de correction")
+
+**Pourquoi pas β ∈ [0, 1]** : β→0 est déjà couvert par `correction_strategy=none`. Le range [0.3, 1.0] évite la zone redondante et concentre l'exploration sur la portion utile.
+
+[src/optimize.py](../src/optimize.py) propage via `_refresh_correction_powers()` : recalcul de `sampler_power` et `loss_power` à chaque set de α ou β, ordre d'application des params indifférent.

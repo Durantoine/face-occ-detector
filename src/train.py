@@ -61,7 +61,7 @@ _NON_HF_TRAIN_KEYS = {
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
     "loss_cell_within_target",
-    "sampler_power", "loss_power",
+    "sampler_power", "loss_power", "correction_alpha", "correction_strength",
     "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
     "group_dro_alpha", "layer_decay",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
@@ -826,20 +826,21 @@ def train(
 
     eval_results = trainer.evaluate()
     eval_loss = eval_results["eval_loss"]
-    eval_score = eval_results.get("eval_challenge_score_test_estimated", 0.0)
-    err_diff   = eval_results.get("eval_err_diff_test_estimated", 0.0)
-    err_F      = eval_results.get("eval_err_F_test_estimated", 0.0)
-    err_M      = eval_results.get("eval_err_M_test_estimated", 0.0)
-    eval_score_val = eval_results.get("eval_challenge_score_val", 0.0)
+    # v6.5 : lit les nouveaux noms (sans _test_estimated) avec fallback legacy.
+    eval_score = eval_results.get("eval_challenge_score", eval_results.get("eval_challenge_score_test_estimated", 0.0))
+    err_diff   = eval_results.get("eval_err_diff",        eval_results.get("eval_err_diff_test_estimated", 0.0))
+    err_F      = eval_results.get("eval_err_F",           eval_results.get("eval_err_F_test_estimated", 0.0))
+    err_M      = eval_results.get("eval_err_M",           eval_results.get("eval_err_M_test_estimated", 0.0))
+    eval_score_val = eval_results.get("eval_challenge_score_raw", eval_results.get("eval_challenge_score_val", 0.0))
     err_diff_val   = eval_results.get("eval_err_diff_val", 0.0)
-    err_F_val      = eval_results.get("eval_err_F_val", 0.0)
-    err_M_val      = eval_results.get("eval_err_M_val", 0.0)
+    err_F_val      = eval_results.get("eval_err_F_raw", eval_results.get("eval_err_F_val", 0.0))
+    err_M_val      = eval_results.get("eval_err_M_raw", eval_results.get("eval_err_M_val", 0.0))
     print(f"loss={eval_loss:.5f}")
     print(f"  test-estimated : score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
     print(f"  val direct     : score={eval_score_val:.5f}  err_F={err_F_val:.5f}  err_M={err_M_val:.5f}  err_diff={err_diff_val:.5f}")
-    mae_pct_te = eval_results.get("eval_mae_pct_test_estimated", 0.0)
+    mae_pct_te = eval_results.get("eval_mae_pct", eval_results.get("eval_mae_pct_test_estimated", 0.0))
     mae_pct_va = eval_results.get("eval_mae_pct_val", 0.0)
-    r2_te = eval_results.get("eval_r2_test_estimated", 0.0)
+    r2_te = eval_results.get("eval_r2", eval_results.get("eval_r2_test_estimated", 0.0))
     r2_va = eval_results.get("eval_r2_val", 0.0)
     print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
 
@@ -859,44 +860,10 @@ def train(
         gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
 
-    # Quantile matching evaluation: only meaningful when P_val ≈ P_test (val_split_strategy=test_pmf).
-    # Sur stratified_yg, P_val ≈ P_train ≠ P_test → matched preds (forcés à P_test marginal)
-    # sont systématiquement éloignés des val GTs → s_matched explose par construction.
-    # → On gate l'évaluation pour ne pas logger des métriques trompeuses.
-    used_matching = False
-    matching_eligible = val_split_strategy == "test_pmf"
-    if preds is not None and matching_eligible:
-        from src.inference.calibration import quantile_match_to_test_pmf
-        from src.utils.losses import _TEST_PMF_0025
-        from src.utils.metrics import compute_score as _compute_score
-
-        preds_matched = quantile_match_to_test_pmf(preds, _TEST_PMF_0025)
-        matched = _compute_score(preds_matched, gt, gender, importance_pmf_ratio=eval_pmf_ratio)
-        s_raw, s_matched = float(eval_score), float(matched["challenge_score_test_estimated"])
-        used_matching = s_matched < s_raw
-
-        ml_log_metrics(client, run_id, {
-            "eval_challenge_score_matched_test_estimated": s_matched,
-            "eval_err_F_matched_test_estimated": matched["err_F_test_estimated"],
-            "eval_err_M_matched_test_estimated": matched["err_M_test_estimated"],
-            "eval_err_diff_matched_test_estimated": matched["err_diff_test_estimated"],
-            "eval_challenge_score_matched_val": matched["challenge_score_val"],
-            "eval_challenge_score_best_test_estimated": min(s_raw, s_matched),
-            "calibration_helps": 1.0 if used_matching else 0.0,
-            "calibration_delta": s_raw - s_matched,
-        })
-        ml_log_params(client, run_id, {"best_variant_uses_matching": used_matching})
-        print(f"  quantile match: raw={s_raw:.5f} matched={s_matched:.5f} "
-              f"→ {'matching helps' if used_matching else 'raw wins'} (Δ={s_raw-s_matched:+.5f})")
-
-        if used_matching:
-            eval_score = s_matched
-            err_diff = float(matched["err_diff_test_estimated"])
-            err_F = float(matched["err_F_test_estimated"])
-            err_M = float(matched["err_M_test_estimated"])
-    elif preds is not None:
-        print(f"  quantile match: skipped (val_split_strategy={val_split_strategy} → "
-              f"P_val ≠ P_test, matched eval would be misleading by construction)")
+    # v6.5 : matched eval metrics retirées (eval_challenge_score_matched_*, _best_).
+    # Avec val_split_strategy=test_pmf (B'), val matche déjà P_test → matched = post-process
+    # potentiellement utile mais redondant comme métrique de sélection ; quantile_match reste
+    # dispo dans predict.py pour la post-inference si besoin.
 
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
     if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():
@@ -985,8 +952,8 @@ def train(
 
     ml_log_metrics(client, run_id, {
         "val_score": eval_score,
-        "val_err_F": eval_results.get("eval_err_F_test_estimated", 0.0),
-        "val_err_M": eval_results.get("eval_err_M_test_estimated", 0.0),
+        "val_err_F": eval_results.get("eval_err_F", eval_results.get("eval_err_F_test_estimated", 0.0)),
+        "val_err_M": eval_results.get("eval_err_M", eval_results.get("eval_err_M_test_estimated", 0.0)),
         "val_err_diff": err_diff,
         "final_eval_loss": eval_loss,
     })

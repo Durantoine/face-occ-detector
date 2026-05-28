@@ -43,7 +43,7 @@ export FACE_OCC_PRETRAIN_SRC="data/pretrain_224"
 # eff_batch=64 × 100k = 6.4M faces vues (~1.2 epoch MS1MV3)
 # Caveat cosine LR: schedule étalé sur 100k → si stop à 50k, LR final ~0.71 init (vs ~0 si MAX=50k).
 # Impact minime sur iBOT-light/frozen-teacher (teacher = anchor).
-export FACE_OCC_PRETRAIN_MAX_STEPS=90000
+export FACE_OCC_PRETRAIN_MAX_STEPS=88000
 export FACE_OCC_PRETRAIN_OUT="./results/pretrain_vith16plus"
 export FACE_OCC_PRETRAIN_TEACHER_FROZEN=1
 export FACE_OCC_PRETRAIN_SNAPSHOT_STEPS="25000,50000,75000"

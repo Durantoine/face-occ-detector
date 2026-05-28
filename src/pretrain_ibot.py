@@ -43,7 +43,7 @@ CONFIG: Dict[str, Any] = {
     "image_size": int(os.environ.get("FACE_OCC_PRETRAIN_IMG_SIZE", "112")),
     "patch_size": 16,
     "max_steps": int(os.environ.get("FACE_OCC_PRETRAIN_MAX_STEPS", "100000")),
-    "save_steps": 5000,
+    "save_steps": 30000,
     "logging_steps": 100,
     "teacher_frozen": os.environ.get("FACE_OCC_PRETRAIN_TEACHER_FROZEN", "1") != "0",
     "teacher_ema_decay": float(os.environ.get("FACE_OCC_PRETRAIN_EMA_DECAY", "0.999")),

@@ -43,7 +43,7 @@ _TRAINING_KEYS = {
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level", "ema_decay", "layer_decay",
-    "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
+    "loss_focal_gamma", "loss_fairness_lambda",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
     "loss_cell_within_target",
     "sampler_power", "loss_power",

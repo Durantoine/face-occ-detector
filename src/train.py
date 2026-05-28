@@ -60,6 +60,8 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
+    "loss_cell_within_target",
+    "sampler_power", "loss_power",
     "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
     "group_dro_alpha", "layer_decay",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",

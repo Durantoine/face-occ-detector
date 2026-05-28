@@ -39,6 +39,8 @@ data:
   image_base_dir: data/raw
   data_csv: data/raw/train.csv
   extra_train_csv: null
+  # v6 : val réduit 0.20 → 0.15. Cf dinov3-vitb16-3090-v6.yaml pour le rationale.
+  val_split_ratio: 0.15
 
 training:
   # 3090 24GB BF16 : BS=32 par GPU × 2 GPUs = 64 effectif (= v4)
@@ -55,7 +57,9 @@ training:
   seed: 42
   logging_steps: 50
   metric_for_best_model: eval_challenge_score_test_estimated
-  val_split_strategy: stratified_yg
+  # v6 (Option B') : val_split=test_pmf + eval_importance_reweight=false.
+  # Cf dinov3-vitb16-3090-v6.yaml pour le rationale détaillé.
+  val_split_strategy: test_pmf
   greater_is_better: false
   bf16: true
   fp16: false
@@ -65,7 +69,8 @@ training:
   loss_focal_gamma: 0.0
   loss_fairness_lambda: 1.0
   loss_query_diversity_lambda: 0.0
-  eval_importance_reweight: true
+  # B' : val matche déjà P_test → pas besoin de reweight eval-time. test_estimated == val_direct.
+  eval_importance_reweight: false
   save_qualitative_k: 10
   group_dro_alpha: 0.5
   ema_decay: 0.9995
@@ -91,29 +96,22 @@ optuna:
       # v6 : retiré cls + gem (cf dinov3 v6, data v4 montre que les meilleurs gros modèles
       # bénéficient de l'attention pooling).
       choices: [attention_k_query, multihead_attention]
-    # === Stratégies d'équilibrage v6 — 3 axes orthogonaux ===
-    # Voir docs/fairness.md §"Stratégies d'équilibrage — 3 axes" pour la matrice complète.
-    sampler_strategy:
+    # === Stratégies d'équilibrage v6.5 — paired-α design ===
+    # Cf dinov3-vitb16-3090-v6.yaml pour le rationale. correction_alpha ∈ [0, 1] répartit
+    # la correction r(y, g) entre sampler (∝ r^α) et loss (∝ r^(1-α)).
+    correction_strategy:
       type: categorical
-      # v6 : 4 choix orthogonaux couvrant (Y∈{none, P_test} × G∈{none, 50/50 intra-bin}).
-      # Retiré v6 : gender (no-op), gender_x_occ (overfit), occlusion (redondant test_pmf).
       choices:
         - "none"
-        - "test_pmf"                   # data : Y → P_test, no G correction
-        - "gender_within_occ"          # NEW : 50/50 F/M intra-bin, Y reste P_train
-        - "gender_within_test_pmf"     # NEW : 50/50 F/M intra-bin + Y → P_test
-    loss_rw_strategy:
-      type: categorical
-      # v6 : cell_joint retiré. Remplacé par cell_within_* (50/50 F/M intra-bin sans
-      # surreprésenter les cellules rares).
-      choices:
-        - "none"
-        - "imp_rw"
-        - "cell_within_occ"
-        - "cell_within_test_pmf"
-      # Évite la double correction : seul `sampler=none` laisse le loss libre.
+        - "test_pmf"
+        - "gender_within_occ"
+        - "gender_within_test_pmf"
+    correction_alpha:
+      type: float
+      low: 0.0
+      high: 1.0
       conditional_on:
-        sampler_strategy: ["none"]
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
         loss_type: weighted_mse
     feature_fairness:
       type: categorical

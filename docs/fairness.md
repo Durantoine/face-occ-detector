@@ -14,6 +14,15 @@
 > - **Axe 3 (feature_fairness)** : retiré `dann` (avg 0.01246, adversarial training instable).
 >   Reste `none`, `mmd`, `mixup_gender`. La stratégie G (DANN) ci-dessous reste documentée
 >   à titre de référence théorique, mais le code DANN n'est plus activé par le sweep v6.
+>
+> **Mise à jour v6.5 — Paired-α design** : les axes 1 et 2 ont été **collapsés** en un seul
+> axe `correction_strategy` (4 choix) + un continu `correction_alpha ∈ [0, 1]`.
+> Constat clé : chaque paire (sampler, loss) ciblait la même correction r(y, g), juste
+> appliquée à des stages différents. Avec α, on partage la correction :
+> sampler ∝ r^α, loss ∝ r^(1−α), effet combiné = r exact (∀α).
+> α=1 ⇔ pur sampler (legacy), α=0 ⇔ pur loss, α=0.5 ⇔ hybride √-strength (poids effectifs
+> divisés par √r côté chaque mécanisme → moins d'extrêmes, moins de variance).
+> Voir §"Paired-α design" en fin de doc.
 
 ---
 
@@ -513,3 +522,76 @@ The math: avec `f_sampler(b)` la fréquence par-bin du sampler et `w_imp(b)` le 
 | **F** | `occlusion` (quantile) | `w_gender` only | sampler quantile-balanced sur occ | quantile bins ≠ GT bins → ne matche pas la distribution test aussi finement |
 
 → Dans v4, ces stratégies sont remplacées par les **3 axes orthogonaux** (sampler, loss_rw, feature_fairness), avec la même couverture conceptuelle mais en samplant les axes indépendamment.
+
+---
+
+## Paired-α design (v6.5)
+
+### Constat motivant le refactor
+
+Le design 3-axes v6 traite `sampler_strategy` et `loss_rw_strategy` comme indépendants — mais en pratique chaque "stratégie sampler" a un jumeau loss qui vise **exactement la même correction** r(y, g) :
+
+| Cible r(y, g) = P_target / P_train | Sampler version | Loss version |
+|---|---|---|
+| P_test(y) / P_train(y) | `test_pmf` | `imp_rw` |
+| 0.5 · P_train(y) / P_train(y, g) | `gender_within_occ` | `cell_within_occ` |
+| 0.5 · P_test(y) / P_train(y, g) | `gender_within_test_pmf` | `cell_within_test_pmf` |
+
+Le `conditional_on: sampler_strategy=["none"]` v6 forçait à choisir un seul stage (sampler **ou** loss). Le paired-α relâche ça en faisant **les deux à intensité partagée**.
+
+### Formulation
+
+Pour chaque correction de cible r :
+
+$$\underbrace{p_{\text{sampler}}(y, g)}_{\text{poids de tirage}} \;\propto\; r(y, g)^{\alpha} \qquad
+\underbrace{w_{\text{loss}}(y, g)}_{\text{poids dans la loss}} \;\propto\; r(y, g)^{1-\alpha}$$
+
+**Effet combiné sur le gradient** :
+
+$$\mathbb{E}_{(y,g) \sim p_{\text{sampler}}} \!\left[w_{\text{loss}}(y, g) \cdot \mathcal{L}\right]
+\;=\; \mathbb{E}_{(y,g) \sim p_{\text{train}}} \!\left[r(y, g)^{\alpha} \cdot r(y, g)^{1-\alpha} \cdot \mathcal{L}\right]
+\;=\; \mathbb{E}_{p_{\text{train}}} \!\left[r(y, g) \cdot \mathcal{L}\right]$$
+
+→ La correction effective est **exactement r**, quel que soit α. Seule la **répartition** entre data-side et gradient-side change.
+
+### Pourquoi α=0.5 est intéressant
+
+Si r(y, g) = 10 pour les cellules rares :
+- **α=1 (pur sampler)** : ces samples sont tirés 10× par epoch → memorization si très peu de samples uniques
+- **α=0 (pur loss)** : gradients ×10 sur 1 sample → grosse variance, batch dominé par 1 sample
+- **α=0.5 (hybride √)** : tirage √10 ≈ 3.16× + poids √10 ≈ 3.16. Aucun extrême, partage la charge.
+
+### Cas particulier : α aux extrêmes
+
+- α=1 : `loss_power=0` → train.py court-circuite la loss reweight (irrelevant). Équivalent legacy "pur sampler".
+- α=0 : `sampler_power=0` → train.py court-circuite la création du sampler. Équivalent legacy "pur loss".
+
+→ Les extrêmes reproduisent exactement le comportement v6, donc le sweep paired-α généralise strictement v6.
+
+### Search space v6.5
+
+```yaml
+correction_strategy:
+  type: categorical
+  choices: ["none", "test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+correction_alpha:
+  type: float
+  low: 0.0
+  high: 1.0
+  conditional_on:
+    correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+    loss_type: weighted_mse
+```
+
+4 stratégies × 1 dim continue = ~50 trials/stratégie avec un budget de 200 → TPE peut tuner α finement par cible.
+
+### Pourquoi α n'est pas appris en bout de modèle
+
+Le sampler est **discret** (sélection de samples → batch), pas différentiable. Donc ∂L/∂α n'existe pas côté data-side. Les workarounds (REINFORCE, bilevel, sampler-soft) sont soit trop coûteux (extra training), soit défont l'intérêt du sampler. **TPE = la bonne solution** : 1 trial = 1 sample (α, score), apprentissage bayésien gratuit au niveau outer-loop.
+
+### Implémentation
+
+- [src/utils/losses.py](../src/utils/losses.py) — `build_importance_weights(..., power)`, `build_cell_weights_within(..., power)` : appliquent `r^power` avec normalisation conservée.
+- [src/data/dataset.py](../src/data/dataset.py) — `create_test_pmf_sampler(..., power)`, `create_gender_within_bin_sampler(..., power)` : idem côté sampler.
+- [src/optimize.py](../src/optimize.py) — `_CORRECTION_STRATEGY_PAIRS` map les 4 corrections vers leur paire (sampler, loss). `_apply_trial_param` propage `correction_alpha` → `sampler_power=α`, `loss_power=1-α`.
+- [src/train.py](../src/train.py) — short-circuit propre quand power=0 (skip sampler/loss respectivement).

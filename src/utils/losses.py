@@ -8,11 +8,22 @@ import torch.nn as nn
 # Extracted pixel-by-pixel from example/task_brief.pdf page 3 (test histogram, 29980 images).
 # Calibration verified: same-method extraction of the train histogram has 0.9999 correlation
 # with local train.csv at 100-bin resolution. Integrated test count = 29961 / 29980 (99.94%).
-# The saw-tooth pattern (alternating high/low) reflects a real label-rounding bias visible
-# in the slide — kept as-is rather than smoothed.
-_TEST_PMF_0025 = np.array([
+#
+# v6 : fit d'une vraie distribution paramétrique pour éliminer le saw-tooth (artefact
+# de label-rounding ~0.05 visible dans la PDF source) :
+#     P_test(y) = π_0 · δ(0) + (1 − π_0) · Beta(α, β; y · 2)
+# avec π_0 = 0.069 (visages "no occlusion" parfaitement), α = 1.67, β = 2.85.
+# Fit par minimisation L2 vs raw histogram → L2 = 0.0334 (meilleur parmi Beta/Gamma/Exp
+# seuls qui font 0.057-0.083 et écrasent le spike bin 0). Bin 0 préservé à 0.096 (−1%
+# vs raw 0.0967). Interprétation : 6.9% du test = aucune occlusion, le reste suit une
+# Beta avec mode ~0.12 et tail jusqu'à 0.5.
+_TEST_PMF_0025_RAW = np.array([
     0.0967, 0.0546, 0.0847, 0.0642, 0.0812, 0.0692, 0.0838, 0.0677, 0.0790, 0.0713,
     0.0681, 0.0589, 0.0448, 0.0316, 0.0228, 0.0118, 0.0056, 0.0023, 0.0012, 0.0006,
+], dtype=np.float64)
+_TEST_PMF_0025 = np.array([
+    0.0960, 0.0531, 0.0679, 0.0764, 0.0807, 0.0817, 0.0801, 0.0765, 0.0713, 0.0650,
+    0.0578, 0.0500, 0.0420, 0.0339, 0.0262, 0.0189, 0.0124, 0.0070, 0.0029, 0.0005,
 ], dtype=np.float64)
 
 
@@ -22,11 +33,21 @@ def build_importance_weights(
     bin_width: float = 0.025,
     test_pmf: np.ndarray = _TEST_PMF_0025,
     clip: float = 10.0,
+    power: float = 1.0,
 ) -> np.ndarray:
+    """Per-bin importance weights w[b] = (P_test[b] / P_train[b])^power, clipped + normalized.
+
+    `power` (paired-α design v6.5) :
+      * 1.0 → full loss-side correction (default, legacy behavior)
+      * 0.5 → √-strength : combined with √-strength sampler donne la correction complète
+      * 0.0 → all-ones après normalisation → no loss effect (sampler à 100%)
+    """
     edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
     train_hist, _ = np.histogram(np.clip(train_targets, 0.0, edges[-1] - 1e-9), bins=edges)
     train_pmf = train_hist / max(train_hist.sum(), 1)
     w = test_pmf / np.clip(train_pmf, 1e-6, None)
+    if power != 1.0:
+        w = np.power(w, power)
     w = np.clip(w, 1.0 / clip, clip)
     w = w / w.mean()
     return w
@@ -67,15 +88,18 @@ def build_cell_weights_within(
     n_bins: int = 20,
     bin_width: float = 0.025,
     clip: float = 10.0,
+    power: float = 1.0,
 ) -> np.ndarray:
     """Cell weights qui égalisent F/M *intra-bin* tout en suivant `target_pmf` sur Y.
 
     Pour chaque cellule (g, b) :
-        W[g, b] = 0.5 × target_pmf[b] / count(g, b)
-    Normalisé à moyenne pondérée = 1 (i.e. mean weighted by occurrence dans le train).
+        W[g, b] = (0.5 × target_pmf[b] × N / count(g, b))^power      (ratio r)
+    Normalisé à moyenne pondérée = 1.
 
-    Effet équivalent en espérance à `create_gender_within_bin_sampler`, mais appliqué
-    au niveau loss (chaque sample vu 1× par epoch, weighted dans la loss).
+    `power` (paired-α design v6.5) :
+      * 1.0 → correction loss-side complète (default, legacy behavior)
+      * 0.5 → √-strength : combiné avec sampler √-strength = correction complète
+      * 0.0 → all-ones → no loss effect (sampler fait 100% du boulot)
 
     Si `target_pmf=None` → utilise P_train(Y) empirique (préserve la distribution Y).
     Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
@@ -98,6 +122,14 @@ def build_cell_weights_within(
     safe_counts = np.maximum(counts, 1.0)
     w = 0.5 * target[None, :] / safe_counts   # broadcast → shape (2, n_bins)
     w[counts == 0] = 0.0
+
+    # Apply power on the per-cell ratio. We power-up before the renormalization so that
+    # the mean-weighted-to-1 invariant holds for any α.
+    if power != 1.0:
+        nonzero_mask = w > 0
+        w_pow = np.zeros_like(w)
+        w_pow[nonzero_mask] = np.power(w[nonzero_mask], power)
+        w = w_pow
 
     # Normalize so that the average weight across the actual train distribution = 1.
     # i.e. Σ_{g,b} count(g,b) × W[g,b] / N = 1

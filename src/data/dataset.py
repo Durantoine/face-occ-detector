@@ -31,15 +31,16 @@ def create_test_pmf_sampler(
     bin_width: float = 0.025,
     clip: float = 10.0,
     num_samples: Optional[int] = None,
+    power: float = 1.0,
 ) -> WeightedRandomSampler:
     """Sampler that resamples the training data so the effective distribution of Y
-    in each epoch matches `test_pmf`. Per-sample weight = P_test[b] / P_train[b]
+    in each epoch matches `test_pmf`. Per-sample weight = (P_test[b] / P_train[b])^power
     where b is the Y-bin index. Clipped to [1/clip, clip] for stability.
 
-    Use this as an ALTERNATIVE to `loss_importance_reweight=True` — both compensate
-    the train↔test shift on Y, but at different stages :
-      * loss reweighting → all samples seen, gradients pondérés
-      * resampling (this) → effective batch distribution = P_test, loss standard
+    `power` (paired-α design v6.5) :
+      * 1.0 → full sampler-side correction (legacy)
+      * 0.5 → √-strength : combined with √-strength loss reweight = full correction
+      * 0.0 → uniform → no sampler effect (loss does 100%)
     """
     y_arr = np.asarray(y, dtype=np.float64).flatten()
     test = np.asarray(test_pmf, dtype=np.float64).flatten()
@@ -47,6 +48,8 @@ def create_test_pmf_sampler(
     bin_idx = np.clip((y_arr / bin_width).astype(int), 0, n_bins - 1)
     train_pmf = np.bincount(bin_idx, minlength=n_bins).astype(np.float64) / max(len(y_arr), 1)
     ratio = test / np.maximum(train_pmf, 1e-6)
+    if power != 1.0:
+        ratio = np.power(ratio, power)
     ratio = np.clip(ratio, 1.0 / clip, clip)
     weights = ratio[bin_idx]
     n = int(num_samples if num_samples is not None else len(y_arr))
@@ -60,17 +63,17 @@ def create_gender_within_bin_sampler(
     bin_width: float = 0.025,
     n_bins: int = 20,
     clip: float = 10.0,
+    power: float = 1.0,
 ) -> WeightedRandomSampler:
     """Sampler égalisant F/M *intra-bin* tout en suivant `target_pmf` sur Y.
 
     Pour chaque sample i de bin b(i) et genre g(i) ∈ {0=F, 1=M} :
-        weight_i = 0.5 × target_pmf[b(i)] / count(g(i), b(i))
+        weight_i = (0.5 × target_pmf[b(i)] / count(g(i), b(i)))^power
 
-    Effet :
-      * Distribution Y effective ≈ target_pmf
-      * Intra-bin : 50/50 F vs M
-      * Cellules très rares (high-Y M) reçoivent un poids élevé mais bornées par `clip`
-        pour éviter l'overfit catastrophique sur 7 images.
+    `power` (paired-α design v6.5) :
+      * 1.0 → full sampler-side correction (legacy)
+      * 0.5 → √-strength : combined with √-strength loss = full correction
+      * 0.0 → uniform → no sampler effect (loss does 100%)
 
     Si `target_pmf=None` → utilise la PMF empirique de Y dans le train (préserve P_train).
     Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
@@ -99,6 +102,10 @@ def create_gender_within_bin_sampler(
         cnt = cell_counts[g, b]
         if cnt > 0:
             weights[i] = 0.5 * target[b] / cnt
+
+    if power != 1.0:
+        pos_mask = weights > 0
+        weights[pos_mask] = np.power(weights[pos_mask], power)
 
     # Clip pour éviter qu'un sample dans une cellule ultra-rare ait un poids absurde
     pos = weights[weights > 0]

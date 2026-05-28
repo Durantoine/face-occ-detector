@@ -46,6 +46,7 @@ _TRAINING_KEYS = {
     "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
     "loss_cell_within_target",
+    "sampler_power", "loss_power",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
     "adv_lambda", "mmd_lambda", "mixup_alpha",
@@ -80,6 +81,19 @@ _LOSS_RW_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
     "cell_within_test_pmf": {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": "test_pmf"},
 }
 
+# v6.5 — Paired-α design. Chaque correction_strategy active SIMULTANÉMENT un sampler et
+# un loss reweight visant la MÊME cible r(y, g). `correction_alpha` ∈ [0, 1] répartit
+# la force entre les deux mécanismes :
+#   sampler weights ∝ r^α           loss weights ∝ r^(1-α)
+# Effet combiné sur le gradient = r^α · r^(1-α) = r (correction exacte, ∀ α).
+# Cas particuliers : α=1 ⇔ pur sampler (ancien comportement) ; α=0 ⇔ pur loss.
+_CORRECTION_STRATEGY_PAIRS: Dict[str, Tuple[str, str]] = {
+    "none":                   ("none",                    "none"),
+    "test_pmf":               ("test_pmf",                "imp_rw"),
+    "gender_within_occ":      ("gender_within_occ",       "cell_within_occ"),
+    "gender_within_test_pmf": ("gender_within_test_pmf",  "cell_within_test_pmf"),
+}
+
 _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
     "none":         {"loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
     "dann":         {"loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
@@ -89,6 +103,24 @@ _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
+    if name == "correction_strategy":
+        # v6.5 paired-α : translate the high-level "correction target" to the legacy
+        # (sampler_strategy, loss_rw_strategy) pair. Both are activated simultaneously ;
+        # `correction_alpha` (sampled conditional on correction_strategy != "none")
+        # then sets sampler_power = α and loss_power = 1-α.
+        s = str(value)
+        if s not in _CORRECTION_STRATEGY_PAIRS:
+            raise ValueError(f"Unknown correction_strategy: {value!r}")
+        sampler_val, loss_val = _CORRECTION_STRATEGY_PAIRS[s]
+        cfg["training"]["sampler_strategy"] = sampler_val
+        for k, v in _LOSS_RW_STRATEGY_MAP[loss_val].items():
+            cfg["training"][k] = v
+        return
+    if name == "correction_alpha":
+        a = float(value)
+        cfg["training"]["sampler_power"] = a
+        cfg["training"]["loss_power"] = 1.0 - a
+        return
     if name == "loss_rw_strategy":
         if str(value) not in _LOSS_RW_STRATEGY_MAP:
             raise ValueError(f"Unknown loss_rw_strategy: {value!r}")
@@ -300,9 +332,6 @@ def objective(
                     "eval_mae_pct_test_estimated",
                     "eval_r2_test_estimated",
                     "eval_challenge_score_val",
-                    "eval_challenge_score_matched_test_estimated",
-                    "eval_challenge_score_best_test_estimated",
-                    "eval_err_diff_matched_test_estimated",
                 ]:
                     if k in run_data:
                         trial.set_user_attr(k.replace("eval_", ""), float(run_data[k]))

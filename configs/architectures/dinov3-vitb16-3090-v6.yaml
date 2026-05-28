@@ -1,12 +1,13 @@
 name: dinov3-vitb16-3090-v6
 description: |
-  DINOv3 ViT-B/16 (86M) v6 — 2x RTX 3090 24GB (BF16). Stratified val (préserve diversité
-  high-Y au training) + 4 nouvelles stratégies d'équilibrage qui ciblent err_M >> err_F :
+  DINOv3 ViT-B/16 (86M) v6 — 2x RTX 3090 24GB (BF16). val_split=test_pmf (Option B')
+  + eval_importance_reweight=false : val matche P_test, eval direct sans reweight (cohérence
+  end-to-end avec le rebalance training, pas de variance amplifiée sur high-Y). 4 nouvelles
+  stratégies d'équilibrage qui ciblent err_M >> err_F :
     Sampler   : + gender_within_occ, gender_within_test_pmf
     Loss rw   : + cell_within_occ, cell_within_test_pmf
   Toutes égalisent F/M intra-bin sans surreprésenter les cellules rares (≠ gender_x_occ).
-  Quantile matching post-train désactivé sur stratified_yg (Option B : metric trompeuse).
-  Backbone iBOT pin sur encoder final via init_backbone_from.
+  test_pmf paramétré : Mix(spike at 0 + Beta(1.67, 2.85)) — fit propre, plus de saw-tooth.
 
 model:
   model_name: dinov3_vitb16
@@ -44,6 +45,10 @@ data:
   image_base_dir: data/raw
   data_csv: data/raw/train.csv
   extra_train_csv: null
+  # v6 : val réduit de 0.20 → 0.15 (val_target=15k → ~14.9k réel : floor + sous-couverture
+  # high-Y bins 16-18). Train passe de 80.3k → 85.1k (+6%), perte stabilité estimateur ~15%
+  # (1/√N) — acceptable car val matche déjà P_test (plus stable que la v4 reweightée).
+  val_split_ratio: 0.15
 
 training:
   # 3090 24GB BF16 : BS=32 par GPU × 2 GPUs = 64 effectif (= v4)
@@ -60,11 +65,16 @@ training:
   seed: 42
   logging_steps: 50
   metric_for_best_model: eval_challenge_score_test_estimated
-  # v6 : stratified_yg pour préserver la diversité high-Y au training (test_pmf vidait les
-  # bins 14-19, là où err_M sur high-Y M est précisément le problème à corriger).
-  # _test_estimated reste l'estimateur principal (importance reweighting eval-time, biaisé
-  # variance amplifiée sur bins haut-Y mais non-biaisé en espérance).
-  val_split_strategy: stratified_yg
+  # v6 (Option B') : val_split=test_pmf + eval_importance_reweight=false.
+  # Rationale : on rebalance le training pour matcher P_test ; pour rester cohérent
+  # end-to-end, on évalue aussi sur une distribution test-like. Conséquences :
+  #   - P_val ≈ P_test (resampling) → val_direct ≡ estimateur test (pas de reweight)
+  #   - eval_challenge_score_val == eval_challenge_score_test_estimated
+  #   - plus de variance amplifiée sur bins haut-Y (le reweight ×10 disparaît)
+  #   - val plus petit (~15k vs 20k) mais estimateur plus stable
+  # Note : ça retire MOINS de high-Y du training (test a peu de high-Y → val en prend
+  # peu → le training en garde plus, contrairement à ce que disait l'ancien commentaire).
+  val_split_strategy: test_pmf
   greater_is_better: false
   # Ampere → BF16
   bf16: true
@@ -75,7 +85,8 @@ training:
   loss_focal_gamma: 0.0
   loss_fairness_lambda: 1.0
   loss_query_diversity_lambda: 0.0
-  eval_importance_reweight: true
+  # B' : val matche déjà P_test → pas besoin de reweight eval-time. test_estimated == val_direct.
+  eval_importance_reweight: false
   save_qualitative_k: 10
   group_dro_alpha: 0.5
   ema_decay: 0.9995
@@ -107,38 +118,26 @@ optuna:
       # v6 : retiré cls + gem (data v4 montre que les meilleurs Sapiens / gros modèles
       # bénéficient de l'attention pooling, et c'est là que la perf finale se joue).
       choices: [attention_k_query, multihead_attention]
-    # === Stratégies d'équilibrage v4 — décomposées sur 3 axes orthogonaux ===
-    # Voir README §"Stratégies d'équilibrage — 3 axes" pour la matrice complète.
-    #   Axe 1 (sampler)       : équilibrage data-level
-    #   Axe 2 (loss reweight) : reweighting dans la loss
-    #   Axe 3 (feature fair)  : invariance genre au niveau features
-    sampler_strategy:
+    # === Stratégies d'équilibrage v6.5 — paired-α design ===
+    # `correction_strategy` choisit la CIBLE (P_train→P_test sur Y, ou 50/50 F/M intra-bin,
+    # ou les deux). `correction_alpha` ∈ [0, 1] partage la correction entre sampler et loss :
+    #   sampler weights ∝ r^α, loss weights ∝ r^(1-α) → effet combiné = r exact ∀α.
+    #   α=1 : pur sampler (legacy v6). α=0 : pur loss. α=0.5 : hybride √-strength.
+    # Voir docs/fairness.md §"Paired-α design".
+    correction_strategy:
       type: categorical
-      # v6 : 4 choix orthogonaux couvrant (Y∈{none, P_test} × G∈{none, 50/50 intra-bin}).
-      # Retiré v6 :
-      #   - gender (no-op équivalent à `none` côté gradient cf docs/fairness.md §3)
-      #   - gender_x_occ (overfit, avg 0.01345 v4)
-      #   - occlusion (quantile flatten = approx grossière du shift, redondant avec test_pmf
-      #     qui calibre exactement P_test, et ne corrige pas G — doublement inférieur)
       choices:
-        - "none"
-        - "test_pmf"                   # data : Y → P_test, no G correction
-        - "gender_within_occ"          # NEW : 50/50 F/M intra-bin, Y reste P_train
-        - "gender_within_test_pmf"     # NEW : 50/50 F/M intra-bin + Y → P_test
-    loss_rw_strategy:
-      type: categorical
-      # v6 : cell_joint retiré (avg 0.00639 sur v4, jamais dans le top). Remplacé
-      # conceptuellement par cell_within_* qui corrige correctement la rareté intra-bin.
-      choices:
-        - "none"
-        - "imp_rw"
-        - "cell_within_occ"            # NEW : 50/50 F/M intra-bin via loss, Y reste P_train
-        - "cell_within_test_pmf"       # NEW : 50/50 F/M intra-bin via loss + Y → P_test
-      # Évite la double correction : seul `sampler=none` laisse le loss libre d'appliquer
-      # ses propres corrections. Si le sampler corrige déjà Y et/ou G, le loss reste à `none`.
-      # Quand loss_type=group_dro, le reweight n'est pas appliqué non plus.
+        - "none"                       # aucune correction
+        - "test_pmf"                   # Y → P_test
+        - "gender_within_occ"          # 50/50 F/M intra-bin, Y reste P_train
+        - "gender_within_test_pmf"     # 50/50 F/M intra-bin + Y → P_test
+    correction_alpha:
+      type: float
+      low: 0.0
+      high: 1.0
+      # α conditionnel : pas samplé quand correction=none (irrelevant).
       conditional_on:
-        sampler_strategy: ["none"]
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
         loss_type: weighted_mse
     feature_fairness:
       type: categorical

@@ -231,6 +231,7 @@ def _load_train_val(
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     gender_col = data_cfg.get("gender_col", DEFAULT_GENDER_COL)
     extra_train = data_cfg.get("extra_train_csv")
+    val_split_ratio = float(data_cfg.get("val_split_ratio", 0.2))
 
     train_path = _resolve_data_path(data_cfg, data_csv)
     if not train_path:
@@ -245,6 +246,7 @@ def _load_train_val(
 
     return _load_data(
         train_path, **common, extra_train_csv=extra_train, seed=seed,
+        split_ratio=val_split_ratio,
         val_split_strategy=val_split_strategy,
     )
 
@@ -552,16 +554,21 @@ def train(
 
     train_sampler = None
     label_col_for_sampler = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-    if sampler_strategy == "test_pmf":
+    # v6.5 paired-α : sampler_power ∈ [0, 1] répartit la correction entre sampler et loss.
+    # sampler_power=0 → sampler inactif (équivalent sampler=none, loss fait 100%).
+    sampler_power = float(train_cfg.get("sampler_power", 1.0))
+    if sampler_strategy == "test_pmf" and sampler_power > 0:
         from src.data.dataset import create_test_pmf_sampler
         from src.utils.losses import _TEST_PMF_0025
         train_sampler = create_test_pmf_sampler(
             train_data[label_col_for_sampler].astype(float).values,
             test_pmf=_TEST_PMF_0025,
+            power=sampler_power,
         )
-        print(f"Sampler 'test_pmf': resampling train to match P_test marginal on Y. "
+        print(f"Sampler 'test_pmf' (power={sampler_power:.2f}): "
               f"{train_sampler.num_samples} samples/epoch")
-    elif sampler_strategy in ("gender_within_occ", "gender_within_test_pmf") and "gender" in train_data.columns:
+    elif sampler_strategy in ("gender_within_occ", "gender_within_test_pmf") \
+            and "gender" in train_data.columns and sampler_power > 0:
         from src.data.dataset import create_gender_within_bin_sampler
         from src.utils.losses import _TEST_PMF_0025
         target = _TEST_PMF_0025 if sampler_strategy == "gender_within_test_pmf" else None
@@ -569,10 +576,13 @@ def train(
             y=train_data[label_col_for_sampler].astype(float).values,
             gender=train_data["gender"].astype(float).values,
             target_pmf=target,
+            power=sampler_power,
         )
-        print(f"Sampler '{sampler_strategy}': 50/50 F/M intra-bin, Y target = "
-              f"{'P_test' if target is not None else 'P_train'}. "
+        print(f"Sampler '{sampler_strategy}' (power={sampler_power:.2f}): 50/50 F/M intra-bin, "
+              f"Y target = {'P_test' if target is not None else 'P_train'}. "
               f"{train_sampler.num_samples} samples/epoch")
+    elif sampler_strategy in ("test_pmf", "gender_within_occ", "gender_within_test_pmf") and sampler_power == 0:
+        print(f"Sampler '{sampler_strategy}' skipped (sampler_power=0, paired-α loss-only)")
     elif sampler_strategy != "none" and "gender" in train_data.columns:
         keys = make_sampler_keys(train_data, strategy=sampler_strategy, n_buckets=10)
         n_groups = int(keys.max()) + 1
@@ -580,17 +590,24 @@ def train(
         print(f"Sampler '{sampler_strategy}': {n_groups} groups, {train_sampler.num_samples} samples/epoch")
 
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+    # eval ratio uses full power (legacy semantics) ; training-side uses loss_power (paired-α).
     test_pmf_ratio = build_importance_weights(train_data[label_col].astype(float).values)
     ml_log_params(client, run_id, {
         "test_pmf_ratio_per_bin": ",".join(f"{x:.3f}" for x in test_pmf_ratio.tolist()),
     })
     print(f"PMF ratios test/train (20 bins of 0.025): {test_pmf_ratio.round(3).tolist()}")
 
+    # v6.5 paired-α : loss_power=0 → loss reweight inactif (sampler fait 100%).
+    loss_power = float(train_cfg.get("loss_power", 1.0))
     importance_pmf_ratio = None
-    if train_cfg.get("loss_importance_reweight", False) and loss_type == "weighted_mse":
-        importance_pmf_ratio = test_pmf_ratio
-        ml_log_params(client, run_id, {"loss_importance_reweight": True})
-        print("loss_importance_reweight ON (applied in training loss)")
+    if train_cfg.get("loss_importance_reweight", False) and loss_type == "weighted_mse" and loss_power > 0:
+        importance_pmf_ratio = build_importance_weights(
+            train_data[label_col].astype(float).values, power=loss_power,
+        )
+        ml_log_params(client, run_id, {"loss_importance_reweight": True, "loss_power": loss_power})
+        print(f"loss_importance_reweight ON (power={loss_power:.2f})")
+    elif train_cfg.get("loss_importance_reweight", False) and loss_power == 0:
+        print("loss_importance_reweight skipped (loss_power=0, paired-α sampler-only)")
 
     eval_use_test_pmf = bool(train_cfg.get("eval_importance_reweight", True))
     eval_pmf_ratio = test_pmf_ratio if eval_use_test_pmf else None
@@ -631,24 +648,28 @@ def train(
                 "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
             })
             print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
-        elif loss_cell_within_target in ("occ", "test_pmf"):
+        elif loss_cell_within_target in ("occ", "test_pmf") and loss_power > 0:
             from src.utils.losses import build_cell_weights_within, _TEST_PMF_0025
             target = _TEST_PMF_0025 if loss_cell_within_target == "test_pmf" else None
             cell_class_weights = build_cell_weights_within(
                 train_targets=train_data[label_col].astype(float).values,
                 train_gender=train_data["gender"].astype(float).values,
                 target_pmf=target,
+                power=loss_power,
             )
             ml_log_params(client, run_id, {
                 "loss_cell_within_target": loss_cell_within_target,
+                "loss_power": loss_power,
                 "loss_cell_weights_max": float(cell_class_weights.max()),
                 "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
                 "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
                 "loss_cell_weights_F_bin13": float(cell_class_weights[0, 13]),
                 "loss_cell_weights_M_bin13": float(cell_class_weights[1, 13]),
             })
-            print(f"Cell within bin reweight (target={loss_cell_within_target}, P_target × 0.5 / count): "
+            print(f"Cell within bin reweight (target={loss_cell_within_target}, power={loss_power:.2f}): "
                   f"max={cell_class_weights.max():.3f}  | bin13: F={cell_class_weights[0,13]:.3f} M={cell_class_weights[1,13]:.3f}")
+        elif loss_cell_within_target in ("occ", "test_pmf") and loss_power == 0:
+            print(f"Cell within bin reweight skipped (loss_power=0, paired-α sampler-only)")
 
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())

@@ -35,9 +35,9 @@ from src.utils.environment import setup_environment
 from src.utils.losses import (
     GroupDROLoss,
     WeightedMSELoss,
+    _TEST_PMF_0025,
     build_cell_weights,
     build_importance_weights,
-    make_sampler_keys,
 )
 from src.utils.metrics import make_compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
@@ -59,15 +59,18 @@ _NON_HF_TRAIN_KEYS = {
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
-    "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_cell_within_target",
-    "sampler_power", "loss_power", "correction_alpha", "correction_strength",
+    "loss_importance_reweight", "loss_cell_reweight",
+    # v8 axis 1 : 3-mechanism Y shift correction with strength γ
+    "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+    "sampler_power", "loss_power", "aug_share",
+    # v8 axis 2 : soft cell rw via build_cell_weights^power
+    "axis2_power",
     "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
     "group_dro_alpha", "layer_decay",
-    "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
-    "adv_lambda", "mmd_lambda", "mixup_alpha",
+    "loss_mmd_alignment", "mixup_inter_gender",
+    "mmd_lambda", "mixup_alpha",
     "val_split_strategy",
-    "loss_rw_strategy", "feature_fairness",
+    "feature_fairness",
 }
 
 
@@ -531,7 +534,6 @@ def train(
     greater_is_better = bool(train_cfg.get("greater_is_better", False))
     image_base_dir = data_cfg.get("image_base_dir")
     augmentation_level = train_cfg.get("augmentation_level", "medium")
-    sampler_strategy = train_cfg.get("sampler_strategy", "gender")
     loss_type = train_cfg.get("loss_type", "weighted_mse")
 
     client, run_id, use_client = _start_or_attach_run(
@@ -554,124 +556,92 @@ def train(
         train_data, val_data, processor, image_base_dir, augmentation_level,
     )
 
-    train_sampler = None
+    # === v8 axis 1 : sampler + loss imp_rw + aug Y-conditional ===
     label_col_for_sampler = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-    # v6.5 paired-α : sampler_power ∈ [0, 1] répartit la correction entre sampler et loss.
-    # sampler_power=0 → sampler inactif (équivalent sampler=none, loss fait 100%).
-    sampler_power = float(train_cfg.get("sampler_power", 1.0))
-    if sampler_strategy == "test_pmf" and sampler_power > 0:
-        from src.data.dataset import create_test_pmf_sampler
-        from src.utils.losses import _TEST_PMF_0025
-        train_sampler = create_test_pmf_sampler(
-            train_data[label_col_for_sampler].astype(float).values,
-            test_pmf=_TEST_PMF_0025,
-            power=sampler_power,
-        )
-        print(f"Sampler 'test_pmf' (power={sampler_power:.2f}): "
-              f"{train_sampler.num_samples} samples/epoch")
-    elif sampler_strategy in ("gender_within_occ", "gender_within_test_pmf") \
-            and "gender" in train_data.columns and sampler_power > 0:
-        from src.data.dataset import create_gender_within_bin_sampler
-        from src.utils.losses import _TEST_PMF_0025
-        target = _TEST_PMF_0025 if sampler_strategy == "gender_within_test_pmf" else None
-        train_sampler = create_gender_within_bin_sampler(
-            y=train_data[label_col_for_sampler].astype(float).values,
-            gender=train_data["gender"].astype(float).values,
-            target_pmf=target,
-            power=sampler_power,
-        )
-        print(f"Sampler '{sampler_strategy}' (power={sampler_power:.2f}): 50/50 F/M intra-bin, "
-              f"Y target = {'P_test' if target is not None else 'P_train'}. "
-              f"{train_sampler.num_samples} samples/epoch")
-    elif sampler_strategy in ("test_pmf", "gender_within_occ", "gender_within_test_pmf") and sampler_power == 0:
-        print(f"Sampler '{sampler_strategy}' skipped (sampler_power=0, paired-α loss-only)")
-    elif sampler_strategy != "none" and "gender" in train_data.columns:
-        keys = make_sampler_keys(train_data, strategy=sampler_strategy, n_buckets=10)
-        n_groups = int(keys.max()) + 1
-        train_sampler = create_balanced_sampler(keys.tolist(), num_groups=n_groups)
-        print(f"Sampler '{sampler_strategy}': {n_groups} groups, {train_sampler.num_samples} samples/epoch")
-
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-    # eval ratio uses full power (legacy semantics) ; training-side uses loss_power (paired-α).
-    test_pmf_ratio = build_importance_weights(train_data[label_col].astype(float).values)
-    ml_log_params(client, run_id, {
-        "test_pmf_ratio_per_bin": ",".join(f"{x:.3f}" for x in test_pmf_ratio.tolist()),
-    })
-    print(f"PMF ratios test/train (20 bins of 0.025): {test_pmf_ratio.round(3).tolist()}")
+    sampler_power = float(train_cfg.get("sampler_power", 0.0))
+    loss_power    = float(train_cfg.get("loss_power", 0.0))
+    aug_share     = float(train_cfg.get("aug_share", 0.0))
 
-    # v6.5 paired-α : loss_power=0 → loss reweight inactif (sampler fait 100%).
-    loss_power = float(train_cfg.get("loss_power", 1.0))
-    importance_pmf_ratio = None
-    if train_cfg.get("loss_importance_reweight", False) and loss_type == "weighted_mse" and loss_power > 0:
-        importance_pmf_ratio = build_importance_weights(
-            train_data[label_col].astype(float).values, power=loss_power,
+    # Y-conditional aug : si aug_share > 0, on enveloppe train_dataset dans un
+    # YConditionalAugDataset qui réplique stochastiquement chaque sample selon
+    # k_i = (P_test[b] / P_train[b])^aug_share. set_epoch() est appelé via callback.
+    y_train = train_data[label_col].astype(float).values
+    yc_dataset = None
+    if aug_share > 0:
+        from src.data.dataset import YConditionalAugDataset
+        yc_dataset = YConditionalAugDataset(
+            base_dataset=train_dataset,
+            y_array=y_train,
+            aug_share=aug_share,
+            test_pmf=_TEST_PMF_0025,
+            seed=seed,
         )
-        ml_log_params(client, run_id, {"loss_importance_reweight": True, "loss_power": loss_power})
-        print(f"loss_importance_reweight ON (power={loss_power:.2f})")
-    elif train_cfg.get("loss_importance_reweight", False) and loss_power == 0:
-        print("loss_importance_reweight skipped (loss_power=0, paired-α sampler-only)")
+        train_dataset = yc_dataset
+        print(f"YConditionalAugDataset enabled (aug_share={aug_share:.3f}): "
+              f"virtual len={len(yc_dataset)} (vs base {len(y_train)}, expansion ×{len(yc_dataset)/len(y_train):.2f})")
+    else:
+        print(f"YConditionalAugDataset disabled (aug_share={aug_share:.3f})")
 
-    eval_use_test_pmf = bool(train_cfg.get("eval_importance_reweight", True))
-    eval_pmf_ratio = test_pmf_ratio if eval_use_test_pmf else None
+    # Sampler test_pmf : intensité = sampler_power. Sur le dataset virtuel si yc actif.
+    train_sampler = None
+    if sampler_power > 0:
+        from src.data.dataset import create_test_pmf_sampler, create_sampler_weights_for_virtual
+        if yc_dataset is not None:
+            train_sampler = create_sampler_weights_for_virtual(
+                y_base=y_train,
+                test_pmf=_TEST_PMF_0025,
+                virtual_to_base=yc_dataset.virtual_to_base,
+                sampler_power=sampler_power,
+            )
+        else:
+            train_sampler = create_test_pmf_sampler(
+                y_train, test_pmf=_TEST_PMF_0025, power=sampler_power,
+            )
+        print(f"Sampler test_pmf (power={sampler_power:.3f}): "
+              f"{train_sampler.num_samples} samples/epoch")
+    else:
+        print(f"Sampler test_pmf disabled (sampler_power=0)")
+
+    # Loss imp_rw (axis 1 loss leg) — intensité = loss_power
+    test_pmf_ratio_full = build_importance_weights(y_train, power=1.0)
+    ml_log_params(client, run_id, {
+        "test_pmf_ratio_per_bin": ",".join(f"{x:.3f}" for x in test_pmf_ratio_full.tolist()),
+    })
+    importance_pmf_ratio = None
+    if loss_power > 0 and loss_type == "weighted_mse":
+        importance_pmf_ratio = build_importance_weights(y_train, power=loss_power)
+        print(f"loss_importance_reweight ON (power={loss_power:.3f}): "
+              f"min={importance_pmf_ratio.min():.3f} max={importance_pmf_ratio.max():.3f}")
+    else:
+        print(f"loss_importance_reweight disabled (loss_power={loss_power:.3f}, loss_type={loss_type})")
+
+    # Eval : pas de reweight (val matche déjà P_test via val_split_strategy=test_pmf, B')
+    eval_use_test_pmf = bool(train_cfg.get("eval_importance_reweight", False))
+    eval_pmf_ratio = test_pmf_ratio_full if eval_use_test_pmf else None
     if eval_use_test_pmf:
         ml_log_params(client, run_id, {"eval_importance_reweight": True})
-        print("eval_importance_reweight ON (eval_score reweighted to test distribution)")
+        print("eval_importance_reweight ON (val reweighted — legacy behavior)")
     compute_metrics = make_compute_metrics(importance_pmf_ratio=eval_pmf_ratio)
 
+    # === v8 axis 2 : cell_rw soft via build_cell_weights avec power ===
     gender_class_weights = None
-    if train_cfg.get("loss_gender_reweight", False) and loss_type == "weighted_mse" and "gender" in train_data.columns:
-        n_f = max(int((train_data["gender"] < 0.5).sum()), 1)
-        n_m = max(int((train_data["gender"] >= 0.5).sum()), 1)
-        w_f = 1.0 / (2.0 * n_f / (n_f + n_m))
-        w_m = 1.0 / (2.0 * n_m / (n_f + n_m))
-        norm = (w_f + w_m) / 2.0
-        gender_class_weights = np.array([w_f / norm, w_m / norm], dtype=np.float64)
-        ml_log_params(client, run_id, {
-            "loss_gender_reweight": True,
-            "loss_gender_weight_F": float(gender_class_weights[0]),
-            "loss_gender_weight_M": float(gender_class_weights[1]),
-        })
-        print(f"Gender reweight: F={gender_class_weights[0]:.3f}, M={gender_class_weights[1]:.3f} (mean=1.0)")
-
     cell_class_weights = None
-    loss_cell_within_target = train_cfg.get("loss_cell_within_target", None)  # None | "occ" | "test_pmf"
-    if loss_type == "weighted_mse" and "gender" in train_data.columns:
-        label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-        if train_cfg.get("loss_cell_reweight", False):
-            cell_class_weights = build_cell_weights(
-                train_data[label_col].astype(float).values,
-                train_data["gender"].astype(float).values,
-            )
-            ml_log_params(client, run_id, {
-                "loss_cell_reweight": True,
-                "loss_cell_weights_max": float(cell_class_weights.max()),
-                "loss_cell_weights_min": float(cell_class_weights.min()),
-                "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
-                "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
-            })
-            print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
-        elif loss_cell_within_target in ("occ", "test_pmf") and loss_power > 0:
-            from src.utils.losses import build_cell_weights_within, _TEST_PMF_0025
-            target = _TEST_PMF_0025 if loss_cell_within_target == "test_pmf" else None
-            cell_class_weights = build_cell_weights_within(
-                train_targets=train_data[label_col].astype(float).values,
-                train_gender=train_data["gender"].astype(float).values,
-                target_pmf=target,
-                power=loss_power,
-            )
-            ml_log_params(client, run_id, {
-                "loss_cell_within_target": loss_cell_within_target,
-                "loss_power": loss_power,
-                "loss_cell_weights_max": float(cell_class_weights.max()),
-                "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
-                "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
-                "loss_cell_weights_F_bin13": float(cell_class_weights[0, 13]),
-                "loss_cell_weights_M_bin13": float(cell_class_weights[1, 13]),
-            })
-            print(f"Cell within bin reweight (target={loss_cell_within_target}, power={loss_power:.2f}): "
-                  f"max={cell_class_weights.max():.3f}  | bin13: F={cell_class_weights[0,13]:.3f} M={cell_class_weights[1,13]:.3f}")
-        elif loss_cell_within_target in ("occ", "test_pmf") and loss_power == 0:
-            print(f"Cell within bin reweight skipped (loss_power=0, paired-α sampler-only)")
+    axis2_power = float(train_cfg.get("axis2_power", 0.0))
+    if axis2_power > 0 and loss_type == "weighted_mse" and "gender" in train_data.columns:
+        cell_class_weights = build_cell_weights(
+            y_train, train_data["gender"].astype(float).values,
+            power=axis2_power,
+        )
+        ml_log_params(client, run_id, {
+            "axis2_power": axis2_power,
+            "axis2_cell_weights_max": float(cell_class_weights.max()),
+            "axis2_cell_weights_min": float(cell_class_weights.min()),
+        })
+        print(f"Cell rw SOFT (axis2_power={axis2_power:.3f}): "
+              f"min={cell_class_weights.min():.3f} max={cell_class_weights.max():.3f}")
+    else:
+        print(f"Cell rw SOFT disabled (axis2_power={axis2_power:.3f})")
 
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())
@@ -798,6 +768,12 @@ def train(
         callbacks.append(ema_cb)
         print(f"EMA enabled: decay={ema_cb.decay}, warmup_steps={ema_cb.warmup_steps}")
 
+    # v8 : YConditionalAugDataset utilise virtual_to_base fixé au __init__ (cf DESIGN NOTE
+    # dans dataset.py). Pas de set_epoch — la diversité vient de l'augmentation stochastique
+    # appliquée à chaque __getitem__ et du sampler with replacement. Ça évite l'incohérence
+    # qui apparaîtrait si le sampler (poids basés sur virtual_to_base au train init) restait
+    # bloqué pendant que virtual_to_base change.
+
     trainer = WeightedMSETrainer(
         loss_type=loss_type,
         focal_gamma=train_cfg.get("loss_focal_gamma", 0.0),
@@ -826,21 +802,21 @@ def train(
 
     eval_results = trainer.evaluate()
     eval_loss = eval_results["eval_loss"]
-    # v6.5 : lit les nouveaux noms (sans _test_estimated) avec fallback legacy.
-    eval_score = eval_results.get("eval_challenge_score", eval_results.get("eval_challenge_score_test_estimated", 0.0))
-    err_diff   = eval_results.get("eval_err_diff",        eval_results.get("eval_err_diff_test_estimated", 0.0))
-    err_F      = eval_results.get("eval_err_F",           eval_results.get("eval_err_F_test_estimated", 0.0))
-    err_M      = eval_results.get("eval_err_M",           eval_results.get("eval_err_M_test_estimated", 0.0))
-    eval_score_val = eval_results.get("eval_challenge_score_raw", eval_results.get("eval_challenge_score_val", 0.0))
+    # v8 clean : noms canoniques uniquement (compute_score retourne sans legacy alias).
+    eval_score     = eval_results.get("eval_challenge_score", 0.0)
+    err_diff       = eval_results.get("eval_err_diff", 0.0)
+    err_F          = eval_results.get("eval_err_F", 0.0)
+    err_M          = eval_results.get("eval_err_M", 0.0)
+    eval_score_val = eval_results.get("eval_challenge_score_raw", 0.0)
     err_diff_val   = eval_results.get("eval_err_diff_val", 0.0)
-    err_F_val      = eval_results.get("eval_err_F_raw", eval_results.get("eval_err_F_val", 0.0))
-    err_M_val      = eval_results.get("eval_err_M_raw", eval_results.get("eval_err_M_val", 0.0))
+    err_F_val      = eval_results.get("eval_err_F_raw", 0.0)
+    err_M_val      = eval_results.get("eval_err_M_raw", 0.0)
     print(f"loss={eval_loss:.5f}")
     print(f"  test-estimated : score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
     print(f"  val direct     : score={eval_score_val:.5f}  err_F={err_F_val:.5f}  err_M={err_M_val:.5f}  err_diff={err_diff_val:.5f}")
-    mae_pct_te = eval_results.get("eval_mae_pct", eval_results.get("eval_mae_pct_test_estimated", 0.0))
+    mae_pct_te = eval_results.get("eval_mae_pct", 0.0)
     mae_pct_va = eval_results.get("eval_mae_pct_val", 0.0)
-    r2_te = eval_results.get("eval_r2", eval_results.get("eval_r2_test_estimated", 0.0))
+    r2_te = eval_results.get("eval_r2", 0.0)
     r2_va = eval_results.get("eval_r2_val", 0.0)
     print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
 
@@ -952,8 +928,8 @@ def train(
 
     ml_log_metrics(client, run_id, {
         "val_score": eval_score,
-        "val_err_F": eval_results.get("eval_err_F", eval_results.get("eval_err_F_test_estimated", 0.0)),
-        "val_err_M": eval_results.get("eval_err_M", eval_results.get("eval_err_M_test_estimated", 0.0)),
+        "val_err_F": eval_results.get("eval_err_F", 0.0),
+        "val_err_M": eval_results.get("eval_err_M", 0.0),
         "val_err_diff": err_diff,
         "final_eval_loss": eval_loss,
     })

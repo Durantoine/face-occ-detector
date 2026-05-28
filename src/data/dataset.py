@@ -276,3 +276,102 @@ class FaceOccDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         img = _open_rgb(self.image_paths[idx], self.base)
         return _encode(self.processor, img, self.targets[idx], self.genders[idx], self.transform)
+
+
+class YConditionalAugDataset(Dataset):
+    """Expansion virtuelle d'un dataset où chaque sample est répliqué selon le bin Y.
+
+    Pour chaque sample i dans le bin b_i, l'espérance du nombre de copies virtuelles est :
+        k_i = (P_test(b_i) / P_train(b_i))^aug_share, clippé à [1/clip, clip]
+
+    Stochastic Bernoulli rounding préserve E[copies] = k_i exact :
+        copies = floor(k_i) + 1{Bernoulli(k_i - floor(k_i))}
+
+    Chaque accès __getitem__ ré-applique la pipeline d'augmentation (côté base dataset
+    via FaceOccDataset.transform stochastique) → vue différente pour chaque copie
+    virtuelle d'un même sample base. Combiné avec un sampler test_pmf ou un loss
+    reweight, l'effet total sur le gradient = r^(sampler_power + loss_power + aug_share).
+
+    **DESIGN NOTE** : virtual_to_base est fixé au __init__ et NE CHANGE PAS pendant
+    le training. Sinon le sampler (qui prend des poids alignés sur virtual_to_base à
+    sa création) deviendrait incohérent à chaque re-roll. La diversité epoch-à-epoch
+    vient de :
+      (a) la pipeline d'augmentation stochastique sur chaque __getitem__ call
+      (b) le sampler (with replacement) qui pioche différentes virtual_idx par epoch
+      (c) le DataLoader random shuffle
+    Largement suffisant pour éviter la memorization.
+
+    Stochastic Bernoulli rounding (au __init__) préserve E[copies] = k_float exact :
+        copies = floor(k_float) + 1{Bernoulli(k_float - floor(k_float))}
+    """
+
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        y_array: np.ndarray,
+        aug_share: float,
+        test_pmf: np.ndarray,
+        bin_width: float = 0.025,
+        clip: float = 10.0,
+        seed: int = 42,
+    ) -> None:
+        self.base = base_dataset
+        self.y_array = np.asarray(y_array, dtype=np.float64)
+        self.aug_share = float(aug_share)
+        self.bin_width = bin_width
+        self.clip = clip
+
+        n_bins = len(test_pmf)
+        self.bin_idx = np.clip((self.y_array / bin_width).astype(int), 0, n_bins - 1)
+        train_pmf = np.bincount(self.bin_idx, minlength=n_bins).astype(np.float64) / max(len(self.y_array), 1)
+        ratio = test_pmf / np.maximum(train_pmf, 1e-6)
+        if self.aug_share > 0:
+            ratio = np.power(ratio, self.aug_share)
+        else:
+            ratio = np.ones_like(ratio)
+        ratio = np.clip(ratio, 1.0 / clip, clip)
+        self.k_float = ratio[self.bin_idx]   # shape (N,) — espérance copies par sample
+
+        # Bernoulli stochastic rounding (deterministic seed → reproducible across runs).
+        # Fixed mapping after __init__ (no per-epoch reroll, see DESIGN NOTE).
+        rng = np.random.RandomState(seed)
+        floor = np.floor(self.k_float).astype(int)
+        frac = self.k_float - floor
+        extra = (rng.uniform(size=len(self.k_float)) < frac).astype(int)
+        k = np.maximum(floor + extra, 0)
+        self.virtual_to_base = np.repeat(np.arange(len(self.k_float)), k)
+
+    def __len__(self) -> int:
+        return len(self.virtual_to_base)
+
+    def __getitem__(self, virtual_idx: int) -> Dict[str, Any]:
+        base_idx = int(self.virtual_to_base[virtual_idx])
+        return self.base[base_idx]
+
+
+def create_sampler_weights_for_virtual(
+    y_base: np.ndarray,
+    test_pmf: np.ndarray,
+    virtual_to_base: np.ndarray,
+    sampler_power: float,
+    bin_width: float = 0.025,
+    clip: float = 10.0,
+) -> WeightedRandomSampler:
+    """Poids sampler pour un dataset virtuel (expansé via YConditionalAugDataset).
+
+    weight[virtual_idx] = (P_test(b) / P_train(b))^sampler_power
+    où b est le bin de y_base[virtual_to_base[virtual_idx]]. Si sampler_power=0, poids uniformes.
+    """
+    n_bins = len(test_pmf)
+    bin_idx_base = np.clip((np.asarray(y_base) / bin_width).astype(int), 0, n_bins - 1)
+    train_pmf = np.bincount(bin_idx_base, minlength=n_bins).astype(np.float64) / max(len(y_base), 1)
+    ratio = test_pmf / np.maximum(train_pmf, 1e-6)
+    if sampler_power != 1.0:
+        ratio = np.power(ratio, sampler_power)
+    ratio = np.clip(ratio, 1.0 / clip, clip)
+    weights_virtual = ratio[bin_idx_base][virtual_to_base]
+    return WeightedRandomSampler(
+        weights=weights_virtual.tolist(),
+        num_samples=len(weights_virtual),
+        replacement=True,
+    )

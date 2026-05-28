@@ -63,22 +63,20 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
     "pretrained_source",
-    "loss_type",
-    "group_dro_alpha",
+    "pooling_type",
     "loss_focal_gamma",
     "loss_fairness_lambda",
-    # v6.5 paired-α design — anciens axes (sampler_strategy/loss_rw_strategy) retirés
-    # car remplacés par ce duo. Toujours visibles dans le dump complet (tab Training params).
-    "correction_strategy",
-    "correction_alpha",
-    "correction_strength",  # v7+ : intensité totale (effet combiné = r^β)
-    "sampler_power",
-    "loss_power",
+    # v8 — design 5 axes orthogonaux
+    "axis1_strength",          # γ (force totale axe 1)
+    "axis1_sampler_share",     # a (poids sampler test_pmf)
+    "axis1_loss_share",        # b (poids loss imp_rw)
+    "sampler_power",           # = γ × a (effectif)
+    "loss_power",              # = γ × b (effectif)
+    "aug_share",               # = γ × (1-a-b) (Y-conditional aug)
+    "axis2_power",             # soft cell_rw power
     "feature_fairness",
-    "pooling_type",
     "learning_rate",
     "weight_decay",
-    "augmentation_level",
     "num_train_epochs",
     "layer_decay",
 ]
@@ -130,15 +128,14 @@ def _list_runs(tracking_uri: str, experiment_id: str) -> List[Dict[str, Any]]:
             "run_id": r.info.run_id,
             "name": r.info.run_name or r.info.run_id[:8],
             "status": r.info.status,
-            # v6.5 rename : on lit en priorité les nouveaux noms (sans _test_estimated),
-            # fallback sur les anciens pour les runs v4/v5/v6-pre-rename.
-            "challenge_score":  pick("eval_challenge_score", "eval_challenge_score_test_estimated", "eval_score", "val_score"),
-            "challenge_score_raw": pick("eval_challenge_score_raw", "eval_challenge_score_val", "eval_score_raw"),
-            "err_F":            pick("eval_err_F", "eval_err_F_test_estimated"),
-            "err_M":            pick("eval_err_M", "eval_err_M_test_estimated"),
-            "err_diff":         pick("eval_err_diff", "eval_err_diff_test_estimated"),
-            "mae_pct":          pick("eval_mae_pct", "eval_mae_pct_test_estimated"),
-            "r2":               pick("eval_r2", "eval_r2_test_estimated"),
+            # v8 clean : noms canoniques uniquement (pas de legacy fallback).
+            "challenge_score":     pick("eval_challenge_score"),
+            "challenge_score_raw": pick("eval_challenge_score_raw"),
+            "err_F":               pick("eval_err_F"),
+            "err_M":               pick("eval_err_M"),
+            "err_diff":            pick("eval_err_diff"),
+            "mae_pct":             pick("eval_mae_pct"),
+            "r2":                  pick("eval_r2"),
         })
     return out
 
@@ -319,11 +316,11 @@ def _render_trials_comparison() -> None:
         st.error("No MLflow experiments found.")
         return
 
-    # Default selection: v7 only (current sweep version on this branch).
-    # Fallback ladders: optuna-*-v7 → all optuna-* → all experiments. v6 et antérieurs
+    # Default selection: v8 only (current sweep version on this branch).
+    # Fallback ladders: optuna-*-v8 → all optuna-* → all experiments. v6/v7 et antérieurs
     # restent sélectionnables manuellement via le multiselect.
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v7$")
+    _CURRENT_VERSION_RE = re.compile(r"-v8$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:
@@ -358,11 +355,9 @@ def _render_trials_comparison() -> None:
         if not available_metrics:
             st.warning("No eval_* metrics found yet.")
             return
-        # v6.5: nouveau nom `eval_challenge_score` ; fallback sur legacy pour runs v4/v5.
+        # v8 : noms canoniques uniquement, pas de legacy fallback.
         if "eval_challenge_score" in available_metrics:
             default_metric = "eval_challenge_score"
-        elif "eval_challenge_score_test_estimated" in available_metrics:
-            default_metric = "eval_challenge_score_test_estimated"
         else:
             default_metric = available_metrics[0]
         selected_metric = st.selectbox(
@@ -379,10 +374,11 @@ def _render_trials_comparison() -> None:
             hide_inf = st.checkbox("Hide failed trials (score=inf/NaN)", value=True)
             sort_order = st.radio(
                 "Sort tables",
-                ["Best → worst", "Worst → best"],
+                ["Best score → worst", "Worst score → best", "Best fairness (low err_diff)", "Worst fairness (high err_diff)"],
                 index=0,
                 help="Affecte les tables 'Top trials per experiment' et 'All trials'. "
-                     "'Worst → best' permet d'identifier les choix d'hyperparams qui ratent.",
+                     "Fairness sort = trier par eval_err_diff (utile pour voir les trials équitables "
+                     "même si score global moins bon).",
             )
             normalize_x = False
         else:
@@ -415,10 +411,14 @@ def _render_trials_comparison() -> None:
         _clear_trials_caches()  # ensure each refresh tick fetches fresh data
 
     if view_mode == "Inter-trial (convergence)":
+        # v8 : 4 sort orders. "Best fairness" = trier par eval_err_diff ascending
+        sort_by_err_diff = sort_order in ("Best fairness (low err_diff)", "Worst fairness (high err_diff)")
+        sort_descending = sort_order in ("Worst score → best", "Worst fairness (high err_diff)")
         _render_inter_trial(
             selected_labels, exp_label_to_id, selected_metric,
             max_per_exp, log_y, show_running_only, show_best_so_far, hide_inf,
-            sort_descending=(sort_order == "Worst → best"),
+            sort_descending=sort_descending,
+            sort_by_err_diff=sort_by_err_diff,
         )
     else:
         _render_intra_trial(
@@ -449,6 +449,7 @@ def _render_inter_trial(
     show_best_so_far: bool,
     hide_inf: bool,
     sort_descending: bool = False,
+    sort_by_err_diff: bool = False,
 ) -> None:
     import math
     import plotly.graph_objects as go
@@ -489,12 +490,20 @@ def _render_inter_trial(
             xs.append(trial_idx)
             ys.append(val)
             hovers.append(_build_hover_text(r["params"], r["name"], label))
+            # v8 : récupère err_diff depuis metrics MLflow pour le sort fairness
+            err_diff_val = None
+            for k in ("eval_err_diff",):
+                v = r["metrics"].get(k)
+                if v is not None:
+                    err_diff_val = float(v)
+                    break
             rows_for_table.append({
                 "experiment": label,
                 "trial_idx": trial_idx,
                 "trial": r["name"],
                 "status": r["status"],
                 "final_value": val,
+                "err_diff": err_diff_val,
                 **{k: r["params"].get(k) for k in HOVER_PARAMS},
             })
 
@@ -540,19 +549,22 @@ def _render_inter_trial(
     st.plotly_chart(fig, use_container_width=True)
 
     if rows_for_table:
-        # sort_descending=True → worst first (highest value first for minimize-metrics).
+        # v8 : sort par score OU par err_diff (fairness), asc/desc selon sort_descending.
+        sort_col = "err_diff" if sort_by_err_diff else "final_value"
         df = pd.DataFrame(rows_for_table).sort_values(
-            "final_value", ascending=not sort_descending, na_position="last",
+            sort_col, ascending=not sort_descending, na_position="last",
         )
 
         focus_cols = [
-            "experiment", "trial_idx", "trial", "final_value",
-            "pretrained_source", "loss_type", "group_dro_alpha",
+            "experiment", "trial_idx", "trial", "final_value", "err_diff",
+            "pretrained_source", "pooling_type",
             "loss_focal_gamma", "loss_fairness_lambda",
-            "correction_strategy", "correction_alpha", "correction_strength",
-            "sampler_power", "loss_power",
+            # v8 — 5 axes
+            "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+            "sampler_power", "loss_power", "aug_share",
+            "axis2_power",
             "feature_fairness",
-            "pooling_type", "learning_rate", "layer_decay",
+            "learning_rate", "layer_decay",
         ]
 
         def _family(name: str) -> str:
@@ -584,7 +596,7 @@ def _render_inter_trial(
             )
             top_per_exp = fam_df.groupby("experiment", as_index=False).head(top_n)
             top_per_exp = top_per_exp.sort_values(
-                ["experiment", "final_value"],
+                ["experiment", sort_col],
                 ascending=[True, not sort_descending],
                 na_position="last",
             )
@@ -596,8 +608,7 @@ def _render_inter_trial(
         # gagnent et lesquels sont à pruner.
         AXIS_PARAMS = [
             "pretrained_source", "pooling_type",
-            "correction_strategy",
-            "feature_fairness", "loss_type",
+            "feature_fairness",
         ]
         for fam_label, fam_key in families:
             fam_df = df[df["_family"] == fam_key]
@@ -866,18 +877,21 @@ with tab_params:
     if not params:
         st.info("No params logged for this run.")
     else:
-        # Highlight panel : Optuna search-space params (the things that actually vary).
+        # Highlight panel : v8 search-space params (the things that actually vary).
         OPTUNA_KEYS = [
             "pretrained_source", "pooling_type",
-            "correction_strategy", "correction_alpha", "correction_strength",
-            "sampler_power", "loss_power",
+            # v8 — axe 1 (Y shift) + dérivés
+            "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+            "sampler_power", "loss_power", "aug_share",
+            # v8 — axe 2-5
+            "axis2_power",
             "feature_fairness",
-            "loss_type", "loss_fairness_lambda", "loss_focal_gamma",
-            "group_dro_alpha", "loss_query_diversity_lambda",
+            "loss_focal_gamma", "loss_fairness_lambda",
+            "loss_query_diversity_lambda",
             "mmd_lambda", "mixup_alpha",
             "learning_rate", "weight_decay", "num_train_epochs",
             "warmup_ratio", "head_dropout", "layer_decay",
-            "backbone_drop_path_rate", "augmentation_level",
+            "backbone_drop_path_rate",
             "pool_attn_dropout", "pool_proj_dropout",
             "tau_focal_init", "tau_diffuse_init",
             "n_focal", "n_diffuse", "n_free", "num_heads",

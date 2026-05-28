@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-sapiens2-01b-v7-optuna
+#SBATCH --job-name=face-occ-sapiens2-01b-v8-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,7 +11,7 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - Sapiens2-0.1B (114M) v7 - paired-α + strength β (2x 3090, BF16)"
+echo "OPTUNA HPO - Sapiens2-0.1B (114M) v8 - paired-α + strength β (2x 3090, BF16)"
 echo "  ▶ correction_strategy ∈ {none, test_pmf, gender_within_occ, gender_within_test_pmf}"
 echo "  ▶ correction_alpha ∈ [0, 1] : split sampler/loss"
 echo "  ▶ correction_strength β ∈ [0.3, 1.0] : intensité totale (effet = r^β)"
@@ -39,7 +39,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
-export FACE_OCC_ARCH=sapiens2-01b-3090-v7
+export FACE_OCC_ARCH=sapiens2-01b-3090-v8
 
 mkdir -p scripts/logs
 

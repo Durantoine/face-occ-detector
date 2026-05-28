@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-vitb16-v7-optuna
+#SBATCH --job-name=face-occ-vitb16-v8-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,11 +11,13 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v7 - paired-α + strength β (2x 3090, BF16)"
-echo "  ▶ correction_strategy ∈ {none, test_pmf, gender_within_occ, gender_within_test_pmf}"
-echo "  ▶ correction_alpha ∈ [0, 1] : split sampler/loss"
-echo "  ▶ correction_strength β ∈ [0.3, 1.0] : intensité totale (effet = r^β)"
-echo "  ▶ val_split = test_pmf (B'), eval_importance_reweight = false"
+echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v8 - 5-axes design (2x 3090, BF16)"
+echo "  ▶ Axe 1 (Y shift) : axis1_strength × (sampler_share, loss_share, aug_share)"
+echo "  ▶ Axe 2 (G soft)  : axis2_power (cell_rw 1/sqrt^power)"
+echo "  ▶ Axe 3 (feature): {none, mmd, mixup_gender}"
+echo "  ▶ Axe 4 (focal)  : loss_focal_gamma ∈ [0, 3]"
+echo "  ▶ Axe 5 (fairness): loss_fairness_lambda ∈ [0, 2]"
+echo "  ▶ Pinned : ema=0, loss_type=weighted_mse, augmentation_level=medium, val_split=test_pmf"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Started: $(date)"
@@ -38,7 +40,7 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
-export FACE_OCC_ARCH=dinov3-vitb16-3090-v7
+export FACE_OCC_ARCH=dinov3-vitb16-3090-v8
 
 mkdir -p scripts/logs
 

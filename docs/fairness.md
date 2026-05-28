@@ -611,3 +611,99 @@ $$\text{Effet combiné sur le gradient} = r^{\alpha\beta + (1-\alpha)\beta} = r^
 **Pourquoi pas β ∈ [0, 1]** : β→0 est déjà couvert par `correction_strategy=none`. Le range [0.3, 1.0] évite la zone redondante et concentre l'exploration sur la portion utile.
 
 [src/optimize.py](../src/optimize.py) propage via `_refresh_correction_powers()` : recalcul de `sampler_power` et `loss_power` à chaque set de α ou β, ordre d'application des params indifférent.
+
+---
+
+## v8 design — refonte axes orthogonaux
+
+Inspiré par le constat empirique : `cell_joint + MMD` (top v4, score 0.00120) battait les
+designs v6/v7 qui forçaient 50/50 F/M intra-bin (déviation P_test). Le design v8 sépare
+proprement Y-shift et G-fairness sur 5 axes indépendants, et réintroduit `cell_rw` soft
+(la mécanique gagnante v4).
+
+### Hypothèse théorique
+
+H1 — covariate shift Y-only : P_test(genre | occlusion) = P_train(genre | occlusion).
+Sous H1, le sampler optimal pour matcher P_test(G, Y) est `test_pmf` (corrige uniquement
+Y, ne touche pas G). Forcer 50/50 F/M intra-bin dévie de P_test → contre-productif sauf si
+la métrique impose autre chose.
+
+La métrique impose **l'égalité d'erreurs** (`|err_F - err_M|`), pas l'égalité de distribution.
+On peut atteindre cet objectif sans modifier P(G|Y) train, via :
+- `loss_focal_gamma` : auto-pondère les hard examples (modalités rares mal apprises)
+- `feature_fairness=mmd` : aligne features F/M dans le RKHS
+- `loss_fairness_lambda` : pression directe sur le gap d'erreur
+- `axis2_power` (cell_rw soft) : compensation douce des cellules rares (top v4)
+
+### Axe 1 — Y shift correction (3 mécaniques)
+
+Les 3 mécaniques partagent la même correction `r(b) = P_test(b) / P_train(b)` mais
+l'appliquent à des stages différents :
+
+| Mécanique | Effet | Implementation |
+|---|---|---|
+| **Sampler test_pmf** (poids `a × γ`) | Tire plus souvent les bins haut-Y | [`create_test_pmf_sampler(power=...)`](../src/data/dataset.py) |
+| **Loss imp_rw** (poids `b × γ`) | Pondère gradient par r^power | [`build_importance_weights(power=...)`](../src/utils/losses.py) |
+| **Aug Y-conditional** (poids `c × γ`) | Réplique k_i = r^power copies augmentées | [`YConditionalAugDataset`](../src/data/dataset.py) |
+
+Paramètres v8 :
+- `axis1_strength` (γ) ∈ [0.5, 1.0] : intensité totale de la correction
+- `axis1_sampler_share` (a) ∈ [0, 1]
+- `axis1_loss_share` (b) ∈ [0, 1]
+- `aug_share` (c) = max(0, 1 − a − b) (déduit, normalisé si a+b>1)
+
+Effet combiné sur le gradient pour un sample dans bin b :
+> tirage `r^(γa)` × loss weight `r^(γb)` × aug count `r^(γc)` = `r^(γ × (a+b+c)) = r^γ`
+
+γ=1 → correction complète. γ=0.5 → correction modérée (√r). La répartition (a, b, c)
+détermine **comment** la correction est appliquée (data-side, gradient-side, ou diversity).
+
+### Aug Y-conditional — stochastic Bernoulli rounding
+
+Pour chaque sample `i` dans bin `b(i)`, on calcule l'espérance de copies :
+> `k_float_i = r(b_i)^c`
+
+On tire le nombre réel de copies via Bernoulli rounding :
+- `k_int = floor(k_float)` (copies garanties)
+- Plus 1 copie supplémentaire avec proba `k_float - floor(k_float)`
+
+Cette procédure préserve **exactement** E[k] = k_float (vérifié à 30 seeds dans le test
+de validation). Chaque copie passe par la pipeline d'augmentation standard, donc chaque
+copie est une vue **différente** du même sample base. Combiné, ça produit la diversité
+demandée sans memo des samples rares.
+
+`set_epoch()` re-roll le mapping virtuel à chaque epoch via un `TrainerCallback` dédié,
+évitant que la même sélection de copies se fige sur tout le training.
+
+### Axe 2 — Soft G compensation (cell_rw)
+
+`axis2_power` ∈ [0, 1] contrôle l'intensité de la compensation des cellules (g, b) rares :
+
+> `W[g, b] = (1 / sqrt(count(g, b)))^power`, normalisé à mean=1
+
+- power=0 → pas d'effet (W=1 partout)
+- power=1 → standard 1/sqrt (top v4)
+- power=0.5 → encore plus doux (1/count^0.25)
+
+Cellules rares (F-bin18, M-bin18) reçoivent ~5-8× la médiane à power=1, vs ~20-35× pour
+`cell_within_*` strict 50/50 (v6). Le soft sqrt est précisément ce qui évite la memo
+catastrophique des cellules ultra-rares.
+
+### Reproduction du top v4 via le nouveau design
+
+Top v4 (Sapiens trial 18, score 0.00120) = `(none, cell_joint, mmd)` correspond à :
+- `axis1_strength=1.0, axis1_sampler_share=0, axis1_loss_share=1` → pure imp_rw (loss-side)
+- `axis2_power=1.0` → cell_rw sqrt full
+- `feature_fairness=mmd`
+- `loss_focal_gamma, loss_fairness_lambda` libres
+
+Le sweep v8 inclut cette configuration et toutes ses voisines, en plus de couvrir le
+sweet spot 3-mécaniques (sampler + loss + aug Y-conditional).
+
+### Implémentation
+
+- [src/data/dataset.py](../src/data/dataset.py) — `YConditionalAugDataset`, `create_sampler_weights_for_virtual`
+- [src/utils/losses.py](../src/utils/losses.py) — `build_cell_weights(..., power)` (cell_rw soft)
+- [src/optimize.py](../src/optimize.py) — `_refresh_axis1_powers()` : recompute sampler_power/loss_power/aug_share depuis γ × shares
+- [src/train.py](../src/train.py) — wiring complet, callback `_YCondAugEpochCallback` pour re-roll virtual mapping
+- Pinned : `ema_decay=0`, `loss_type=weighted_mse`, `augmentation_level=medium`, `val_split_strategy=test_pmf`, `eval_importance_reweight=false`

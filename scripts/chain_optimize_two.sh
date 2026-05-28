@@ -10,15 +10,15 @@
 # cluster time alternately — vitb16 and sapiens 0.1b progress in parallel.
 #
 # Usage:
-#   ./scripts/chain_optimize_two.sh                                        # 3 rounds, vitb16+sapiens01b v6 (defaults)
+#   ./scripts/chain_optimize_two.sh                                        # 3 rounds, vitb16+sapiens01b v8 (defaults)
 #   ./scripts/chain_optimize_two.sh 3
-#   ./scripts/chain_optimize_two.sh 4 scripts/optimize_dinov3_vitb16_v6_2x3090.sh scripts/optimize_sapiens2_01b_v6_2x3090.sh
+#   ./scripts/chain_optimize_two.sh 4 scripts/optimize_dinov3_vitb16_v8_2x3090.sh scripts/optimize_sapiens2_01b_v8_2x3090.sh
 
 set -e
 
 N="${1:-3}"
-SCRIPT_A="${2:-scripts/optimize_dinov3_vitb16_v6_2x3090.sh}"
-SCRIPT_B="${3:-scripts/optimize_sapiens2_01b_v6_2x3090.sh}"
+SCRIPT_A="${2:-scripts/optimize_dinov3_vitb16_v8_2x3090.sh}"
+SCRIPT_B="${3:-scripts/optimize_sapiens2_01b_v8_2x3090.sh}"
 
 for s in "$SCRIPT_A" "$SCRIPT_B"; do
     if [ ! -f "$s" ]; then

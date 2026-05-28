@@ -50,18 +50,17 @@ def compute_score(
     abs_err = np.abs(pred - gt)
     sq_err = (pred - gt) ** 2
 
-    # v6.5 rename : on log les nouveaux noms sans suffix `_test_estimated` (devenu un
-    # faux ami avec B' où le reweight est désactivé). Les anciens noms sont gardés en
-    # ALIAS pour compat avec runs v4/v5 + downstream code (predict.py, qualitative_viewer)
-    # qui peut être migré progressivement.
-    out_new = {
-        "challenge_score":  score,
-        "err_F":            err_f,
-        "err_M":            err_m,
-        "err_diff":         abs(err_f - err_m),
-        "mae_pct":          _weighted_mean(abs_err, w_imp) * 100.0,
-        "r2":               _r2_weighted(pred, gt, w_imp),
-        # Variantes "raw" (sans reweight, identique aux principales quand importance_pmf_ratio=None)
+    # v8 — noms canoniques uniquement (pas de legacy alias).
+    # Note : avec B' (val_split=test_pmf + eval_importance_reweight=false), `importance_pmf_ratio`
+    # est None côté training → les variantes principales et `_raw` sont identiques.
+    return {
+        "challenge_score":     score,
+        "err_F":               err_f,
+        "err_M":               err_m,
+        "err_diff":            abs(err_f - err_m),
+        "mae_pct":             _weighted_mean(abs_err, w_imp) * 100.0,
+        "r2":                  _r2_weighted(pred, gt, w_imp),
+        # Variantes "raw" (sans reweight, utile pour diagnostic si eval_importance_reweight=True)
         "challenge_score_raw": score_raw,
         "err_F_raw":           err_f_raw,
         "err_M_raw":           err_m_raw,
@@ -71,24 +70,6 @@ def compute_score(
         "mae_pct_raw":         float(abs_err.mean() * 100.0),
         "r2_raw":              _r2_weighted(pred, gt, None),
     }
-    # Legacy aliases — anciens noms loggés pour ne pas casser le code aval pendant la transition.
-    out_legacy = {
-        "challenge_score_test_estimated": score,
-        "err_F_test_estimated":           err_f,
-        "err_M_test_estimated":           err_m,
-        "err_diff_test_estimated":        abs(err_f - err_m),
-        "challenge_score_val":            score_raw,
-        "err_F_val":                      err_f_raw,
-        "err_M_val":                      err_m_raw,
-        "err_diff_val":                   abs(err_f_raw - err_m_raw),
-        "mse_val":                _weighted_mean(sq_err, None),
-        "mae_val":                _weighted_mean(abs_err, None),
-        "mae_pct_val":            float(abs_err.mean() * 100.0),
-        "mae_pct_test_estimated": _weighted_mean(abs_err, w_imp) * 100.0,
-        "r2_val":                 _r2_weighted(pred, gt, None),
-        "r2_test_estimated":      _r2_weighted(pred, gt, w_imp),
-    }
-    return {**out_new, **out_legacy}
 
 
 def _weighted_mean(values: np.ndarray, weights: Optional[np.ndarray]) -> float:

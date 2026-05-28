@@ -44,14 +44,18 @@ _TRAINING_KEYS = {
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level", "ema_decay", "layer_decay",
     "loss_focal_gamma", "loss_fairness_lambda",
-    "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
-    "loss_cell_within_target",
-    "sampler_power", "loss_power", "correction_alpha", "correction_strength",
+    "sampler_strategy", "loss_importance_reweight", "loss_cell_reweight",
+    # v8 paired-α : sampler_power, loss_power, aug_share (Y-conditional aug) tous calculés
+    # à partir de axis1_strength × (sampler_share, loss_share, aug_share). axis2_power
+    # contrôle l'intensité de cell_rw_soft.
+    "sampler_power", "loss_power", "aug_share",
+    "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+    "axis2_power",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
-    "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
-    "adv_lambda", "mmd_lambda", "mixup_alpha",
+    "loss_mmd_alignment", "mixup_inter_gender",
+    "mmd_lambda", "mixup_alpha",
     "val_split_strategy",
-    "loss_rw_strategy", "feature_fairness",
+    "feature_fairness",
 }
 _MODEL_KEYS = {
     "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
@@ -64,87 +68,58 @@ _MODEL_KEYS = {
     "attn_dropout", "proj_dropout",
 }
 
-# Stratégies d'équilibrage v4 — décomposées sur 3 axes orthogonaux.
-# Optuna sample chaque axe indépendamment → on peut mesurer l'importance par axe
-# via optuna.importance.get_param_importances(study).
-# Voir README §"Stratégies d'équilibrage — 3 axes" pour la matrice complète des 4
-# aspects (déséquilibre F/M, Y, corrélation Y×G, shift train→test) couverts.
-
-_LOSS_RW_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
-    "none":                 {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": None},
-    "imp_rw":               {"loss_importance_reweight": True,  "loss_cell_reweight": False, "loss_cell_within_target": None},
-    "cell_joint":           {"loss_importance_reweight": True,  "loss_cell_reweight": True,  "loss_cell_within_target": None},
-    # NEW v6 — Cell weights qui égalisent F/M intra-bin sans surreprésenter cellules rares.
-    # _within_occ      : préserve P_train sur Y, 50/50 F/M intra-bin
-    # _within_test_pmf : matche P_test sur Y      + 50/50 F/M intra-bin (corrige les 2 axes)
-    "cell_within_occ":      {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": "occ"},
-    "cell_within_test_pmf": {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": "test_pmf"},
-}
-
-# v6.5 — Paired-α design. Chaque correction_strategy active SIMULTANÉMENT un sampler et
-# un loss reweight visant la MÊME cible r(y, g). `correction_alpha` ∈ [0, 1] répartit
-# la force entre les deux mécanismes :
-#   sampler weights ∝ r^α           loss weights ∝ r^(1-α)
-# Effet combiné sur le gradient = r^α · r^(1-α) = r (correction exacte, ∀ α).
-# Cas particuliers : α=1 ⇔ pur sampler (ancien comportement) ; α=0 ⇔ pur loss.
-_CORRECTION_STRATEGY_PAIRS: Dict[str, Tuple[str, str]] = {
-    "none":                   ("none",                    "none"),
-    "test_pmf":               ("test_pmf",                "imp_rw"),
-    "gender_within_occ":      ("gender_within_occ",       "cell_within_occ"),
-    "gender_within_test_pmf": ("gender_within_test_pmf",  "cell_within_test_pmf"),
-}
+# v8 — Design 5 axes, axe 1 à 3 mécaniques (sampler, loss, aug Y-conditional) dont
+# les shares (a, b, c) somment à 1, multipliées par axis1_strength ∈ [0.5, 1.0].
+# Effet combiné sur gradient pour bin b : r(b)^(γ × (a+b+c)) = r(b)^γ.
+#   γ = 1 → correction complète. γ = 0.5 → correction modérée (sqrt).
+# Décomposition lisible :
+#   - sampler_power = γ × sampler_share : intensité du test_pmf sampler
+#   - loss_power = γ × loss_share : intensité du imp_rw loss reweight
+#   - aug_share_eff = γ × aug_share : intensité de l'aug Y-conditional (multiplicateur k_i)
+# Voir docs/fairness.md §"v8 design" pour le détail.
 
 _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
-    "none":         {"loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "dann":         {"loss_adv_debiasing": True,  "loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "mmd":          {"loss_adv_debiasing": False, "loss_mmd_alignment": True,  "mixup_inter_gender": False},
-    "mixup_gender": {"loss_adv_debiasing": False, "loss_mmd_alignment": False, "mixup_inter_gender": True},
+    "none":         {"loss_mmd_alignment": False, "mixup_inter_gender": False},
+    "mmd":          {"loss_mmd_alignment": True,  "mixup_inter_gender": False},
+    "mixup_gender": {"loss_mmd_alignment": False, "mixup_inter_gender": True},
 }
 
 
-def _refresh_correction_powers(cfg: Dict[str, Any]) -> None:
-    """Recompute sampler_power and loss_power from correction_alpha × correction_strength.
+def _refresh_axis1_powers(cfg: Dict[str, Any]) -> None:
+    """Recompute sampler_power, loss_power, aug_share from axis1_strength × shares.
 
-    Combined gradient effect = r^((α + (1-α)) × β) = r^β.
-      * β=1 : full correction (default, v6 behavior with α tuning).
-      * β<1 : partial correction (v7+) — useful pour test des approches moins agressives
-              sans switcher complètement vers correction_strategy=none.
-    Called whenever α or β is set so order of param application n'a pas d'importance.
+    Decomposition v8 :
+      γ = axis1_strength (∈ [0.5, 1.0])
+      a = axis1_sampler_share (∈ [0, 1])
+      b = axis1_loss_share (∈ [0, 1-a])  — Optuna sample seulement a, b ; c déduit
+      c = 1 - a - b
+
+    Effective powers passed to the 3 axis-1 mechanisms :
+      sampler_power = γ × a    (test_pmf sampler intensity)
+      loss_power = γ × b       (imp_rw loss reweight intensity)
+      aug_share = γ × c        (Y-conditional aug multiplier intensity)
+
+    Combined gradient effect on bin b = r(b)^(γ × (a+b+c)) = r(b)^γ → correction
+    partielle/complète selon γ, peu importe la répartition entre les 3 mécaniques.
     """
-    a = float(cfg["training"].get("correction_alpha", 1.0))
-    b = float(cfg["training"].get("correction_strength", 1.0))
-    cfg["training"]["sampler_power"] = a * b
-    cfg["training"]["loss_power"] = (1.0 - a) * b
+    t = cfg["training"]
+    gamma = float(t.get("axis1_strength", 1.0))
+    a = float(t.get("axis1_sampler_share", 1.0))
+    b = float(t.get("axis1_loss_share", 0.0))
+    # Garde-fou : si somme a+b>1 (peut arriver si sampling indépendant), normaliser
+    s = a + b
+    if s > 1.0:
+        a, b = a / s, b / s
+    c = max(0.0, 1.0 - a - b)
+    t["sampler_power"] = gamma * a
+    t["loss_power"] = gamma * b
+    t["aug_share"] = gamma * c
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    if name == "correction_strategy":
-        # v6.5 paired-α : translate the high-level "correction target" to the legacy
-        # (sampler_strategy, loss_rw_strategy) pair. Both are activated simultaneously ;
-        # `correction_alpha` (sampled conditional on correction_strategy != "none")
-        # then sets sampler_power = α × β and loss_power = (1-α) × β where β is
-        # `correction_strength` (default 1.0 = full correction, v6 behavior).
-        s = str(value)
-        if s not in _CORRECTION_STRATEGY_PAIRS:
-            raise ValueError(f"Unknown correction_strategy: {value!r}")
-        sampler_val, loss_val = _CORRECTION_STRATEGY_PAIRS[s]
-        cfg["training"]["sampler_strategy"] = sampler_val
-        for k, v in _LOSS_RW_STRATEGY_MAP[loss_val].items():
-            cfg["training"][k] = v
-        return
-    if name == "correction_alpha":
-        cfg["training"]["correction_alpha"] = float(value)
-        _refresh_correction_powers(cfg)
-        return
-    if name == "correction_strength":
-        cfg["training"]["correction_strength"] = float(value)
-        _refresh_correction_powers(cfg)
-        return
-    if name == "loss_rw_strategy":
-        if str(value) not in _LOSS_RW_STRATEGY_MAP:
-            raise ValueError(f"Unknown loss_rw_strategy: {value!r}")
-        for k, v in _LOSS_RW_STRATEGY_MAP[str(value)].items():
-            cfg["training"][k] = v
+    if name in ("axis1_strength", "axis1_sampler_share", "axis1_loss_share"):
+        cfg["training"][name] = float(value)
+        _refresh_axis1_powers(cfg)
         return
     if name == "feature_fairness":
         if str(value) not in _FEATURE_FAIRNESS_MAP:
@@ -347,17 +322,10 @@ def objective(
         if client and run_id:
             try:
                 run_data = client.get_run(run_id).data.metrics
-                # v6.5 rename : nouveaux noms d'abord, fallback legacy.
-                METRIC_FALLBACKS = [
-                    ("mae_pct",          ["eval_mae_pct", "eval_mae_pct_test_estimated"]),
-                    ("r2",               ["eval_r2", "eval_r2_test_estimated"]),
-                    ("challenge_score_raw", ["eval_challenge_score_raw", "eval_challenge_score_val"]),
-                ]
-                for attr_name, candidates in METRIC_FALLBACKS:
-                    for k in candidates:
-                        if k in run_data:
-                            trial.set_user_attr(attr_name, float(run_data[k]))
-                            break
+                # v8 clean : noms canoniques uniquement (pas de legacy fallback).
+                for k in ["eval_mae_pct", "eval_r2", "eval_challenge_score_raw"]:
+                    if k in run_data:
+                        trial.set_user_attr(k.replace("eval_", ""), float(run_data[k]))
             except Exception as e_pull:
                 print(f"WARNING: could not pull metrics from MLflow to user_attrs: {e_pull}")
     except Exception as e:
@@ -468,15 +436,21 @@ def _validate_v4_search_space(base_config: Dict[str, Any]) -> None:
     parameter and producing meaningless trials.
     """
     ss = base_config.get("optuna", {}).get("search_space", {})
-    if "balancing_strategy" in ss:
-        raise ValueError(
-            "This yaml uses the legacy `balancing_strategy` parameter (v3). "
-            "v4 decomposes this into 3 orthogonal axes :\n"
-            "  - sampler_strategy ∈ {none, gender, occlusion, gender_x_occ, test_pmf}\n"
-            "  - loss_rw_strategy ∈ {none, imp_rw, cell_joint}\n"
-            "  - feature_fairness ∈ {none, dann, mmd, mixup_gender}\n"
-            "Migrate the yaml, or use a v3 branch of the code if you need to reuse it."
-        )
+    LEGACY = {
+        "balancing_strategy": "v3 monolithic axis (use axis1/axis2 in v8)",
+        "sampler_strategy": "v4-v7 (replaced by axis1_sampler_share in v8)",
+        "loss_rw_strategy": "v4-v7 (replaced by axis1_loss_share + axis2_power in v8)",
+        "correction_strategy": "v6.5 paired-α (replaced by axis1_* in v8)",
+        "correction_alpha": "v6.5 (replaced by axis1_sampler/loss_share)",
+        "correction_strength": "v7 (replaced by axis1_strength)",
+    }
+    bad = [k for k in LEGACY if k in ss]
+    if bad:
+        msg = "Legacy search_space params detected (v8 cleanup removes them) :\n"
+        for k in bad:
+            msg += f"  - {k} : {LEGACY[k]}\n"
+        msg += "Migrate the yaml to v8 axis1/axis2 design or use the corresponding branch."
+        raise ValueError(msg)
 
 
 def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_uri: str) -> None:

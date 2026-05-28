@@ -68,8 +68,16 @@ def build_cell_weights(
     train_gender: np.ndarray,
     n_bins: int = 20,
     bin_width: float = 0.025,
+    power: float = 1.0,
 ) -> np.ndarray:
-    edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
+    """Cell weights soft via 1/sqrt(count(g, b)), normalisé à mean=1.
+
+    `power` (v8 paired-α design) :
+      * 1.0  → standard sqrt-soft compensation (legacy v3/v4 cell_rw)
+      * 0.5  → encore plus doux : (1/sqrt(count))^0.5 = 1/count^0.25
+      * 0.0  → tous les poids = 1, équivalent no-correction
+    Permet à TPE de tuner l'intensité de la compensation sans switcher de mécanisme.
+    """
     g = (np.asarray(train_gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(train_targets) / bin_width).astype(int), 0, n_bins - 1)
     counts = np.zeros((2, n_bins), dtype=np.float64)
@@ -77,6 +85,8 @@ def build_cell_weights(
         counts[gi, bi] += 1
     counts = np.maximum(counts, 1.0)
     w = 1.0 / np.sqrt(counts)
+    if power != 1.0:
+        w = np.power(w, power)
     w = w / w.mean()
     return w
 

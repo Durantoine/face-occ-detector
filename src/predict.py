@@ -72,19 +72,22 @@ def _collect_metadata(
             "pretrained":           params.get("model_pretrained"),
             "init_backbone_from":   params.get("model_init_backbone_from"),
             "pooling_type":         params.get("model_pooling_type"),
-            "sampler_strategy":     params.get("train_sampler_strategy"),
-            "loss_type":            params.get("train_loss_type"),
-            "loss_importance_reweight":  params.get("train_loss_importance_reweight"),
-            "loss_gender_reweight":      params.get("train_loss_gender_reweight"),
-            "loss_cell_reweight":        params.get("train_loss_cell_reweight"),
-            "loss_adv_debiasing":        params.get("train_loss_adv_debiasing"),
-            "loss_mmd_alignment":        params.get("train_loss_mmd_alignment"),
-            "mixup_inter_gender":        params.get("train_mixup_inter_gender"),
-            "loss_fairness_lambda":      params.get("train_loss_fairness_lambda"),
-            "learning_rate":             params.get("train_learning_rate"),
-            "num_train_epochs":          params.get("train_num_train_epochs"),
-            "augmentation_level":        params.get("train_augmentation_level"),
-            "layer_decay":               params.get("train_layer_decay"),
+            # v8 axes
+            "axis1_strength":        params.get("train_axis1_strength"),
+            "axis1_sampler_share":   params.get("train_axis1_sampler_share"),
+            "axis1_loss_share":      params.get("train_axis1_loss_share"),
+            "sampler_power":         params.get("train_sampler_power"),
+            "loss_power":            params.get("train_loss_power"),
+            "aug_share":             params.get("train_aug_share"),
+            "axis2_power":           params.get("train_axis2_power"),
+            "feature_fairness":      params.get("train_feature_fairness"),
+            "loss_focal_gamma":      params.get("train_loss_focal_gamma"),
+            "loss_fairness_lambda":  params.get("train_loss_fairness_lambda"),
+            "loss_type":             params.get("train_loss_type"),
+            "learning_rate":         params.get("train_learning_rate"),
+            "num_train_epochs":      params.get("train_num_train_epochs"),
+            "augmentation_level":    params.get("train_augmentation_level"),
+            "layer_decay":           params.get("train_layer_decay"),
         }
     except Exception as e:
         metadata["mlflow_fetch_error"] = str(e)
@@ -109,16 +112,12 @@ def _print_metadata_summary(metadata: Dict[str, Any]) -> None:
     init = key.get("init_backbone_from") or "—"
     print(f"  iBOT init         : {init}")
     print(f"  Pooling           : {key.get('pooling_type')}")
-    print(f"  Sampler           : {key.get('sampler_strategy')}")
-    on = [k for k, v in {
-        "imp_rw":     key.get("loss_importance_reweight"),
-        "gender_rw":  key.get("loss_gender_reweight"),
-        "cell_rw":    key.get("loss_cell_reweight"),
-        "DANN":       key.get("loss_adv_debiasing"),
-        "MMD":        key.get("loss_mmd_alignment"),
-        "mixup_G":    key.get("mixup_inter_gender"),
-    }.items() if str(v).lower() == "true"]
-    print(f"  Balancing flags   : {', '.join(on) if on else 'none'}")
+    # v8 axes
+    print(f"  Axis 1 (Y shift) : strength={key.get('axis1_strength')} "
+          f"(sampler={key.get('sampler_power')}, loss={key.get('loss_power')}, aug={key.get('aug_share')})")
+    print(f"  Axis 2 (cell_rw) : power={key.get('axis2_power')}")
+    print(f"  Feature fairness : {key.get('feature_fairness')}")
+    print(f"  Focal γ          : {key.get('loss_focal_gamma')}")
     print(f"  λ_fairness        : {key.get('loss_fairness_lambda')}")
     print(f"  Post-hoc          : TTA={opts.get('use_tta')}  "
           f"bias={'on' if opts.get('bias_correction') else 'off'}  "

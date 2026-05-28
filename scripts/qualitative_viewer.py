@@ -319,10 +319,11 @@ def _render_trials_comparison() -> None:
         st.error("No MLflow experiments found.")
         return
 
-    # Default selection: v6+ optuna experiments only (exclude legacy v4/v5).
-    # Fallback ladders: optuna-*v6+ → all optuna-* → all experiments.
+    # Default selection: v7 only (current sweep version on this branch).
+    # Fallback ladders: optuna-*-v7 → all optuna-* → all experiments. v6 et antérieurs
+    # restent sélectionnables manuellement via le multiselect.
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v([6-9]|\d{2,})$")
+    _CURRENT_VERSION_RE = re.compile(r"-v7$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:

@@ -1,0 +1,266 @@
+name: sapiens2-01b-3090-v7
+description: |
+  Sapiens2-0.1B (114M) v7 — 2x RTX 3090 24GB (BF16). Miroir dinov3-vitb16 v7 :
+  identique v6 + correction_strength (β ∈ [0.3, 1.0]) pour tester corrections partielles.
+  Cf dinov3-vitb16-3090-v7.yaml pour le rationale détaillé.
+
+model:
+  model_name: sapiens2_0.1b
+  output_dim: 1
+  head_dropout: 0.1
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query
+  # Attention K-query
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  # Multi-head
+  num_heads: 4
+  # GeM
+  gem_p_init: 3.0
+  # Common pool
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  # v6 : val réduit 0.20 → 0.15. Cf dinov3-vitb16-3090-v6.yaml pour le rationale.
+  val_split_ratio: 0.15
+
+training:
+  # 3090 24GB BF16 : BS=32 par GPU × 2 GPUs = 64 effectif (= v4)
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 8
+  learning_rate: 5.0e-05
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_challenge_score
+  # v6 (Option B') : val_split=test_pmf + eval_importance_reweight=false.
+  # Cf dinov3-vitb16-3090-v6.yaml pour le rationale détaillé.
+  val_split_strategy: test_pmf
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: medium
+  loss_type: weighted_mse
+  loss_focal_gamma: 0.0
+  loss_fairness_lambda: 1.0
+  loss_query_diversity_lambda: 0.0
+  # B' : val matche déjà P_test → pas besoin de reweight eval-time. test_estimated == val_direct.
+  eval_importance_reweight: false
+  save_qualitative_k: 10
+  group_dro_alpha: 0.5
+  ema_decay: 0.9995
+  ema_warmup_steps: 200
+  layer_decay: 0.85
+
+optuna:
+  n_trials: 200
+  objective_mode: score
+  rotate_val_seed: true
+  search_space:
+    # `sapiens_default` (poids HF par défaut, analogue de `lvd` côté DINOv3) gardé comme
+    # baseline / contrôle. Les iBOT snapshots viennent du pretrain Sapiens2 sur run b70b78e8.
+    pretrained_source:
+      type: categorical
+      choices:
+        - "sapiens_default"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_50000"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
+    pooling_type:
+      type: categorical
+      # v6 : retiré cls + gem (cf dinov3 v6, data v4 montre que les meilleurs gros modèles
+      # bénéficient de l'attention pooling).
+      choices: [attention_k_query, multihead_attention]
+    # === Stratégies d'équilibrage v6.5 — paired-α design ===
+    # Cf dinov3-vitb16-3090-v6.yaml pour le rationale. correction_alpha ∈ [0, 1] répartit
+    # la correction r(y, g) entre sampler (∝ r^α) et loss (∝ r^(1-α)).
+    correction_strategy:
+      type: categorical
+      choices:
+        - "none"
+        - "test_pmf"
+        - "gender_within_occ"
+        - "gender_within_test_pmf"
+    correction_alpha:
+      type: float
+      low: 0.0
+      high: 1.0
+      conditional_on:
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+        loss_type: weighted_mse
+    # v7 : ajout β = correction_strength. Cf dinov3-vitb16-3090-v7.yaml.
+    correction_strength:
+      type: float
+      low: 0.3
+      high: 1.0
+      conditional_on:
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+        loss_type: weighted_mse
+    feature_fairness:
+      type: categorical
+      # Retiré v6 : dann (avg 0.01246 v4, adversarial training instable). `mmd` couvre
+      # le même objectif (features gender-invariant) plus proprement.
+      choices:
+        - "none"
+        - "mmd"
+        - "mixup_gender"
+    learning_rate:
+      type: float
+      low: 1.0e-05
+      high: 2.0e-04
+      log: true
+    weight_decay:
+      type: float
+      low: 0.0
+      high: 0.3
+    num_train_epochs:
+      type: int
+      low: 8
+      high: 15
+    warmup_ratio:
+      type: float
+      low: 0.05
+      high: 0.2
+    head_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+    augmentation_level:
+      type: categorical
+      choices: [none, light, medium, strong]
+    loss_type:
+      type: categorical
+      choices: [weighted_mse, group_dro]
+    # Only sampled when loss_type=weighted_mse.
+    loss_fairness_lambda:
+      type: float
+      low: 0.0
+      high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    loss_focal_gamma:
+      type: float
+      low: 0.0
+      high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    # Only sampled when loss_type=group_dro.
+    group_dro_alpha:
+      type: float
+      low: 0.1
+      high: 1.0
+      conditional_on:
+        loss_type: group_dro
+    layer_decay:
+      type: float
+      # v6 : high resserré 1.0 → 0.95 (cf dinov3 v6, LLRD off jamais dans le top v4).
+      low: 0.65
+      high: 0.95
+    backbone_drop_path_rate:
+      type: float
+      low: 0.0
+      high: 0.2
+
+    # === Conditional on pooling_type ∈ {attention_k_query, multihead_attention} ===
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+
+    # === Conditional on pooling_type == attention_k_query ===
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_focal_init:
+      type: float
+      # v6 : low 0.05 → 0.08 (cf dinov3 v6, zone <0.08 jamais utilisée).
+      low: 0.08
+      high: 0.3
+      log: true
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_diffuse_init:
+      type: float
+      # v6 : high 3.0 → 4.0 (cf dinov3 v6, borne haute mord).
+      low: 1.0
+      high: 4.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      # v6 : high 4 → 6 (cf dinov3 v6, top trials collent à n_diffuse=4).
+      low: 1
+      high: 6
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      # v6 : high 3 → 4 (cf dinov3 v6, borne haute mord).
+      low: 0
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # === Conditional on pooling_type == multihead_attention ===
+    num_heads:
+      type: categorical
+      # Divisors common to Sapiens2-0.1B (768) / 0.4B (1024) / 0.8B (1280) / 1B (1536) / 5B (2432).
+      choices: [2, 4, 8, 16]
+      conditional_on:
+        pooling_type: multihead_attention
+
+    # === Conditional on feature_fairness (axe 3) — mmd_lambda / mixup_alpha ===
+    # adv_lambda retiré avec dann (cf feature_fairness choices).
+    mmd_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: mmd
+    mixup_alpha:
+      type: float
+      # v6 : high 0.5 → 1.0 log (cf dinov3 v6, borne mord ; log explore mix faibles α≈0.1).
+      low: 0.1
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: mixup_gender

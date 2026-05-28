@@ -1,0 +1,302 @@
+name: dinov3-vitb16-3090-v7
+description: |
+  DINOv3 ViT-B/16 (86M) v7 — 2x RTX 3090 24GB (BF16). Identique v6 + ajout du paramètre
+  `correction_strength` (β ∈ [0.3, 1.0]) qui contrôle la STRENGTH totale du rééquilibrage :
+    sampler ∝ r^(α × β)   loss ∝ r^((1-α) × β)   →   effet combiné = r^β
+  β=1 : correction complète (v6). β<1 : correction plus douce (test d'approches moins
+  agressives sans switcher complètement vers correction_strategy=none).
+  À lancer APRÈS v6 pour comparer empiriquement si l'optimum est à β=1 ou en deçà.
+
+model:
+  model_name: dinov3_vitb16
+  output_dim: 1
+  head_dropout: 0.1
+  projection_size: null
+  output_activation: sigmoid
+  # `pretrained` est forcé à True par Optuna via le mapping pretrained_source
+  # (cf. _apply_trial_param) — pas la peine de le dupliquer ici.
+  pooling_type: attention_k_query
+  # Attention K-query
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  # Multi-head
+  num_heads: 4
+  # GeM
+  gem_p_init: 3.0
+  # Common pool
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+  # init_backbone_from RETIRÉ : pretrained_source dans le search_space avec 3 choix
+  # (encoder_100000 / encoder final / lvd). Data v4 dit encoder_100000 > encoder final
+  # → on laisse Optuna trancher proprement plutôt que de pinner sur l'un.
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  # v6 : val réduit de 0.20 → 0.15 (val_target=15k → ~14.9k réel : floor + sous-couverture
+  # high-Y bins 16-18). Train passe de 80.3k → 85.1k (+6%), perte stabilité estimateur ~15%
+  # (1/√N) — acceptable car val matche déjà P_test (plus stable que la v4 reweightée).
+  val_split_ratio: 0.15
+
+training:
+  # 3090 24GB BF16 : BS=32 par GPU × 2 GPUs = 64 effectif (= v4)
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 8
+  learning_rate: 5.0e-05
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_challenge_score
+  # v6 (Option B') : val_split=test_pmf + eval_importance_reweight=false.
+  # Rationale : on rebalance le training pour matcher P_test ; pour rester cohérent
+  # end-to-end, on évalue aussi sur une distribution test-like. Conséquences :
+  #   - P_val ≈ P_test (resampling) → val_direct ≡ estimateur test (pas de reweight)
+  #   - eval_challenge_score_val == eval_challenge_score_test_estimated
+  #   - plus de variance amplifiée sur bins haut-Y (le reweight ×10 disparaît)
+  #   - val plus petit (~15k vs 20k) mais estimateur plus stable
+  # Note : ça retire MOINS de high-Y du training (test a peu de high-Y → val en prend
+  # peu → le training en garde plus, contrairement à ce que disait l'ancien commentaire).
+  val_split_strategy: test_pmf
+  greater_is_better: false
+  # Ampere → BF16
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: medium
+  loss_type: weighted_mse
+  loss_focal_gamma: 0.0
+  loss_fairness_lambda: 1.0
+  loss_query_diversity_lambda: 0.0
+  # B' : val matche déjà P_test → pas besoin de reweight eval-time. test_estimated == val_direct.
+  eval_importance_reweight: false
+  save_qualitative_k: 10
+  group_dro_alpha: 0.5
+  ema_decay: 0.9995
+  ema_warmup_steps: 200
+  layer_decay: 0.85
+
+optuna:
+  n_trials: 200
+  objective_mode: score
+  rotate_val_seed: true
+  search_space:
+    # v6 : pretrained_source remis dans le search_space.
+    # Re-mesure data v4 (34 trials actifs) : mean best_score par source —
+    #   encoder        : 0.00232 (21 trials, top 1 = 0.00151)  ← MEILLEUR
+    #   encoder_50000  : 0.00211 (4 trials, mean équiv. mais petit n)
+    #   encoder_100000 : 0.00467 (5 trials, décevant — contredit l'hypothèse initiale)
+    #   lvd            : 0.00595 (4 trials, worst en v4)
+    # `lvd` (= poids Meta DINOv3 LVD par défaut, analogue de sapiens_default) gardé
+    # comme baseline / contrôle symétrique avec sapiens v6.
+    pretrained_source:
+      type: categorical
+      choices:
+        - "lvd"                                                          # Meta default (baseline)
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder_50000"    # early snapshot
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder_100000"   # mid (décevant v4)
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder"          # final, best v4
+    pooling_type:
+      type: categorical
+      # v6 : retiré cls + gem (data v4 montre que les meilleurs Sapiens / gros modèles
+      # bénéficient de l'attention pooling, et c'est là que la perf finale se joue).
+      choices: [attention_k_query, multihead_attention]
+    # === Stratégies d'équilibrage v6.5 — paired-α design ===
+    # `correction_strategy` choisit la CIBLE (P_train→P_test sur Y, ou 50/50 F/M intra-bin,
+    # ou les deux). `correction_alpha` ∈ [0, 1] partage la correction entre sampler et loss :
+    #   sampler weights ∝ r^α, loss weights ∝ r^(1-α) → effet combiné = r exact ∀α.
+    #   α=1 : pur sampler (legacy v6). α=0 : pur loss. α=0.5 : hybride √-strength.
+    # Voir docs/fairness.md §"Paired-α design".
+    correction_strategy:
+      type: categorical
+      choices:
+        - "none"                       # aucune correction
+        - "test_pmf"                   # Y → P_test
+        - "gender_within_occ"          # 50/50 F/M intra-bin, Y reste P_train
+        - "gender_within_test_pmf"     # 50/50 F/M intra-bin + Y → P_test
+    correction_alpha:
+      type: float
+      low: 0.0
+      high: 1.0
+      # α conditionnel : pas samplé quand correction=none (irrelevant).
+      conditional_on:
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+        loss_type: weighted_mse
+    # v7 : ajout β = correction_strength ∈ [0.3, 1.0]. Effet combiné sur le gradient = r^β.
+    # Range [0.3, 1.0] choisi pour éviter l'overlap avec correction_strategy=none (qui est
+    # déjà la "no correction" propre). Bornes :
+    #   β=1.0 → correction complète (= v6)
+    #   β=0.5 → √r, correction à mi-puissance (utile si full overfit sur high-Y rares)
+    #   β=0.3 → r^0.3, correction très douce (limite haute du "presque none")
+    correction_strength:
+      type: float
+      low: 0.3
+      high: 1.0
+      conditional_on:
+        correction_strategy: ["test_pmf", "gender_within_occ", "gender_within_test_pmf"]
+        loss_type: weighted_mse
+    feature_fairness:
+      type: categorical
+      # Retiré v6 : dann (avg 0.01246 v4, très instable — adversarial training fragile).
+      # `mmd` couvre le même objectif (features gender-invariant) plus proprement.
+      choices:
+        - "none"
+        - "mmd"
+        - "mixup_gender"
+    learning_rate:
+      type: float
+      low: 1.0e-05
+      high: 2.0e-04
+      log: true
+    weight_decay:
+      type: float
+      low: 0.0
+      high: 0.3
+    num_train_epochs:
+      type: int
+      low: 8
+      high: 15
+    warmup_ratio:
+      type: float
+      low: 0.05
+      high: 0.2
+    head_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+    augmentation_level:
+      type: categorical
+      choices: [none, light, medium, strong]
+    loss_type:
+      type: categorical
+      choices: [weighted_mse, group_dro]
+    # Only sampled when loss_type=weighted_mse (group_dro ignores fairness_lambda + focal_gamma).
+    loss_fairness_lambda:
+      type: float
+      low: 0.0
+      high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    loss_focal_gamma:
+      type: float
+      low: 0.0
+      high: 2.0
+      conditional_on:
+        loss_type: weighted_mse
+    # Only sampled when loss_type=group_dro.
+    group_dro_alpha:
+      type: float
+      low: 0.1
+      high: 1.0
+      conditional_on:
+        loss_type: group_dro
+    layer_decay:
+      type: float
+      # v6 : high resserré 1.0 → 0.95 (data v4 : aucun trial du top 20 n'utilise LLRD off ;
+      # top values ∈ [0.65, 0.87]). Économise des trials sur la zone morte.
+      low: 0.65
+      high: 0.95
+    backbone_drop_path_rate:
+      type: float
+      low: 0.0
+      high: 0.2
+
+    # === Conditional on pooling_type ∈ {attention_k_query, multihead_attention} ===
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+
+    # === Conditional on pooling_type == attention_k_query ===
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_focal_init:
+      type: float
+      # v6 : low 0.05 → 0.08 (data v4 : top 10 ∈ [0.09, 0.17], zone < 0.08 jamais explorée).
+      low: 0.08
+      high: 0.3
+      log: true
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_diffuse_init:
+      type: float
+      # v6 : high 3.0 → 4.0 (data v4 : top trials à 2.89, 2.76, 2.74, borne haute mord).
+      low: 1.0
+      high: 4.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      # v6 : high 4 → 6 (data v4 : 6/20 top trials collent à n_diffuse=4, dont le top 1).
+      low: 1
+      high: 6
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      # v6 : high 3 → 4 (data v4 : top 1, 2, 5 utilisent n_free=3, borne haute mord).
+      low: 0
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # === Conditional on pooling_type == multihead_attention ===
+    num_heads:
+      type: categorical
+      # Divisors common to ViT-B (768) / ViT-L (1024) / ViT-H+ (1280) — keeps search space
+      # portable across backbones without arch-specific yaml duplication.
+      choices: [2, 4, 8, 16]
+      conditional_on:
+        pooling_type: multihead_attention
+
+    # === Conditional on feature_fairness (axe 3) — mmd_lambda / mixup_alpha ===
+    # adv_lambda retiré avec dann (cf feature_fairness choices).
+    mmd_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: mmd
+    mixup_alpha:
+      type: float
+      # v6 : high 0.5 → 1.0 log (data v4 : top mixup trials à 0.491, 0.484, borne mord ;
+      # log permet d'explorer aussi mix faibles α≈0.1 qui dominent le top 1-2).
+      low: 0.1
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: mixup_gender

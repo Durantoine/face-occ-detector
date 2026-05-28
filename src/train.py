@@ -561,6 +561,18 @@ def train(
         )
         print(f"Sampler 'test_pmf': resampling train to match P_test marginal on Y. "
               f"{train_sampler.num_samples} samples/epoch")
+    elif sampler_strategy in ("gender_within_occ", "gender_within_test_pmf") and "gender" in train_data.columns:
+        from src.data.dataset import create_gender_within_bin_sampler
+        from src.utils.losses import _TEST_PMF_0025
+        target = _TEST_PMF_0025 if sampler_strategy == "gender_within_test_pmf" else None
+        train_sampler = create_gender_within_bin_sampler(
+            y=train_data[label_col_for_sampler].astype(float).values,
+            gender=train_data["gender"].astype(float).values,
+            target_pmf=target,
+        )
+        print(f"Sampler '{sampler_strategy}': 50/50 F/M intra-bin, Y target = "
+              f"{'P_test' if target is not None else 'P_train'}. "
+              f"{train_sampler.num_samples} samples/epoch")
     elif sampler_strategy != "none" and "gender" in train_data.columns:
         keys = make_sampler_keys(train_data, strategy=sampler_strategy, n_buckets=10)
         n_groups = int(keys.max()) + 1
@@ -603,20 +615,40 @@ def train(
         print(f"Gender reweight: F={gender_class_weights[0]:.3f}, M={gender_class_weights[1]:.3f} (mean=1.0)")
 
     cell_class_weights = None
-    if train_cfg.get("loss_cell_reweight", False) and loss_type == "weighted_mse" and "gender" in train_data.columns:
+    loss_cell_within_target = train_cfg.get("loss_cell_within_target", None)  # None | "occ" | "test_pmf"
+    if loss_type == "weighted_mse" and "gender" in train_data.columns:
         label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-        cell_class_weights = build_cell_weights(
-            train_data[label_col].astype(float).values,
-            train_data["gender"].astype(float).values,
-        )
-        ml_log_params(client, run_id, {
-            "loss_cell_reweight": True,
-            "loss_cell_weights_max": float(cell_class_weights.max()),
-            "loss_cell_weights_min": float(cell_class_weights.min()),
-            "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
-            "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
-        })
-        print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
+        if train_cfg.get("loss_cell_reweight", False):
+            cell_class_weights = build_cell_weights(
+                train_data[label_col].astype(float).values,
+                train_data["gender"].astype(float).values,
+            )
+            ml_log_params(client, run_id, {
+                "loss_cell_reweight": True,
+                "loss_cell_weights_max": float(cell_class_weights.max()),
+                "loss_cell_weights_min": float(cell_class_weights.min()),
+                "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
+                "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
+            })
+            print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
+        elif loss_cell_within_target in ("occ", "test_pmf"):
+            from src.utils.losses import build_cell_weights_within, _TEST_PMF_0025
+            target = _TEST_PMF_0025 if loss_cell_within_target == "test_pmf" else None
+            cell_class_weights = build_cell_weights_within(
+                train_targets=train_data[label_col].astype(float).values,
+                train_gender=train_data["gender"].astype(float).values,
+                target_pmf=target,
+            )
+            ml_log_params(client, run_id, {
+                "loss_cell_within_target": loss_cell_within_target,
+                "loss_cell_weights_max": float(cell_class_weights.max()),
+                "loss_cell_weights_F_bin0": float(cell_class_weights[0, 0]),
+                "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
+                "loss_cell_weights_F_bin13": float(cell_class_weights[0, 13]),
+                "loss_cell_weights_M_bin13": float(cell_class_weights[1, 13]),
+            })
+            print(f"Cell within bin reweight (target={loss_cell_within_target}, P_target × 0.5 / count): "
+                  f"max={cell_class_weights.max():.3f}  | bin13: F={cell_class_weights[0,13]:.3f} M={cell_class_weights[1,13]:.3f}")
 
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())

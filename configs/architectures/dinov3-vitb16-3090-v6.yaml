@@ -1,12 +1,12 @@
-name: dinov3-vitb16-p100-v5
+name: dinov3-vitb16-3090-v6
 description: |
-  DINOv3 ViT-B/16 (86M) v5 — same 3-axis search space as v4 but :
-  - val_split_strategy = test_pmf → P_val ≈ P_test, donc le quantile matching post-train est
-    enfin meaningfully évaluable (gated dans train.py: désormais skipped si stratified_yg).
-  - sampler_strategy=test_pmf retiré du search space (P_val matche déjà test, le sampler de
-    training peut rester sur les autres axes sans double correction).
-  - 2x P100 16GB (FP16). Backbone iBOT le plus avancé pin via init_backbone_from.
-  Étude Optuna distincte de v4 → ne pollue pas le sweep en cours sur 3090.
+  DINOv3 ViT-B/16 (86M) v6 — 2x RTX 3090 24GB (BF16). Stratified val (préserve diversité
+  high-Y au training) + 4 nouvelles stratégies d'équilibrage qui ciblent err_M >> err_F :
+    Sampler   : + gender_within_occ, gender_within_test_pmf
+    Loss rw   : + cell_within_occ, cell_within_test_pmf
+  Toutes égalisent F/M intra-bin sans surreprésenter les cellules rares (≠ gender_x_occ).
+  Quantile matching post-train désactivé sur stratified_yg (Option B : metric trompeuse).
+  Backbone iBOT pin sur encoder final via init_backbone_from.
 
 model:
   model_name: dinov3_vitb16
@@ -33,8 +33,9 @@ model:
   pool_attn_dropout: 0.0
   pool_proj_dropout: 0.0
   backbone_drop_path_rate: 0.0
-  # Pretrain pinné sur le snapshot iBOT le plus avancé (v4 run, encoder final).
-  init_backbone_from: runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder
+  # init_backbone_from RETIRÉ : pretrained_source dans le search_space avec 3 choix
+  # (encoder_100000 / encoder final / lvd). Data v4 dit encoder_100000 > encoder final
+  # → on laisse Optuna trancher proprement plutôt que de pinner sur l'un.
 
 data:
   image_col: filename
@@ -45,10 +46,10 @@ data:
   extra_train_csv: null
 
 training:
-  # P100 16GB FP16 : BS=16 par GPU × 2 GPUs × grad_accum=2 = 64 effectif (= v4 sur 3090)
-  per_device_train_batch_size: 16
-  per_device_eval_batch_size: 32
-  gradient_accumulation_steps: 2
+  # 3090 24GB BF16 : BS=32 par GPU × 2 GPUs = 64 effectif (= v4)
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
   num_train_epochs: 8
   learning_rate: 5.0e-05
   weight_decay: 0.05
@@ -59,13 +60,15 @@ training:
   seed: 42
   logging_steps: 50
   metric_for_best_model: eval_challenge_score_test_estimated
-  # v5 : val resamplé pour P_val = P_test → quantile matching meaningful, _test_estimated
-  # se confond avec _val. Variance estimateur réduite, lecture intuitive.
-  val_split_strategy: test_pmf
+  # v6 : stratified_yg pour préserver la diversité high-Y au training (test_pmf vidait les
+  # bins 14-19, là où err_M sur high-Y M est précisément le problème à corriger).
+  # _test_estimated reste l'estimateur principal (importance reweighting eval-time, biaisé
+  # variance amplifiée sur bins haut-Y mais non-biaisé en espérance).
+  val_split_strategy: stratified_yg
   greater_is_better: false
-  # Pascal n'a PAS de BF16 → FP16 only
-  bf16: false
-  fp16: true
+  # Ampere → BF16
+  bf16: true
+  fp16: false
   gradient_checkpointing: false
   augmentation_level: medium
   loss_type: weighted_mse
@@ -84,12 +87,26 @@ optuna:
   objective_mode: score
   rotate_val_seed: true
   search_space:
-    # v5 : pretrained_source PAS dans le search_space (pinné en static sur l'iBOT final
-    # via model.init_backbone_from). Économise le budget Optuna pour les vraies questions
-    # (équilibrage, pooling, hparams) maintenant que le pretrain "le plus avancé" est connu.
+    # v6 : pretrained_source remis dans le search_space.
+    # Re-mesure data v4 (34 trials actifs) : mean best_score par source —
+    #   encoder        : 0.00232 (21 trials, top 1 = 0.00151)  ← MEILLEUR
+    #   encoder_50000  : 0.00211 (4 trials, mean équiv. mais petit n)
+    #   encoder_100000 : 0.00467 (5 trials, décevant — contredit l'hypothèse initiale)
+    #   lvd            : 0.00595 (4 trials, worst en v4)
+    # `lvd` (= poids Meta DINOv3 LVD par défaut, analogue de sapiens_default) gardé
+    # comme baseline / contrôle symétrique avec sapiens v6.
+    pretrained_source:
+      type: categorical
+      choices:
+        - "lvd"                                                          # Meta default (baseline)
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder_50000"    # early snapshot
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder_100000"   # mid (décevant v4)
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder"          # final, best v4
     pooling_type:
       type: categorical
-      choices: [cls, gem, attention_k_query, multihead_attention]
+      # v6 : retiré cls + gem (data v4 montre que les meilleurs Sapiens / gros modèles
+      # bénéficient de l'attention pooling, et c'est là que la perf finale se joue).
+      choices: [attention_k_query, multihead_attention]
     # === Stratégies d'équilibrage v4 — décomposées sur 3 axes orthogonaux ===
     # Voir README §"Stratégies d'équilibrage — 3 axes" pour la matrice complète.
     #   Axe 1 (sampler)       : équilibrage data-level
@@ -97,31 +114,38 @@ optuna:
     #   Axe 3 (feature fair)  : invariance genre au niveau features
     sampler_strategy:
       type: categorical
-      # NOTE v5 : test_pmf retiré ici. P_val matche déjà P_test au niveau split, donc on garde
-      # les samplers data-level pour leur équilibrage F/M ou Y, pas pour le shift train→test.
+      # v6 : 4 choix orthogonaux couvrant (Y∈{none, P_test} × G∈{none, 50/50 intra-bin}).
+      # Retiré v6 :
+      #   - gender (no-op équivalent à `none` côté gradient cf docs/fairness.md §3)
+      #   - gender_x_occ (overfit, avg 0.01345 v4)
+      #   - occlusion (quantile flatten = approx grossière du shift, redondant avec test_pmf
+      #     qui calibre exactement P_test, et ne corrige pas G — doublement inférieur)
       choices:
         - "none"
-        - "gender"
-        - "occlusion"
-        - "gender_x_occ"
+        - "test_pmf"                   # data : Y → P_test, no G correction
+        - "gender_within_occ"          # NEW : 50/50 F/M intra-bin, Y reste P_train
+        - "gender_within_test_pmf"     # NEW : 50/50 F/M intra-bin + Y → P_test
     loss_rw_strategy:
       type: categorical
+      # v6 : cell_joint retiré (avg 0.00639 sur v4, jamais dans le top). Remplacé
+      # conceptuellement par cell_within_* qui corrige correctement la rareté intra-bin.
       choices:
         - "none"
         - "imp_rw"
-        - "cell_joint"
-      # Quand sampler=test_pmf, le loss reweight n'a pas de sens (test_pmf corrige
-      # déjà le shift Y au niveau data) → forcer le default "none" (skip sampling).
-      # Quand loss_type=group_dro, le reweight n'est pas appliqué non plus (group_dro
-      # n'utilise pas importance_reweight / cell_reweight) → skip aussi.
+        - "cell_within_occ"            # NEW : 50/50 F/M intra-bin via loss, Y reste P_train
+        - "cell_within_test_pmf"       # NEW : 50/50 F/M intra-bin via loss + Y → P_test
+      # Évite la double correction : seul `sampler=none` laisse le loss libre d'appliquer
+      # ses propres corrections. Si le sampler corrige déjà Y et/ou G, le loss reste à `none`.
+      # Quand loss_type=group_dro, le reweight n'est pas appliqué non plus.
       conditional_on:
-        sampler_strategy: ["none", "gender", "occlusion", "gender_x_occ"]
+        sampler_strategy: ["none"]
         loss_type: weighted_mse
     feature_fairness:
       type: categorical
+      # Retiré v6 : dann (avg 0.01246 v4, très instable — adversarial training fragile).
+      # `mmd` couvre le même objectif (features gender-invariant) plus proprement.
       choices:
         - "none"
-        - "dann"
         - "mmd"
         - "mixup_gender"
     learning_rate:
@@ -173,8 +197,10 @@ optuna:
         loss_type: group_dro
     layer_decay:
       type: float
+      # v6 : high resserré 1.0 → 0.95 (data v4 : aucun trial du top 20 n'utilise LLRD off ;
+      # top values ∈ [0.65, 0.87]). Économise des trials sur la zone morte.
       low: 0.65
-      high: 1.0
+      high: 0.95
     backbone_drop_path_rate:
       type: float
       low: 0.0
@@ -203,15 +229,17 @@ optuna:
         pooling_type: attention_k_query
     tau_focal_init:
       type: float
-      low: 0.05
+      # v6 : low 0.05 → 0.08 (data v4 : top 10 ∈ [0.09, 0.17], zone < 0.08 jamais explorée).
+      low: 0.08
       high: 0.3
       log: true
       conditional_on:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
+      # v6 : high 3.0 → 4.0 (data v4 : top trials à 2.89, 2.76, 2.74, borne haute mord).
       low: 1.0
-      high: 3.0
+      high: 4.0
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
@@ -222,14 +250,16 @@ optuna:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
+      # v6 : high 4 → 6 (data v4 : 6/20 top trials collent à n_diffuse=4, dont le top 1).
       low: 1
-      high: 4
+      high: 6
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
+      # v6 : high 3 → 4 (data v4 : top 1, 2, 5 utilisent n_free=3, borne haute mord).
       low: 0
-      high: 3
+      high: 4
       conditional_on:
         pooling_type: attention_k_query
 
@@ -242,14 +272,8 @@ optuna:
       conditional_on:
         pooling_type: multihead_attention
 
-    # === Conditional on feature_fairness (axe 3) — adv_lambda/mmd_lambda/mixup_alpha ===
-    adv_lambda:
-      type: float
-      low: 0.01
-      high: 1.0
-      log: true
-      conditional_on:
-        feature_fairness: dann
+    # === Conditional on feature_fairness (axe 3) — mmd_lambda / mixup_alpha ===
+    # adv_lambda retiré avec dann (cf feature_fairness choices).
     mmd_lambda:
       type: float
       low: 0.01
@@ -259,7 +283,10 @@ optuna:
         feature_fairness: mmd
     mixup_alpha:
       type: float
+      # v6 : high 0.5 → 1.0 log (data v4 : top mixup trials à 0.491, 0.484, borne mord ;
+      # log permet d'explorer aussi mix faibles α≈0.1 qui dominent le top 1-2).
       low: 0.1
-      high: 0.5
+      high: 1.0
+      log: true
       conditional_on:
         feature_fairness: mixup_gender

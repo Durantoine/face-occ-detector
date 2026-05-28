@@ -56,6 +56,6 @@ ${TORCHRUN} --nproc_per_node=2 --master_port=$MASTER_PORT src/pretrain_ibot.py
 echo "================================================================================"
 echo "COMPLETE - Finished: $(date)"
 echo "  ▶ Get the MLflow encoder run_id from results/pretrain_sapiens2_01b/mlflow_run_id.txt"
-echo "  ▶ Fill it into configs/architectures/sapiens2-01b-3090-v4.yaml"
-echo "    (search_space.pretrained_source.choices, replace __FILL_SAPIENS_01B_IBOT_RUN_ID__)"
+echo "  ▶ Fill it into configs/architectures/sapiens2-01b-3090-v6.yaml"
+echo "    (search_space.pretrained_source.choices, replace the existing run_id)"
 echo "================================================================================"

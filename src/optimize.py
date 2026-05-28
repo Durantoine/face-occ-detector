@@ -45,6 +45,7 @@ _TRAINING_KEYS = {
     "augmentation_level", "ema_decay", "layer_decay",
     "loss_focal_gamma", "loss_fairness_lambda", "use_gender_balanced_sampler",
     "sampler_strategy", "loss_importance_reweight", "loss_gender_reweight", "loss_cell_reweight",
+    "loss_cell_within_target",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
     "loss_adv_debiasing", "loss_mmd_alignment", "mixup_inter_gender",
     "adv_lambda", "mmd_lambda", "mixup_alpha",
@@ -69,9 +70,14 @@ _MODEL_KEYS = {
 # aspects (déséquilibre F/M, Y, corrélation Y×G, shift train→test) couverts.
 
 _LOSS_RW_STRATEGY_MAP: Dict[str, Dict[str, Any]] = {
-    "none":       {"loss_importance_reweight": False, "loss_cell_reweight": False},
-    "imp_rw":     {"loss_importance_reweight": True,  "loss_cell_reweight": False},
-    "cell_joint": {"loss_importance_reweight": True,  "loss_cell_reweight": True},
+    "none":                 {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": None},
+    "imp_rw":               {"loss_importance_reweight": True,  "loss_cell_reweight": False, "loss_cell_within_target": None},
+    "cell_joint":           {"loss_importance_reweight": True,  "loss_cell_reweight": True,  "loss_cell_within_target": None},
+    # NEW v6 — Cell weights qui égalisent F/M intra-bin sans surreprésenter cellules rares.
+    # _within_occ      : préserve P_train sur Y, 50/50 F/M intra-bin
+    # _within_test_pmf : matche P_test sur Y      + 50/50 F/M intra-bin (corrige les 2 axes)
+    "cell_within_occ":      {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": "occ"},
+    "cell_within_test_pmf": {"loss_importance_reweight": False, "loss_cell_reweight": False, "loss_cell_within_target": "test_pmf"},
 }
 
 _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {

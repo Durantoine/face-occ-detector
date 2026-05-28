@@ -88,34 +88,27 @@ inv viewer             # http://localhost:8501  (qualitative_viewer.py — best/
 
 ## Cluster workflow (SLURM, 2× RTX 3090)
 
-Les 4 yamls v4 (`dinov3-vitb16/-vith16plus`, `sapiens2-01b/-08b`) intègrent `pretrained_source` en search_space Optuna → le baseline (`lvd` / `sapiens_default`) et les pretrains iBOT custom (`encoder_25000` / `encoder_50000` / `encoder_75000` / `encoder`) sont comparés dans le **même sweep**.
+Les 2 yamls v6 (`dinov3-vitb16-3090-v6`, `sapiens2-01b-3090-v6`) intègrent `pretrained_source` en search_space Optuna → le baseline (`lvd` / `sapiens_default`) et les pretrains iBOT custom (`encoder_50000` / `encoder_100000` / `encoder`) sont comparés dans le **même sweep**.
 
 ```bash
-# 1) Pretrain iBOT custom — les 2 gros modèles en INTERLEAVED (A1, B1, A2, B2, ...)
-#    pour qu'ils progressent en parallèle au lieu de séquentiel sur un nœud unique.
-#    8 links de 30h chacun → MAX_STEPS=100k @224 (stop-early possible via snapshots).
-./scripts/chain_pretrain_two.sh 8 \
-    scripts/pretrain_ibot_vith16plus_2x3090.sh \
-    scripts/pretrain_ibot_sapiens2_08b_2x3090.sh
-# Les petits modèles (01b, vitb16) tournent à 112 sur MS1MV3-WDS :
+# 1) Pretrain iBOT custom — les petits modèles tournent à 112 sur MS1MV3-WDS :
 sbatch scripts/pretrain_ibot_vitb16_2x3090.sh
 sbatch scripts/pretrain_ibot_sapiens2_01b_2x3090.sh
 
-# 2) Récupérer les run_ids et remplir les yaml v4
-cat results/pretrain_vith16plus/mlflow_run_id.txt           # → ID pour __FILL_VITH16PLUS_IBOT_RUN_ID__
-cat results/pretrain_sapiens2_08b/mlflow_run_id.txt         # → ID pour __FILL_SAPIENS_08B_IBOT_RUN_ID__
-cat results/pretrain_vitb16/mlflow_run_id.txt               # → ID pour __FILL_VITB16_IBOT_RUN_ID__
-cat results/pretrain_sapiens2_01b/mlflow_run_id.txt         # → ID pour __FILL_SAPIENS_01B_IBOT_RUN_ID__
-# sed -i s/__FILL_*_RUN_ID__/<id>/ configs/architectures/<yaml>
+# 2) Récupérer les run_ids et remplir les yaml v6
+cat results/pretrain_vitb16/mlflow_run_id.txt               # → ID pour vitb16 v6
+cat results/pretrain_sapiens2_01b/mlflow_run_id.txt         # → ID pour sapiens 01b v6
+# Remplacer manuellement le run_id dans `search_space.pretrained_source.choices`
+# du yaml d'architecture correspondant.
 
-# 3) Lancer l'Optuna v4 — il samplera automatiquement entre baseline et iBOT snapshots
-sbatch scripts/optimize_dinov3_vith16plus_v4_2x3090.sh
-sbatch scripts/optimize_sapiens2_08b_v4_2x3090.sh
+# 3) Lancer l'Optuna v6 — il samplera automatiquement entre baseline et iBOT snapshots
+sbatch scripts/optimize_dinov3_vitb16_v6_2x3090.sh
+sbatch scripts/optimize_sapiens2_01b_v6_2x3090.sh
 
-# 4) Pour les petits modèles, chainer 3 jobs SLURM en INTERLEAVED
+# 4) Pour chainer 3 jobs SLURM en INTERLEAVED (les deux archs progressent en parallèle)
 ./scripts/chain_optimize_two.sh 3 \
-    scripts/optimize_dinov3_vitb16_v4_2x3090.sh \
-    scripts/optimize_sapiens2_01b_v4_2x3090.sh
+    scripts/optimize_dinov3_vitb16_v6_2x3090.sh \
+    scripts/optimize_sapiens2_01b_v6_2x3090.sh
 ```
 
 `train.py` charge l'encodeur sélectionné par Optuna et logue `model_init_backbone_from`, `init_backbone_pretrain_run_id`, tous les `pretrain_*` params, et un tag `pretrain_run_id` pour la traçabilité complète.
@@ -149,7 +142,8 @@ Stop avec `scancel <job-ids>` (le script les imprime).
 
 - **`main`** — version v1 : `FaceOccRegressor` avec pooling simple (cls / mean / max / attention single-query) + tête MIL auxiliaire
 - **`v2-attention-pooling`** — version v2 : K=6 multi-head attention pooling à températures mixtes (focal/diffuse/free), apprises ; tête MIL retirée ; 3 niveaux de régularization
-- **`v4-rigorous-balancing`** (current) — v2 archi + équilibrage 3 axes orthogonaux + `pretrained_source` en search_space + quantile matching post-inférence
+- **`v4-rigorous-balancing`** — v2 archi + équilibrage 3 axes orthogonaux + `pretrained_source` en search_space + quantile matching post-inférence
+- **`v6`** (current) — v4 + nouvelles stratégies `gender_within_*` / `cell_within_*` (50/50 F/M intra-bin sans sur-poids des cellules rares) + bornes Optuna resserrées sur signal data v4 ; `dann` retiré (instable) ; v5 retiré (config p100 obsolète)
 
 ---
 
@@ -157,7 +151,7 @@ Stop avec `scancel <job-ids>` (le script les imprime).
 
 ```
 src/                  train, optimize, ensemble, pretrain_ibot, predict, evaluate + models/data/utils
-configs/architectures/v4 yamls (dino vit-b/h+, sapiens2 0.1b/0.8b)
+configs/architectures/v6 yamls (dinov3 vitb16, sapiens2 0.1b)
 scripts/              SLURM sbatch files + chain helpers + UI launchers
 docs/                 documentation théorique (fairness, metrics, archi, etc.)
 data/                 raw (train.csv, test_students.csv, databases) + pretrain/ + extra/

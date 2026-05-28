@@ -52,7 +52,7 @@ Implementation: `src/pretrain_ibot.py:DinoV3IBoT` (~100 LOC core).
 
 Run with `sbatch scripts/pretrain_ibot_vith16plus_2x3090.sh` (ou `./scripts/chain_pretrain.sh 8 scripts/pretrain_ibot_vith16plus_2x3090.sh` pour chainer 8 links de 30h, target 100k steps @224 = ~1.2 epoch MS1MV3). Output : run MLflow avec snapshots `encoder_25000/50000/75000/encoder` (final à 100k) — stop-early possible via scancel.
 
-**v4 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v4.yaml`). Optuna comparera alors automatiquement :
+**v6 workflow** — pour utiliser ce pretrain custom dans Optuna, fill l'URI dans la choice `ibot:runs:/<run_id>/encoder` du search space `pretrained_source` du yaml d'architecture (par exemple `configs/architectures/dinov3-vitb16-3090-v6.yaml`). Optuna comparera alors automatiquement :
 - `"lvd"` (ou `"sapiens_default"` pour Sapiens2) : poids de base Meta
 - `"ibot:runs:/<run_id>/encoder"` : notre pretrain custom par-dessus
 

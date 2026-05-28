@@ -53,6 +53,64 @@ def create_test_pmf_sampler(
     return WeightedRandomSampler(weights=weights.tolist(), num_samples=n, replacement=True)
 
 
+def create_gender_within_bin_sampler(
+    y: np.ndarray,
+    gender: np.ndarray,
+    target_pmf: Optional[np.ndarray] = None,
+    bin_width: float = 0.025,
+    n_bins: int = 20,
+    clip: float = 10.0,
+) -> WeightedRandomSampler:
+    """Sampler égalisant F/M *intra-bin* tout en suivant `target_pmf` sur Y.
+
+    Pour chaque sample i de bin b(i) et genre g(i) ∈ {0=F, 1=M} :
+        weight_i = 0.5 × target_pmf[b(i)] / count(g(i), b(i))
+
+    Effet :
+      * Distribution Y effective ≈ target_pmf
+      * Intra-bin : 50/50 F vs M
+      * Cellules très rares (high-Y M) reçoivent un poids élevé mais bornées par `clip`
+        pour éviter l'overfit catastrophique sur 7 images.
+
+    Si `target_pmf=None` → utilise la PMF empirique de Y dans le train (préserve P_train).
+    Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
+    """
+    y_arr = np.asarray(y, dtype=np.float64).flatten()
+    g_arr = (np.asarray(gender, dtype=np.float64).flatten() >= 0.5).astype(int)
+    bin_idx = np.clip((y_arr / bin_width).astype(int), 0, n_bins - 1)
+
+    if target_pmf is None:
+        bin_counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
+        target = bin_counts / max(bin_counts.sum(), 1)
+    else:
+        target = np.asarray(target_pmf, dtype=np.float64).flatten()
+        if len(target) != n_bins:
+            raise ValueError(f"target_pmf has len {len(target)}, expected {n_bins}")
+        target = target / max(target.sum(), 1e-9)
+
+    cell_counts = np.zeros((2, n_bins), dtype=np.float64)
+    for g, b in zip(g_arr, bin_idx):
+        cell_counts[g, b] += 1
+
+    n_total = len(y_arr)
+    weights = np.zeros(n_total, dtype=np.float64)
+    for i in range(n_total):
+        g, b = g_arr[i], bin_idx[i]
+        cnt = cell_counts[g, b]
+        if cnt > 0:
+            weights[i] = 0.5 * target[b] / cnt
+
+    # Clip pour éviter qu'un sample dans une cellule ultra-rare ait un poids absurde
+    pos = weights[weights > 0]
+    if len(pos) > 0:
+        median_w = float(np.median(pos))
+        weights = np.clip(weights, 0.0, median_w * clip)
+
+    if weights.sum() == 0:
+        weights = np.ones(n_total) / n_total
+    return WeightedRandomSampler(weights=weights.tolist(), num_samples=n_total, replacement=True)
+
+
 def _normalize_df(
     df: pd.DataFrame,
     image_col: str,

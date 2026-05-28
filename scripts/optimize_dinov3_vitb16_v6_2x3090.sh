@@ -1,17 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-vith16plus-v4-optuna
+#SBATCH --job-name=face-occ-vitb16-v6-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=80G
+#SBATCH --mem=60G
 #SBATCH --time=30:00:00
 
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - DINOv3 ViT-H+/16 (600M) v4 - le plus gros DINO sur 2x RTX 3090"
+echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v6 - cibler err_M >> err_F (2x 3090, BF16)"
+echo "  ▶ sampler:  + gender_within_occ, gender_within_test_pmf"
+echo "  ▶ loss_rw:  + cell_within_occ,   cell_within_test_pmf"
+echo "  ▶ val_split = stratified_yg (préserve high-Y train pour learning)"
+echo "  ▶ pretrained pinned : iBOT encoder final (run c1e1ba1a...)"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Started: $(date)"
@@ -30,11 +34,11 @@ uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
 
-export FACE_OCC_ARCH=dinov3-vith16plus-3090-v4
+export FACE_OCC_ARCH=dinov3-vitb16-3090-v6
 
 mkdir -p scripts/logs
 

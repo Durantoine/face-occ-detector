@@ -85,11 +85,22 @@ def _get_client(tracking_uri: str):
     return MlflowClient(tracking_uri=tracking_uri)
 
 
+_EXP_FILTER = os.environ.get("FACE_OCC_EXP_FILTER", "").strip()
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _list_experiments(tracking_uri: str) -> List[Tuple[str, str]]:
+    """List MLflow experiments, optionally filtered by FACE_OCC_EXP_FILTER env var.
+
+    Filter is a substring match against experiment name (e.g. "v6" → only `*-v6` experiments).
+    Empty filter → all experiments shown.
+    """
     client = _get_client(tracking_uri)
     exps = client.search_experiments()
-    return sorted([(e.experiment_id, e.name) for e in exps], key=lambda x: x[1])
+    pairs = [(e.experiment_id, e.name) for e in exps]
+    if _EXP_FILTER:
+        pairs = [(eid, name) for eid, name in pairs if _EXP_FILTER in name]
+    return sorted(pairs, key=lambda x: x[1])
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -123,6 +134,17 @@ def _list_runs(tracking_uri: str, experiment_id: str) -> List[Dict[str, Any]]:
             "r2_test_estimated":              pick("eval_r2_test_estimated"),
         })
     return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_run_params(tracking_uri: str, run_id: str) -> Dict[str, str]:
+    """Return all MLflow params logged for the given run (config dump)."""
+    client = _get_client(tracking_uri)
+    try:
+        return dict(client.get_run(run_id).data.params)
+    except Exception as e:
+        st.warning(f"Could not fetch params for {run_id}: {e}")
+        return {}
 
 
 @st.cache_data(ttl=300, show_spinner="Downloading artifacts...")
@@ -339,10 +361,18 @@ def _render_trials_comparison() -> None:
         if view_mode == "Inter-trial (convergence)":
             show_best_so_far = st.checkbox("Show best-so-far envelope", value=True)
             hide_inf = st.checkbox("Hide failed trials (score=inf/NaN)", value=True)
+            sort_order = st.radio(
+                "Sort tables",
+                ["Best → worst", "Worst → best"],
+                index=0,
+                help="Affecte les tables 'Top trials per experiment' et 'All trials'. "
+                     "'Worst → best' permet d'identifier les choix d'hyperparams qui ratent.",
+            )
             normalize_x = False
         else:
             show_best_so_far = False
             hide_inf = False
+            sort_order = "Best → worst"
             normalize_x = st.checkbox(
                 "Normalize x-axis to % progress",
                 value=True,
@@ -372,6 +402,7 @@ def _render_trials_comparison() -> None:
         _render_inter_trial(
             selected_labels, exp_label_to_id, selected_metric,
             max_per_exp, log_y, show_running_only, show_best_so_far, hide_inf,
+            sort_descending=(sort_order == "Worst → best"),
         )
     else:
         _render_intra_trial(
@@ -401,6 +432,7 @@ def _render_inter_trial(
     show_running_only: bool,
     show_best_so_far: bool,
     hide_inf: bool,
+    sort_descending: bool = False,
 ) -> None:
     import math
     import plotly.graph_objects as go
@@ -492,7 +524,10 @@ def _render_inter_trial(
     st.plotly_chart(fig, use_container_width=True)
 
     if rows_for_table:
-        df = pd.DataFrame(rows_for_table).sort_values("final_value", na_position="last")
+        # sort_descending=True → worst first (highest value first for minimize-metrics).
+        df = pd.DataFrame(rows_for_table).sort_values(
+            "final_value", ascending=not sort_descending, na_position="last",
+        )
 
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value",
@@ -530,9 +565,57 @@ def _render_inter_trial(
                 key=f"topn_per_exp_{fam_key}",
             )
             top_per_exp = fam_df.groupby("experiment", as_index=False).head(top_n)
-            top_per_exp = top_per_exp.sort_values(["experiment", "final_value"], na_position="last")
+            top_per_exp = top_per_exp.sort_values(
+                ["experiment", "final_value"],
+                ascending=[True, not sort_descending],
+                na_position="last",
+            )
             cols = [c for c in focus_cols if c in top_per_exp.columns]
             st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)
+
+        # Per-axis breakdown : pour chaque param catégoriel du search space, agrégation
+        # (best/avg/n_trials) par valeur. Permet de voir d'un coup d'œil quels choix
+        # gagnent et lesquels sont à pruner.
+        AXIS_PARAMS = [
+            "pretrained_source", "pooling_type", "sampler_strategy",
+            "loss_rw_strategy", "feature_fairness", "loss_type",
+        ]
+        for fam_label, fam_key in families:
+            fam_df = df[df["_family"] == fam_key]
+            if fam_df.empty:
+                continue
+            st.markdown(f"### Per-axis breakdown — {fam_label}")
+            st.caption(
+                f"Pour chaque axe Optuna catégoriel : best score, avg score, n trials par choix. "
+                f"Trier par best ASC → identifier les choix gagnants et ceux à pruner."
+            )
+            rows: List[Dict[str, Any]] = []
+            for axis in AXIS_PARAMS:
+                if axis not in fam_df.columns:
+                    continue
+                axis_df = fam_df[["final_value", axis]].dropna(subset=[axis])
+                axis_df = axis_df[axis_df["final_value"].notna()]
+                if axis_df.empty:
+                    continue
+                for choice, sub in axis_df.groupby(axis):
+                    if len(sub) == 0:
+                        continue
+                    rows.append({
+                        "axis": axis,
+                        "choice": str(choice),
+                        "n": int(len(sub)),
+                        "best": float(sub["final_value"].min()),
+                        "avg": float(sub["final_value"].mean()),
+                        "med": float(sub["final_value"].median()),
+                    })
+            if not rows:
+                st.info("No categorical params available for this family.")
+                continue
+            ax_df = pd.DataFrame(rows).sort_values(["axis", "best"]).reset_index(drop=True)
+            # Cast for clean display
+            for col in ("best", "avg", "med"):
+                ax_df[col] = ax_df[col].round(5)
+            st.dataframe(ax_df, use_container_width=True, hide_index=True)
 
         st.markdown("### All trials")
         st.dataframe(df.drop(columns=["_family"]), use_container_width=True, hide_index=True)
@@ -732,8 +815,9 @@ qual_path = Path(qual_dir)
 worst_df = _load_csv(qual_path / "worst", "worst")
 best_df = _load_csv(qual_path / "best", "best")
 
-tab_diag, tab_worst, tab_best, tab_csv = st.tabs([
+tab_diag, tab_params, tab_worst, tab_best, tab_csv = st.tabs([
     "📊 Diagnostic charts",
+    "⚙️ Training params",
     "Worst-K (highest weighted_err)",
     "Best-K (lowest weighted_err)",
     "Raw CSVs",
@@ -756,6 +840,51 @@ with tab_diag:
             "Aucun diagnostic chart pour ce run.\n\n"
             "Les charts sont produits par `_save_diagnostic_charts()` dans `train.py` lors du dump qualitatif "
             "(activé via `save_qualitative_k > 0`). Run nécessaire avec le code v3+."
+        )
+
+with tab_params:
+    params = _fetch_run_params(TRACKING_URI, selected_run["run_id"])
+    if not params:
+        st.info("No params logged for this run.")
+    else:
+        # Highlight panel : Optuna search-space params (the things that actually vary).
+        OPTUNA_KEYS = [
+            "pretrained_source", "pooling_type",
+            "sampler_strategy", "loss_rw_strategy", "feature_fairness",
+            "loss_type", "loss_fairness_lambda", "loss_focal_gamma",
+            "group_dro_alpha", "loss_query_diversity_lambda",
+            "mmd_lambda", "mixup_alpha", "adv_lambda",
+            "learning_rate", "weight_decay", "num_train_epochs",
+            "warmup_ratio", "head_dropout", "layer_decay",
+            "backbone_drop_path_rate", "augmentation_level",
+            "pool_attn_dropout", "pool_proj_dropout",
+            "tau_focal_init", "tau_diffuse_init",
+            "n_focal", "n_diffuse", "n_free", "num_heads",
+        ]
+        highlight = [(k, params[k]) for k in OPTUNA_KEYS if k in params]
+        if highlight:
+            st.markdown("### Optuna search-space (params samplés)")
+            st.dataframe(
+                pd.DataFrame(highlight, columns=["param", "value"]),
+                use_container_width=True, hide_index=True,
+            )
+
+        # Full dump — toutes les params (train_*, pretrain_*, model_*, data_*, etc.)
+        # avec filtre texte pour naviguer.
+        st.markdown("### All params (full MLflow dump)")
+        query = st.text_input(
+            "Filter params (substring match on key or value)",
+            value="",
+            placeholder="e.g. train_, pretrain_lr, sapiens, ...",
+        )
+        items = sorted(params.items())
+        if query:
+            q = query.lower()
+            items = [(k, v) for k, v in items if q in k.lower() or q in str(v).lower()]
+        st.caption(f"{len(items)} / {len(params)} params shown")
+        st.dataframe(
+            pd.DataFrame(items, columns=["param", "value"]),
+            use_container_width=True, hide_index=True, height=600,
         )
 
 with tab_worst:

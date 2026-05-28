@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -57,6 +57,61 @@ def build_cell_weights(
     counts = np.maximum(counts, 1.0)
     w = 1.0 / np.sqrt(counts)
     w = w / w.mean()
+    return w
+
+
+def build_cell_weights_within(
+    train_targets: np.ndarray,
+    train_gender: np.ndarray,
+    target_pmf: Optional[np.ndarray] = None,
+    n_bins: int = 20,
+    bin_width: float = 0.025,
+    clip: float = 10.0,
+) -> np.ndarray:
+    """Cell weights qui égalisent F/M *intra-bin* tout en suivant `target_pmf` sur Y.
+
+    Pour chaque cellule (g, b) :
+        W[g, b] = 0.5 × target_pmf[b] / count(g, b)
+    Normalisé à moyenne pondérée = 1 (i.e. mean weighted by occurrence dans le train).
+
+    Effet équivalent en espérance à `create_gender_within_bin_sampler`, mais appliqué
+    au niveau loss (chaque sample vu 1× par epoch, weighted dans la loss).
+
+    Si `target_pmf=None` → utilise P_train(Y) empirique (préserve la distribution Y).
+    Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
+    """
+    g = (np.asarray(train_gender) >= 0.5).astype(int)
+    b = np.clip((np.asarray(train_targets) / bin_width).astype(int), 0, n_bins - 1)
+    counts = np.zeros((2, n_bins), dtype=np.float64)
+    for gi, bi in zip(g, b):
+        counts[gi, bi] += 1
+
+    if target_pmf is None:
+        bin_counts = counts.sum(axis=0)
+        target = bin_counts / max(bin_counts.sum(), 1)
+    else:
+        target = np.asarray(target_pmf, dtype=np.float64).flatten()
+        if len(target) != n_bins:
+            raise ValueError(f"target_pmf has len {len(target)}, expected {n_bins}")
+        target = target / max(target.sum(), 1e-9)
+
+    safe_counts = np.maximum(counts, 1.0)
+    w = 0.5 * target[None, :] / safe_counts   # broadcast → shape (2, n_bins)
+    w[counts == 0] = 0.0
+
+    # Normalize so that the average weight across the actual train distribution = 1.
+    # i.e. Σ_{g,b} count(g,b) × W[g,b] / N = 1
+    total_count = counts.sum()
+    mean_w = float((counts * w).sum() / max(total_count, 1))
+    if mean_w > 0:
+        w = w / mean_w
+
+    # Clip cellules ultra-rares pour éviter gradient bruité
+    nonzero = w[w > 0]
+    if len(nonzero) > 0:
+        median_w = float(np.median(nonzero))
+        w = np.clip(w, 0.0, median_w * clip)
+
     return w
 
 

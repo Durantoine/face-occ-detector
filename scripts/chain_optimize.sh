@@ -4,18 +4,17 @@
 # (sqlite:///optuna.db). Counts trials toward the same `n_trials` budget set in the yaml.
 #
 # Usage:
-#   ./scripts/chain_optimize.sh                                              # 3 links of vitb16 (default)
-#   ./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v4_2x3090.sh
-#   ./scripts/chain_optimize.sh 5 scripts/optimize_dinov3_vith16plus_v4_2x3090.sh
+#   ./scripts/chain_optimize.sh                                              # 3 links of vitb16 v6 (default)
+#   ./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v6_2x3090.sh
 #
-# Recommended for the small configs (vitb16, sapiens 0.1b) with n_trials=130 :
-#   ./scripts/chain_optimize.sh 3 scripts/optimize_dinov3_vitb16_v4_2x3090.sh
-#   ./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v4_2x3090.sh
+# Recommended for the small configs (vitb16, sapiens 0.1b) with n_trials=200 :
+#   ./scripts/chain_optimize.sh 3 scripts/optimize_dinov3_vitb16_v6_2x3090.sh
+#   ./scripts/chain_optimize.sh 3 scripts/optimize_sapiens2_01b_v6_2x3090.sh
 
 set -e
 
 N="${1:-3}"
-SCRIPT="${2:-scripts/optimize_dinov3_vitb16_v4_2x3090.sh}"
+SCRIPT="${2:-scripts/optimize_dinov3_vitb16_v6_2x3090.sh}"
 
 if [ ! -f "$SCRIPT" ]; then
     echo "ERROR: script not found: $SCRIPT"

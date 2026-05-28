@@ -52,7 +52,7 @@ Everything below is YAML-controllable and **defaults to a safe value**.
 
 | Key | Default | Notes |
 |---|---|---|
-| `optuna.n_trials` | 200 (v4) | budget |
+| `optuna.n_trials` | 200 (v6) | budget |
 | `optuna.objective_mode` | score | score / loss / pareto(score, err_diff) |
 | `optuna.rotate_val_seed` | true | val_seed per trial → robustness |
 
@@ -133,14 +133,12 @@ src/
     ├── config.py / environment.py / mlflow_utils.py / distributed.py
 
 configs/architectures/
-├── dinov3-vitb16-3090-v4.yaml             ViT-B/16  — 2× 3090 (v4 — 3 axes orthogonaux)
-├── dinov3-vith16plus-3090-v4.yaml         ViT-H+/16 — 2× 3090 (le plus gros DINO en DDP)
-├── sapiens2-01b-3090-v4.yaml              Sapiens2-0.1B — 2× 3090
-└── sapiens2-08b-3090-v4.yaml              Sapiens2-0.8B — 2× 3090 (le plus gros Sapiens2 en DDP)
+├── dinov3-vitb16-3090-v6.yaml             ViT-B/16  — 2× 3090 (v6 — 3 axes orthogonaux + within strategies)
+└── sapiens2-01b-3090-v6.yaml              Sapiens2-0.1B — 2× 3090 (v6, miroir dinov3 vitb16)
 
 scripts/
 ├── pretrain_ibot_*_2x3090.sh                                   # SLURM iBOT pretrain
-├── optimize_*_v4_2x3090.sh                                     # SLURM Optuna HPO v4
+├── optimize_*_v6_2x3090.sh                                     # SLURM Optuna HPO v6
 ├── chain_pretrain.sh / chain_pretrain_two.sh                   # chain N successive sbatch runs
 ├── chain_optimize.sh / chain_optimize_two.sh                   # chain N Optuna sweeps
 ├── download_dinov3_weights.sh                                  # URL reference for larger DINOv3 weights

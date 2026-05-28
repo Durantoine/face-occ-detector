@@ -69,5 +69,5 @@ ${TORCHRUN} --nproc_per_node=2 --master_port=$MASTER_PORT src/pretrain_ibot.py
 echo "================================================================================"
 echo "COMPLETE - Finished: $(date)"
 echo "  ▶ run_id: cat results/pretrain_sapiens2_08b/mlflow_run_id.txt"
-echo "  ▶ Fill into configs/architectures/sapiens2-08b-3090-v4.yaml (pretrained_source)"
+echo "  ▶ Fill into your sapiens2-08b arch yaml (pretrained_source) — no 08b v6 yaml yet on this branch"
 echo "================================================================================"

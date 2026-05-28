@@ -4,6 +4,17 @@
 > Pour la cohérence des combos dans le search space Optuna et le câblage code, voir aussi
 > [audits_and_roadmap.md](audits_and_roadmap.md) §"Audit v4".
 
+> **Mise à jour v6** — Le search space Optuna v6 modifie les 3 axes (justifications basées
+> sur les data v4, 34 trials actifs) :
+> - **Axe 1 (sampler)** : retirés `gender` (no-op cf §3), `gender_x_occ` (avg 0.01345),
+>   `occlusion` (redondant avec `test_pmf`). Ajoutés `gender_within_occ` et
+>   `gender_within_test_pmf` (50/50 F/M intra-bin, sans sur-poids des cellules rares).
+> - **Axe 2 (loss_rw)** : retiré `cell_joint` (avg 0.00639). Ajoutés `cell_within_occ` et
+>   `cell_within_test_pmf` (équivalent loss-side des nouveaux samplers).
+> - **Axe 3 (feature_fairness)** : retiré `dann` (avg 0.01246, adversarial training instable).
+>   Reste `none`, `mmd`, `mixup_gender`. La stratégie G (DANN) ci-dessous reste documentée
+>   à titre de référence théorique, mais le code DANN n'est plus activé par le sweep v6.
+
 ---
 
 ## Fairness — the central problem
@@ -115,61 +126,77 @@ Optuna sample **3 axes indépendamment** par trial, ce qui permet de mesurer l'*
 
 #### Axe 1 — `sampler_strategy` (équilibrage data-level)
 
-Quel sampler de batch utiliser ?
+Quel sampler de batch utiliser ? Le tableau liste **toutes les valeurs historiques** (v3/v4),
+avec un drapeau pour celles activées dans le search space v6.
 
-| Valeur | Effet | Aspects adressés |
-|---|---|---|
-| `none` | DataLoader standard (séquentiel/random) | aucun |
-| `gender` | WeightedRandomSampler équilibrant F/M | **(1)** |
-| `occlusion` | WeightedRandomSampler équilibrant les buckets Y | **(2)** |
-| `gender_x_occ` | WeightedRandomSampler équilibrant les cellules (G × Y_bucket) | **(1), (2), (3)** — joint Y×G par data |
-| `test_pmf` | WeightedRandomSampler avec poids `P_test(Y)/P_train(Y)` | **(2), (4)** — distribution Y matche test directement |
+| Valeur | v6 | Effet | Aspects adressés |
+|---|---|---|---|
+| `none` | ✅ | DataLoader standard (séquentiel/random) | aucun |
+| `gender` | ❌ | WeightedRandomSampler équilibrant F/M *(retiré v6 : no-op cf §3)* | **(1)** |
+| `occlusion` | ❌ | WeightedRandomSampler équilibrant les buckets Y *(retiré v6 : redondant avec `test_pmf`)* | **(2)** |
+| `gender_x_occ` | ❌ | WeightedRandomSampler par cellule (G × Y_bucket) *(retiré v6 : sur-poids des cellules rares, avg score v4 = 0.01345)* | **(1), (2), (3)** |
+| `test_pmf` | ✅ | WeightedRandomSampler avec poids `P_test(Y)/P_train(Y)` | **(2), (4)** |
+| `gender_within_occ` | ✅ *(v6)* | 50/50 F/M intra-bin Y, Y reste P_train | **(1), (3)** — décorrélation Y×G sans changer P(Y) |
+| `gender_within_test_pmf` | ✅ *(v6)* | 50/50 F/M intra-bin Y + Y → P_test | **(1), (3), (4)** — décorrélation Y×G + shift Y |
+
+> Les samplers `gender_within_*` égalisent F/M *à l'intérieur de chaque bin Y* sans surreprésenter
+> les cellules rares (≠ `gender_x_occ` qui tirait les bins haut-Y 100×/epoch → memorization).
 
 #### Axe 2 — `loss_rw_strategy` (reweighting dans la loss)
 
-| Valeur | Effet | Aspects adressés |
-|---|---|---|
-| `none` | Loss standard (juste `w_i = 1/30 + y_i`) | aucun |
-| `imp_rw` | `w_i *= P_test(bin_y)/P_train(bin_y)` — importance reweighting | **(4)** — shift Y dans la loss |
-| `cell_joint` | imp_rw + cell_rw : `w_i *= P_test(bin_y)/P_train(bin_y) * 1/√count(G, bin_y)` | **(3), (4)** — hard decorrelation Y×G dans la loss |
+| Valeur | v6 | Effet | Aspects adressés |
+|---|---|---|---|
+| `none` | ✅ | Loss standard (juste `w_i = 1/30 + y_i`) | aucun |
+| `imp_rw` | ✅ | `w_i *= P_test(bin_y)/P_train(bin_y)` | **(4)** |
+| `cell_joint` | ❌ | imp_rw + `1/√count(G, bin_y)` *(retiré v6 : avg score v4 = 0.00639)* | **(3), (4)** |
+| `cell_within_occ` | ✅ *(v6)* | `W[g, b] = 0.5 × P_train[b] / count(g, b)` — 50/50 F/M intra-bin via loss | **(1), (3)** |
+| `cell_within_test_pmf` | ✅ *(v6)* | `W[g, b] = 0.5 × P_test[b] / count(g, b)` — 50/50 F/M intra-bin + Y → P_test | **(1), (3), (4)** |
 
-> Conditional : quand `sampler_strategy=test_pmf`, l'axe 2 est forcé à `none` (test_pmf corrige déjà le shift Y au niveau data, double-correction inutile). Quand `loss_type=group_dro`, l'axe 2 est aussi forcé à `none` (group_dro n'utilise pas de reweights).
+> Les `cell_within_*` sont l'équivalent **loss-side** des nouveaux samplers `gender_within_*` :
+> chaque sample est vu 1×/epoch (pas de re-tirage des rares) mais reçoit un poids qui égalise
+> les contributions F/M intra-bin. Voir [`build_cell_weights_within`](../src/utils/losses.py).
+
+> Conditional : quand `sampler_strategy ≠ none`, l'axe 2 est forcé à `none` (évite la double
+> correction). Quand `loss_type=group_dro`, l'axe 2 est aussi forcé à `none`.
 
 #### Axe 3 — `feature_fairness` (invariance genre au niveau features)
 
-| Valeur | Effet | Aspects adressés |
-|---|---|---|
-| `none` | Aucune contrainte sur les features | aucun |
-| `dann` | Discriminateur G + Gradient Reversal Layer → features gender-invariantes | **(1), (3)** — hard decorrelation G par adversarial |
-| `mmd` | Pénalité MMD entre features F et M | **(1), (3)** — hard decorrelation G par alignement statistique |
-| `mixup_gender` | Mixup inter-genre dans le même bucket Y | **(1), (3)** — hard decorrelation G par data aug |
+| Valeur | v6 | Effet | Aspects adressés |
+|---|---|---|---|
+| `none` | ✅ | Aucune contrainte sur les features | aucun |
+| `dann` | ❌ | Discriminateur G + GRL *(retiré v6 : avg score v4 = 0.01246, adversarial instable)* | **(1), (3)** |
+| `mmd` | ✅ | Pénalité MMD entre features F et M | **(1), (3)** |
+| `mixup_gender` | ✅ | Mixup inter-genre dans le même bucket Y | **(1), (3)** |
 
 ### Combos couverts
 
-5 × 3 × 4 = **60 combinaisons théoriques**. Après filtrage du conditional (`test_pmf` force `loss_rw=none`, `group_dro` force `loss_rw=none`) → **~52 combinaisons valides** par loss_type.
+**v6** : 4 (sampler) × 4 (loss_rw) × 3 (feature_fairness) = **48 combinaisons théoriques**.
+Filtrage du conditional (loss_rw forcé à `none` quand sampler ≠ `none`, et idem pour
+`loss_type=group_dro`) → **~22 combinaisons valides** par loss_type.
 
-Quelques combos notables :
+Quelques combos notables (v6) :
 
-| Combo (sampler, loss_rw, feature_fairness) | Équivalent à l'ancienne stratégie | Sens |
-|---|---|---|
-| `(none, none, none)` | `no_balancing` | Baseline pur — aucune correction |
-| `(none, imp_rw, none)` | `imp_only` | Juste correction shift Y |
-| `(none, cell_joint, none)` | `cell_joint_yg` | Hard decorrelation loss-based Y×G |
-| `(gender_x_occ, imp_rw, none)` | (combo nouveau) | Sampler joint + correction shift |
-| `(none, imp_rw, dann)` | `dann` | Hard decorrelation features adversarial |
-| `(none, imp_rw, mmd)` | `mmd` | Hard decorrelation features géométrique |
-| `(none, imp_rw, mixup_gender)` | `mixup_gender` | Hard decorrelation par data aug |
-| `(test_pmf, none, none)` | `test_pmf_sampler` | Compensation shift Y au niveau sampler |
-| `(test_pmf, none, dann)` | (combo nouveau) | Sampler aligned + adversarial G |
-| `(test_pmf, none, mmd)` | (combo nouveau) | Sampler aligned + MMD G |
+| Combo (sampler, loss_rw, feature_fairness) | Sens |
+|---|---|
+| `(none, none, none)` | Baseline pur — aucune correction |
+| `(none, imp_rw, none)` | Juste correction shift Y |
+| `(none, cell_within_occ, none)` | 50/50 F/M intra-bin loss-side, Y reste P_train |
+| `(none, cell_within_test_pmf, none)` | 50/50 F/M intra-bin loss-side + Y → P_test |
+| `(none, imp_rw, mmd)` | Correction shift Y + alignement géométrique des features F/M |
+| `(none, imp_rw, mixup_gender)` | Correction shift Y + décorrélation par data aug |
+| `(test_pmf, none, none)` | Compensation shift Y au niveau sampler |
+| `(test_pmf, none, mmd)` | Sampler aligned + MMD G |
+| `(gender_within_occ, none, mixup_gender)` | Sampler 50/50 intra-bin + mixup G |
+| `(gender_within_test_pmf, none, mmd)` | Triple correction : Y→P_test + 50/50 F/M + MMD |
 
-→ Le 3-axes inclut **toutes les anciennes stratégies** comme points particuliers + **ouvre des combinaisons nouvelles** qui n'existaient pas (par exemple `test_pmf + dann`).
+→ Le 3-axes v6 couvre les corrections **(1) F/M, (2) Y, (3) Y×G, (4) shift train→test**
+de manière orthogonale, sans cellules rares sur-représentées.
 
 ### Budget Optuna et trial par combo
 
 ```
-200 trials sur 52 combos valides = ~4 trials/combo en moyenne (TPE concentre vite sur les bons)
-→ ~10-20 trials sur les 5-10 meilleurs combos, ~1-2 sur les mauvais
+200 trials sur ~22 combos valides = ~9 trials/combo en moyenne (TPE concentre vite sur les bons)
+→ ~20-30 trials sur les 3-5 meilleurs combos, ~1-2 sur les mauvais
 ```
 
 Suffisant pour identifier le gagnant et mesurer l'importance par axe.
@@ -291,7 +318,7 @@ Loss totale : $\mathcal{L}_{\text{tot}} = \mathcal{L}_{\text{task}} + \lambda_{\
 
 ```yaml
 feature_fairness: mixup_gender
-mixup_alpha: ε ∈ [0.1, 0.5]
+mixup_alpha: ε ∈ [0.1, 1.0]   # v6 : étendu de [0.1, 0.5] (log scale)
 ```
 
 Pour chaque sample F dans le batch, on cherche un partenaire M dans le bucket Y le plus proche, puis on interpole.
@@ -299,7 +326,7 @@ Pour chaque sample F dans le batch, on cherche un partenaire M dans le bucket Y 
 **Étape 1 — pairing** :
 $$\text{partner}(i) = \arg\min_{j \in m_{\text{idx}}} |b(y_i) - b(y_j)|.$$
 
-**Étape 2 — sampling du poids de mix** : $\lambda_i \sim \text{Beta}(\alpha, \alpha)$. Pour $\alpha \in [0.1, 0.5]$, la distribution Beta est U-shaped → $\lambda$ concentré près de 0 ou 1.
+**Étape 2 — sampling du poids de mix** : $\lambda_i \sim \text{Beta}(\alpha, \alpha)$. Pour $\alpha < 1$, la distribution Beta est U-shaped → $\lambda$ concentré près de 0 ou 1 (mix faible). Pour $\alpha = 1$, uniforme. Pour $\alpha > 1$ (hors range), centré sur 0.5.
 
 **Étape 3 — interpolation** :
 $$\tilde x_i = \lambda_i \cdot x_i^F + (1 - \lambda_i) \cdot x_{\text{partner}(i)}^M, \qquad \tilde y_i = \lambda_i \cdot y_i^F + (1 - \lambda_i) \cdot y_{\text{partner}(i)}^M.$$
@@ -307,17 +334,35 @@ $$\tilde x_i = \lambda_i \cdot x_i^F + (1 - \lambda_i) \cdot x_{\text{partner}(i
 - **Coût** : O($n_F \cdot n_M$) + O($n_F \cdot C \cdot H \cdot W$). Négligeable.
 - **Avantage** : zéro params nouveaux, juste de la data aug
 
+### Stratégie J — Cell-within reweight (v6, équivalent loss-side des samplers `gender_within_*`)
+
+```yaml
+loss_rw_strategy: cell_within_occ        # ou cell_within_test_pmf
+```
+
+Construit $W^{\text{cell-within}} \in \mathbb{R}^{2 \times B}$ avec :
+$$W^{\text{cell-within}}[g, b] = \frac{0.5 \cdot P_{\text{target}}[b]}{\max\!\big(\lvert\{i : g_i = g \wedge b(y_i) = b\}\rvert,\, 1\big)},$$
+puis normalisé pour que $\sum_{g, b} \text{count}(g, b) \cdot W[g, b] / N = 1$ (moyenne pondérée
+= 1, échelle de loss préservée) et clippé à `median × 10` pour éviter les cellules ultra-rares.
+
+- $P_{\text{target}}$ = $P_{\text{train}}$ (cas `cell_within_occ`) ou $P_{\text{test}}$ (cas `cell_within_test_pmf`)
+- **Différence vs `cell_joint`** : pas de $1/\sqrt{N}$ qui sur-pondère les cellules rares, ici on
+  cible directement 50/50 F/M intra-bin sans surreprésenter les bins peu peuplés
+- **Code** : [`build_cell_weights_within`](../src/utils/losses.py)
+
 ### Résumé : matrice méthode × objectif
 
-| Strat. | Sampler | Imp_rw | Mécanisme actif | Cible théorique |
-|---|---|---|---|---|
-| A | gender | ✓ | aucun (sampler suffit pour G) | shift Y + fairness G via sampler |
-| D | none | ✓ | gender_rw=no-op | shift Y + fairness G via aggregation par-groupe |
-| E | none | ✗ | cell_rw | équité Y×G implicite |
-| F | occlusion | ✗ | gender_rw=no-op | shift Y via sampler |
-| **G** | none | ✓ | **DANN** | fairness G via features invariantes au gender |
-| **H** | none | ✓ | **MMD** | fairness G via alignement de distributions de features |
-| **I** | none | ✓ | **Mixup inter-G** | invariance par augmentation conditionnelle Y |
+| Strat. | Sampler | Imp_rw | Mécanisme actif | v6 | Cible théorique |
+|---|---|---|---|---|---|
+| A | gender | ✓ | aucun (sampler suffit pour G) | ❌ | shift Y + fairness G via sampler |
+| D | none | ✓ | gender_rw=no-op | ❌ | shift Y + fairness G via aggregation par-groupe |
+| E | none | ✗ | cell_rw | ❌ | équité Y×G implicite |
+| F | occlusion | ✗ | gender_rw=no-op | ❌ | shift Y via sampler |
+| **G** | none | ✓ | **DANN** | ❌ | fairness G via features invariantes au gender |
+| **H** | none | ✓ | **MMD** | ✅ | fairness G via alignement de distributions de features |
+| **I** | none | ✓ | **Mixup inter-G** | ✅ | invariance par augmentation conditionnelle Y |
+| **J** | none | ✗ | **cell_within_***  *(v6)* | ✅ | 50/50 F/M intra-bin sans sur-poids des cellules rares |
+| **K** | `gender_within_*` *(v6)* | ✗ | aucun (sampler suffit) | ✅ | équivalent data-side de J |
 
 ---
 

@@ -1,35 +1,18 @@
-name: dinov3-vitb16-3090-v8
+name: dinov3-vitb16-3090-v9
 description: |
-  DINOv3 ViT-B/16 (86M) v8 — 2x RTX 3090 24GB (BF16). Refonte complète du design d'équilibrage
-  inspirée du retour sur v3/v4 (top historique 0.00120 avec cell_joint + MMD) et de l'analyse
-  multi-versions. Sépare proprement Y-shift (axe 1) et G-fairness (axes 2-5).
+  DINOv3 ViT-B/16 (86M) v9 — 2x RTX 3090 24GB (BF16). Évolution majeure v8 :
 
-  Axe 1 — Y shift correction (3 mécaniques, force totale γ ∈ [0.5, 1])
-    axis1_strength       : γ (intensité totale, r^γ effet final sur gradient)
-    axis1_sampler_share  : a (poids du sampler test_pmf, ∈ [0, 1])
-    axis1_loss_share     : b (poids du loss imp_rw, ∈ [0, 1-a])
-    aug_share (déduit)   : c = 1 - a - b (Y-conditional augmentation)
-    → sampler ∝ r^(γa), loss ∝ r^(γb), aug k_i = r^(γc) (stochastic Bernoulli rounding)
-    → effet combiné gradient = r^γ (a+b+c=1)
+  NOUVEAUTÉS v9 :
+  - val_split_alpha (data:) : interpolation P_test ↔ P_train sur le val (α=0.5 défaut)
+    + auto-compensation eval reweight pour rester unbiased sous H1
+  - Axe 1 : stick-breaking 2-way (sampler + loss). AUG Y-conditional RETIRÉE (v8 inconcluant)
+    γ × a = sampler_power, γ × (1-a) = loss_power
+  - Axe 2 : base passe de 1/√count à 1/count^0.75 → ratio cell rare/dense 43× (vs 12× v8)
+  - Focal loss : formule (err + 0.05)^γ, range [0, 2.5]. Vraie sélection hard examples.
+  - P_train et P_test paramétriques (MixSpikeBeta), plus de bin 19 noise empirique
+  - LLRD bugfix : backbone.norm, mask_token, storage_tokens correctement dans optimizer
 
-  Axe 2 — Soft G compensation (cell_rw 1/sqrt(count(g,b)))
-    axis2_power ∈ [0, 1]  : intensité (0=off, 1=full sqrt, top v4 utilisait full)
-    Préserve P(G|Y)_train approximativement, compense rareté cellules sans 50/50 forcé.
-
-  Axe 3 — Feature / data fairness
-    feature_fairness ∈ {none, mmd, mixup_gender}
-    MMD aligne features F/M dans RKHS. mixup_gender mélange F-M intra-bin.
-
-  Axe 4 — Auto hard examples (focal loss)
-    loss_focal_gamma ∈ [0, 3]  : auto-pondère les samples mal prédits
-
-  Axe 5 — Assurance fairness gap
-    loss_fairness_lambda ∈ [0, 2]  : pénalité directe sur |err_F - err_M|
-
-  Pinned :
-    loss_type = weighted_mse  (data v4 : weighted_mse > group_dro nettement)
-    ema_decay = 0             (EMA off, on garde load_best_model_at_end → meilleur checkpoint)
-    val_split_strategy = test_pmf + eval_importance_reweight = false (Option B' v6.5)
+  Pinned : loss_type=weighted_mse, ema_decay=0, augmentation_level=medium
 
 model:
   model_name: dinov3_vitb16
@@ -59,6 +42,7 @@ data:
   data_csv: data/raw/train.csv
   extra_train_csv: null
   val_split_ratio: 0.15
+  val_split_alpha: 0.5            # v9 : mid-ground. 1.0=B' v8 (val=P_test), 0.0=stratified_yg
 
 training:
   per_device_train_batch_size: 32
@@ -80,7 +64,7 @@ training:
   bf16: true
   fp16: false
   gradient_checkpointing: false
-  augmentation_level: medium     # PINNED : magnitude safe, quantité gérée par aug_power
+  augmentation_level: medium     # PINNED : magnitude safe (RandomCrop, ColorJitter, ...)
   loss_type: weighted_mse        # PINNED : data v4 confirme weighted_mse > group_dro
   ema_decay: 0                   # PINNED : EMA off, load_best_model_at_end actif
   ema_warmup_steps: 0
@@ -103,9 +87,9 @@ optuna:
       type: categorical
       choices: [attention_k_query, multihead_attention]
 
-    # === Axe 1 — Y shift correction (3 mécaniques) ===
-    # axis1_power = γ : intensité totale axe 1. γ=0 → ERM baseline (pas de correction Y) ;
-    # γ=1 → correction complète (effet r^γ sur gradient). [0, 1] full spectrum.
+    # === Axe 1 — Y shift correction (v9 : 2 mécaniques, aug retirée) ===
+    # axis1_power = γ : intensité totale (γ=0 → ERM baseline, γ=1 → correction complète, effet r^γ)
+    # axis1_sampler_share = a : fraction sampler. loss_share = 1-a (déduit). sampler_power=γa, loss_power=γ(1-a).
     axis1_power:
       type: float
       low: 0.0
@@ -114,16 +98,9 @@ optuna:
       type: float
       low: 0.0
       high: 1.0
-    axis1_loss_fraction:
-      type: float
-      low: 0.0
-      high: 1.0
-      # Stick-breaking sur le 2-simplexe (cf _refresh_axis1_powers) :
-      #   b = (1 - sampler_share) × loss_fraction         (loss share effectif)
-      #   c = (1 - sampler_share) × (1 - loss_fraction)   (aug share déduit)
-      # Garantit a + b + c = 1 sans normalisation post-hoc. TPE explore proprement le simplexe.
 
-    # === Axe 2 — Soft G compensation (cell_rw 1/sqrt^power) ===
+    # === Axe 2 — Soft G compensation (cell_rw v9 : base 1/count^0.75) ===
+    # axis2_power=0 → off. axis2_power=1 → ratio cell rare/dense ≈ 43× (vs 12× v8 sqrt).
     axis2_power:
       type: float
       low: 0.0
@@ -134,11 +111,12 @@ optuna:
       type: categorical
       choices: [none, mmd, mixup_gender]
 
-    # === Axe 4 — Auto hard examples ===
+    # === Axe 4 — Auto hard examples (focal v9 : formule (err + 0.05)^γ) ===
+    # γ=0 off, γ=1 ratio hard/easy ≈ 6× (outlier 0.3 vs median 0.005), γ=2.5 ratio ≈ 200×
     loss_focal_gamma:
       type: float
       low: 0.0
-      high: 3.0
+      high: 2.5
 
     # === Axe 5 — Assurance fairness gap ===
     loss_fairness_lambda:

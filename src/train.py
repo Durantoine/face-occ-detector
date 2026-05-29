@@ -24,7 +24,6 @@ from src.data.dataset import (
     DEFAULT_LABEL_COL,
     FaceOccDataset,
     _load_data,
-    create_balanced_sampler,
 )
 from src.data.transforms import build_train_transform
 from src.models.dinov3_loader import get_image_processor
@@ -60,10 +59,9 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_cell_reweight",
-    # v8 axis 1 : 3-mechanism Y shift correction with strength γ
-    "axis1_power", "axis1_sampler_share", "axis1_loss_fraction",
-    "axis1_share_loss", "axis1_share_aug",
-    "sampler_power", "loss_power", "aug_power",
+    # v9 axis 1 : 2-mechanism Y shift correction (sampler + loss, aug retirée)
+    "axis1_power", "axis1_sampler_share",
+    "sampler_power", "loss_power",
     # v8 axis 2 : soft cell rw via build_cell_weights^power
     "axis2_power",
     "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
@@ -198,21 +196,36 @@ class WeightedMSETrainer(Trainer):
 
         decay = self._layer_decay
         groups: List[Dict[str, Any]] = []
+        assigned: set[int] = set()
 
-        embed_params = [p for n, p in self.model.named_parameters()
-                        if "backbone" in n and any(k in n for k in ("embed", "pos_embed", "cls_token"))]
-        if embed_params:
-            groups.append({"params": embed_params, "lr": base_lr * decay ** (n_layers + 1), "weight_decay": wd})
+        def _take(predicate, lr: float) -> List[torch.nn.Parameter]:
+            picked: List[torch.nn.Parameter] = []
+            for n, p in self.model.named_parameters():
+                if id(p) in assigned or not p.requires_grad:
+                    continue
+                if predicate(n):
+                    picked.append(p)
+                    assigned.add(id(p))
+            if picked:
+                groups.append({"params": picked, "lr": lr, "weight_decay": wd})
+            return picked
 
+        _take(
+            lambda n: "backbone" in n and any(k in n for k in ("embed", "cls_token", "mask_token", "storage_tokens", "register_tokens")),
+            base_lr * decay ** (n_layers + 1),
+        )
         for i in range(n_layers):
             pattern = f"backbone.{block_attr}.{i}."
-            layer_params = [p for n, p in self.model.named_parameters() if pattern in n]
-            if layer_params:
-                groups.append({"params": layer_params, "lr": base_lr * decay ** (n_layers - i), "weight_decay": wd})
+            _take(lambda n, p=pattern: p in n, base_lr * decay ** (n_layers - i))
 
-        head_params = [p for n, p in self.model.named_parameters() if "backbone" not in n]
-        if head_params:
-            groups.append({"params": head_params, "lr": base_lr, "weight_decay": wd})
+        _take(lambda n: "backbone" in n, base_lr)
+
+        _take(lambda n: True, base_lr)
+
+        leftover = [n for n, p in self.model.named_parameters()
+                    if p.requires_grad and id(p) not in assigned]
+        if leftover:
+            raise RuntimeError(f"LLRD did not cover {len(leftover)} trainable params: {leftover[:5]}")
 
         print(f"LLRD: {len(groups)} groups, LR ∈ [{groups[0]['lr']:.2e}, {base_lr:.2e}]")
         self.optimizer = torch.optim.AdamW(
@@ -232,6 +245,7 @@ def _load_train_val(
     val_data_csv: Optional[str],
     seed: int,
     val_split_strategy: str = "stratified_yg",
+    val_split_alpha: float = 1.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     image_col = data_cfg.get("image_col", DEFAULT_IMAGE_COL)
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
@@ -254,6 +268,7 @@ def _load_train_val(
         train_path, **common, extra_train_csv=extra_train, seed=seed,
         split_ratio=val_split_ratio,
         val_split_strategy=val_split_strategy,
+        val_split_alpha=val_split_alpha,
     )
 
 
@@ -551,9 +566,11 @@ def train(
 
     processor = get_image_processor(model_name)
     val_split_strategy = train_cfg.get("val_split_strategy", "stratified_yg")
+    val_split_alpha = float(data_cfg.get("val_split_alpha", 1.0))
     train_data, val_data = _load_train_val(
         data_cfg, data_csv, val_data_csv, val_seed or seed,
         val_split_strategy=val_split_strategy,
+        val_split_alpha=val_split_alpha,
     )
     train_dataset, val_dataset = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
@@ -564,43 +581,16 @@ def train(
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     sampler_power = float(train_cfg.get("sampler_power", 0.0))
     loss_power    = float(train_cfg.get("loss_power", 0.0))
-    aug_power     = float(train_cfg.get("aug_power", 0.0))
 
-    # Y-conditional aug : si aug_power > 0, on enveloppe train_dataset dans un
-    # YConditionalAugDataset qui réplique stochastiquement chaque sample selon
-    # k_i = (P_test[b] / P_train[b])^aug_power.
     y_train = train_data[label_col].astype(float).values
-    yc_dataset = None
-    if aug_power > 0:
-        from src.data.dataset import YConditionalAugDataset
-        yc_dataset = YConditionalAugDataset(
-            base_dataset=train_dataset,
-            y_array=y_train,
-            aug_power=aug_power,
-            test_pmf=_TEST_PMF_0025,
-            seed=seed,
-        )
-        train_dataset = yc_dataset
-        print(f"YConditionalAugDataset enabled (aug_power={aug_power:.3f}): "
-              f"virtual len={len(yc_dataset)} (vs base {len(y_train)}, expansion ×{len(yc_dataset)/len(y_train):.2f})")
-    else:
-        print(f"YConditionalAugDataset disabled (aug_power={aug_power:.3f})")
 
-    # Sampler test_pmf : intensité = sampler_power. Sur le dataset virtuel si yc actif.
+    # Sampler test_pmf : intensité = sampler_power (axe 1 sampler leg).
     train_sampler = None
     if sampler_power > 0:
-        from src.data.dataset import create_test_pmf_sampler, create_sampler_weights_for_virtual
-        if yc_dataset is not None:
-            train_sampler = create_sampler_weights_for_virtual(
-                y_base=y_train,
-                test_pmf=_TEST_PMF_0025,
-                virtual_to_base=yc_dataset.virtual_to_base,
-                sampler_power=sampler_power,
-            )
-        else:
-            train_sampler = create_test_pmf_sampler(
-                y_train, test_pmf=_TEST_PMF_0025, power=sampler_power,
-            )
+        from src.data.dataset import create_test_pmf_sampler
+        train_sampler = create_test_pmf_sampler(
+            y_train, test_pmf=_TEST_PMF_0025, power=sampler_power,
+        )
         print(f"Sampler test_pmf (power={sampler_power:.3f}): "
               f"{train_sampler.num_samples} samples/epoch")
     else:
@@ -619,12 +609,36 @@ def train(
     else:
         print(f"loss_importance_reweight disabled (loss_power={loss_power:.3f}, loss_type={loss_type})")
 
-    # Eval : pas de reweight (val matche déjà P_test via val_split_strategy=test_pmf, B')
-    eval_use_test_pmf = bool(train_cfg.get("eval_importance_reweight", False))
-    eval_pmf_ratio = test_pmf_ratio_full if eval_use_test_pmf else None
-    if eval_use_test_pmf:
+    # === v9 : eval reweight automatique compensant val_split_alpha ===
+    # val_split_alpha couple le SPLIT (dataset.py) et le REWEIGHT (ici) pour rester
+    # estimateur non-biaisé du risque test sous H1 (covariate shift Y-only).
+    #   eval_weight(y) = P_test(y) / P_val_target(y)
+    #                  = P_test(y) / [α × P_test(y) + (1−α) × P_train(y)]
+    #
+    # α=1.0 → P_val=P_test → eval_weight=1 partout (équiv. B' actuel, pas de reweight)
+    # α=0.0 → P_val=P_train → eval_weight=P_test/P_train (= full reweight v4 stratified_yg)
+    # α=0.5 → mid-ground → eval_weight intermédiaire (~1.67 sur bin 18)
+    eval_pmf_ratio = None
+    if val_split_alpha < 1.0:
+        from src.utils.losses import _TRAIN_PMF_0025
+        p_val_target = val_split_alpha * _TEST_PMF_0025 + (1.0 - val_split_alpha) * _TRAIN_PMF_0025
+        eval_pmf_ratio = _TEST_PMF_0025 / np.maximum(p_val_target, 1e-6)
+        eval_pmf_ratio = np.clip(eval_pmf_ratio, 0.05, 20.0)
+        eval_pmf_ratio = eval_pmf_ratio / eval_pmf_ratio.mean()
+        ml_log_params(client, run_id, {
+            "val_split_alpha": val_split_alpha,
+            "eval_reweight_max": float(eval_pmf_ratio.max()),
+            "eval_reweight_min": float(eval_pmf_ratio.min()),
+        })
+        print(f"v9 eval reweight (val_split_alpha={val_split_alpha:.2f}): "
+              f"min={eval_pmf_ratio.min():.3f} max={eval_pmf_ratio.max():.3f}")
+    elif bool(train_cfg.get("eval_importance_reweight", False)):
+        # Legacy v6 override : eval reweight full (compatible v4 stratified_yg behavior)
+        eval_pmf_ratio = test_pmf_ratio_full
         ml_log_params(client, run_id, {"eval_importance_reweight": True})
-        print("eval_importance_reweight ON (val reweighted — legacy behavior)")
+        print("eval_importance_reweight ON (legacy v6 full reweight)")
+    else:
+        print(f"eval reweight disabled (val_split_alpha=1.0 → val already matches P_test)")
     compute_metrics = make_compute_metrics(importance_pmf_ratio=eval_pmf_ratio)
 
     # === v8 axis 2 : cell_rw soft via build_cell_weights avec power ===
@@ -774,12 +788,6 @@ def train(
     if ema_cb is not None:
         callbacks.append(ema_cb)
         print(f"EMA enabled: decay={ema_cb.decay}, warmup_steps={ema_cb.warmup_steps}")
-
-    # v8 : YConditionalAugDataset utilise virtual_to_base fixé au __init__ (cf DESIGN NOTE
-    # dans dataset.py). Pas de set_epoch — la diversité vient de l'augmentation stochastique
-    # appliquée à chaque __getitem__ et du sampler with replacement. Ça évite l'incohérence
-    # qui apparaîtrait si le sampler (poids basés sur virtual_to_base au train init) restait
-    # bloqué pendant que virtual_to_base change.
 
     trainer = WeightedMSETrainer(
         loss_type=loss_type,

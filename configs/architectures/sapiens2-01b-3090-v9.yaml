@@ -1,15 +1,7 @@
-name: sapiens2-01b-3090-v8
+name: sapiens2-01b-3090-v9
 description: |
-  Sapiens2-0.1B (114M) v8 — 2x RTX 3090 24GB (BF16). Miroir de dinov3-vitb16 v8 :
-  design 5 axes orthogonaux séparant proprement Y-shift (axe 1) et G-fairness (axes 2-5).
-  Voir dinov3-vitb16-3090-v8.yaml pour le rationale détaillé.
-
-  Top historique v4 (Sapiens trial 18, score 0.00120) = (cell_joint + MMD) :
-    axis1_strength=1, axis1_sampler_share=0, axis1_loss_share=1, aug_share=0  (= imp_rw seul)
-    axis2_power=1.0 (= cell_rw sqrt full)
-    feature_fairness=mmd
-    loss_focal_gamma libre, loss_fairness_lambda libre
-  → reproduit exactement le top via le nouveau design.
+  Sapiens2-0.1B (114M) v9 — 2x RTX 3090 24GB (BF16). Miroir de dinov3-vitb16 v9.
+  Voir dinov3-vitb16-3090-v9.yaml pour le rationale (val_split_alpha + axes 1-5 inchangés v8).
 
 model:
   model_name: sapiens2_0.1b
@@ -39,6 +31,7 @@ data:
   data_csv: data/raw/train.csv
   extra_train_csv: null
   val_split_ratio: 0.15
+  val_split_alpha: 0.5            # v9 : mid-ground. 1.0=B' v8 (val=P_test), 0.0=stratified_yg
 
 training:
   per_device_train_batch_size: 32
@@ -83,9 +76,7 @@ optuna:
       type: categorical
       choices: [attention_k_query, multihead_attention]
 
-    # === Axe 1 — Y shift correction (3 mécaniques) ===
-    # axis1_power = γ : intensité totale axe 1. γ=0 → ERM baseline (pas de correction Y) ;
-    # γ=1 → correction complète (effet r^γ sur gradient). [0, 1] full spectrum.
+    # === Axe 1 — Y shift correction (v9 : 2 mécaniques, aug retirée) ===
     axis1_power:
       type: float
       low: 0.0
@@ -94,12 +85,8 @@ optuna:
       type: float
       low: 0.0
       high: 1.0
-    axis1_loss_fraction:
-      type: float
-      low: 0.0
-      high: 1.0
 
-    # === Axe 2 — Soft G compensation ===
+    # === Axe 2 — Soft G compensation (cell_rw v9 : base 1/count^0.75) ===
     axis2_power:
       type: float
       low: 0.0
@@ -110,11 +97,11 @@ optuna:
       type: categorical
       choices: [none, mmd, mixup_gender]
 
-    # === Axe 4 — Auto hard examples ===
+    # === Axe 4 — Auto hard examples (focal v9 : (err + 0.05)^γ) ===
     loss_focal_gamma:
       type: float
       low: 0.0
-      high: 3.0
+      high: 2.5
 
     # === Axe 5 — Assurance fairness gap ===
     loss_fairness_lambda:

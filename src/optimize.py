@@ -45,14 +45,13 @@ _TRAINING_KEYS = {
     "augmentation_level", "ema_decay", "layer_decay",
     "loss_focal_gamma", "loss_fairness_lambda",
     "sampler_strategy", "loss_importance_reweight", "loss_cell_reweight",
-    # v8 axes :
-    # Raw TPE (yaml search_space) : axis1_power (γ), axis1_sampler_share (a), axis1_loss_fraction (f)
-    # Computed normalized shares (visible UI) : axis1_sampler_share=a, axis1_share_loss=(1-a)f, axis1_share_aug=(1-a)(1-f)
-    # Computed effective powers : sampler_power=γa, loss_power=γ(1-a)f, aug_power=γ(1-a)(1-f)
-    # axis2_power = intensité directe cell_rw soft (single mechanism).
-    "axis1_power", "axis1_sampler_share", "axis1_loss_fraction",
-    "axis1_share_loss", "axis1_share_aug",
-    "sampler_power", "loss_power", "aug_power",
+    # v9 axes :
+    # Axe 1 stick-breaking 2-way (sampler + loss seul, aug retirée) :
+    #   Raw TPE = axis1_power (γ), axis1_sampler_share (a)
+    #   Computed = sampler_power=γa, loss_power=γ(1-a)
+    # Axe 2 = intensité directe cell_rw soft avec base 1/count^0.75.
+    "axis1_power", "axis1_sampler_share",
+    "sampler_power", "loss_power",
     "axis2_power",
     "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
     "loss_mmd_alignment", "mixup_inter_gender",
@@ -89,41 +88,27 @@ _FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
 
 
 def _refresh_axis1_powers(cfg: Dict[str, Any]) -> None:
-    """Recompute axis 1 normalized shares + effective powers from raw TPE params.
+    """Compute axe 1 effective powers from TPE raw params.
 
-    Decomposition v8 (stick-breaking sur le 2-simplexe) :
-      γ = axis1_power            ∈ [0, 1]   — total power axe 1
-      a = axis1_sampler_share    ∈ [0, 1]   — share normalisé pour sampler (= raw TPE)
-      f = axis1_loss_fraction    ∈ [0, 1]   — raw stick-breaking : fraction du reste pour loss
+    v9 : stick-breaking 2-way (sampler + loss seulement, aug retirée — pas concluant en v8).
+      γ = axis1_power            ∈ [0, 1]   — intensité totale axe 1
+      a = axis1_sampler_share    ∈ [0, 1]   — fraction sampler
 
-    Computed normalized shares (somment à 1, lisibles pour l'UI) :
-      axis1_sampler_share = a               (same as raw, déjà normalisé)
-      axis1_share_loss    = (1 - a) × f     (share normalisé pour loss)
-      axis1_share_aug     = (1 - a) × (1 - f) (share normalisé pour aug)
+    Effective powers :
+      sampler_power = γ × a
+      loss_power    = γ × (1 - a)
 
-    Effective powers (= γ × share, utilisés dans le code) :
-      sampler_power = γ × axis1_sampler_share
-      loss_power    = γ × axis1_share_loss
-      aug_power     = γ × axis1_share_aug
-
-    Combined gradient effect on bin = r^(γ × (sum_shares)) = r^γ → correction partielle/complète
-    selon γ, répartition propre par stick-breaking.
+    Combined gradient effect ≈ r^γ.
     """
     t = cfg["training"]
     gamma = float(t.get("axis1_power", 1.0))
     a = min(max(float(t.get("axis1_sampler_share", 1.0)), 0.0), 1.0)
-    f = min(max(float(t.get("axis1_loss_fraction", 0.0)), 0.0), 1.0)
-    # Normalized shares (sum to 1)
-    t["axis1_share_loss"] = (1.0 - a) * f
-    t["axis1_share_aug"] = (1.0 - a) * (1.0 - f)
-    # Effective powers (sum to γ)
     t["sampler_power"] = gamma * a
-    t["loss_power"] = gamma * t["axis1_share_loss"]
-    t["aug_power"] = gamma * t["axis1_share_aug"]
+    t["loss_power"] = gamma * (1.0 - a)
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    if name in ("axis1_power", "axis1_sampler_share", "axis1_loss_fraction"):
+    if name in ("axis1_power", "axis1_sampler_share"):
         cfg["training"][name] = float(value)
         _refresh_axis1_powers(cfg)
         return

@@ -15,107 +15,34 @@ DEFAULT_LABEL_COL = "FaceOcclusion"
 DEFAULT_GENDER_COL = "gender"
 
 
-def create_balanced_sampler(group_keys: List[int], num_groups: int = 2) -> WeightedRandomSampler:
-    counts = np.bincount(np.asarray(group_keys).astype(int), minlength=num_groups)
-    weights = np.zeros(len(group_keys), dtype=np.float64)
-    for g in range(num_groups):
-        if counts[g] > 0:
-            weights[np.asarray(group_keys).astype(int) == g] = 1.0 / counts[g]
-    n_samples = int(counts[counts > 0].min() * num_groups) if (counts > 0).any() else len(group_keys)
-    return WeightedRandomSampler(weights=weights.tolist(), num_samples=n_samples, replacement=True)
-
-
 def create_test_pmf_sampler(
     y: np.ndarray,
     test_pmf: np.ndarray,
+    train_pmf: Optional[np.ndarray] = None,
     bin_width: float = 0.025,
-    clip: float = 10.0,
+    clip: float = 20.0,
     num_samples: Optional[int] = None,
     power: float = 1.0,
 ) -> WeightedRandomSampler:
-    """Sampler that resamples the training data so the effective distribution of Y
-    in each epoch matches `test_pmf`. Per-sample weight = (P_test[b] / P_train[b])^power
-    where b is the Y-bin index. Clipped to [1/clip, clip] for stability.
+    """Sampler that resamples training data so the effective Y-distribution matches `test_pmf`.
 
-    `power` (paired-α design v6.5) :
-      * 1.0 → full sampler-side correction (legacy)
-      * 0.5 → √-strength : combined with √-strength loss reweight = full correction
-      * 0.0 → uniform → no sampler effect (loss does 100%)
+    Per-sample weight = (P_test[b] / P_train[b])^power where b is the Y-bin.
+    v9 : si `train_pmf=None`, on utilise _TRAIN_PMF_0025 (smoothed Mix(spike+Beta))
+    plutôt que l'empirique du subset — ratios stables et reproductibles entre trials.
     """
+    from src.utils.losses import _TRAIN_PMF_0025
     y_arr = np.asarray(y, dtype=np.float64).flatten()
     test = np.asarray(test_pmf, dtype=np.float64).flatten()
     n_bins = len(test)
     bin_idx = np.clip((y_arr / bin_width).astype(int), 0, n_bins - 1)
-    train_pmf = np.bincount(bin_idx, minlength=n_bins).astype(np.float64) / max(len(y_arr), 1)
-    ratio = test / np.maximum(train_pmf, 1e-6)
+    train = train_pmf if train_pmf is not None else _TRAIN_PMF_0025
+    ratio = test / np.maximum(train, 1e-6)
     if power != 1.0:
         ratio = np.power(ratio, power)
     ratio = np.clip(ratio, 1.0 / clip, clip)
     weights = ratio[bin_idx]
     n = int(num_samples if num_samples is not None else len(y_arr))
     return WeightedRandomSampler(weights=weights.tolist(), num_samples=n, replacement=True)
-
-
-def create_gender_within_bin_sampler(
-    y: np.ndarray,
-    gender: np.ndarray,
-    target_pmf: Optional[np.ndarray] = None,
-    bin_width: float = 0.025,
-    n_bins: int = 20,
-    clip: float = 10.0,
-    power: float = 1.0,
-) -> WeightedRandomSampler:
-    """Sampler égalisant F/M *intra-bin* tout en suivant `target_pmf` sur Y.
-
-    Pour chaque sample i de bin b(i) et genre g(i) ∈ {0=F, 1=M} :
-        weight_i = (0.5 × target_pmf[b(i)] / count(g(i), b(i)))^power
-
-    `power` (paired-α design v6.5) :
-      * 1.0 → full sampler-side correction (legacy)
-      * 0.5 → √-strength : combined with √-strength loss = full correction
-      * 0.0 → uniform → no sampler effect (loss does 100%)
-
-    Si `target_pmf=None` → utilise la PMF empirique de Y dans le train (préserve P_train).
-    Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
-    """
-    y_arr = np.asarray(y, dtype=np.float64).flatten()
-    g_arr = (np.asarray(gender, dtype=np.float64).flatten() >= 0.5).astype(int)
-    bin_idx = np.clip((y_arr / bin_width).astype(int), 0, n_bins - 1)
-
-    if target_pmf is None:
-        bin_counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
-        target = bin_counts / max(bin_counts.sum(), 1)
-    else:
-        target = np.asarray(target_pmf, dtype=np.float64).flatten()
-        if len(target) != n_bins:
-            raise ValueError(f"target_pmf has len {len(target)}, expected {n_bins}")
-        target = target / max(target.sum(), 1e-9)
-
-    cell_counts = np.zeros((2, n_bins), dtype=np.float64)
-    for g, b in zip(g_arr, bin_idx):
-        cell_counts[g, b] += 1
-
-    n_total = len(y_arr)
-    weights = np.zeros(n_total, dtype=np.float64)
-    for i in range(n_total):
-        g, b = g_arr[i], bin_idx[i]
-        cnt = cell_counts[g, b]
-        if cnt > 0:
-            weights[i] = 0.5 * target[b] / cnt
-
-    if power != 1.0:
-        pos_mask = weights > 0
-        weights[pos_mask] = np.power(weights[pos_mask], power)
-
-    # Clip pour éviter qu'un sample dans une cellule ultra-rare ait un poids absurde
-    pos = weights[weights > 0]
-    if len(pos) > 0:
-        median_w = float(np.median(pos))
-        weights = np.clip(weights, 0.0, median_w * clip)
-
-    if weights.sum() == 0:
-        weights = np.ones(n_total) / n_total
-    return WeightedRandomSampler(weights=weights.tolist(), num_samples=n_total, replacement=True)
 
 
 def _normalize_df(
@@ -153,6 +80,7 @@ def load_csv_data(
     seed: int = 42,
     n_buckets: int = 10,
     val_split_strategy: str = "stratified_yg",
+    val_split_alpha: float = 1.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(data_csv)
     df = _normalize_df(df, image_col, label_col, gender_col)
@@ -165,8 +93,8 @@ def load_csv_data(
         return df.reset_index(drop=True), pd.DataFrame()
 
     if val_split_strategy == "test_pmf" and "FaceOcclusion" in df.columns:
-        train_df, val_df = _split_val_to_match_test_pmf(df, split_ratio, seed)
-        print(f"Val split = test_pmf (val matches P_test marginal on Y)")
+        train_df, val_df = _split_val_to_match_test_pmf(df, split_ratio, seed, val_split_alpha=val_split_alpha)
+        print(f"Val split = test_pmf (α={val_split_alpha:.2f} interpolation P_test ↔ P_train)")
     else:
         from src.utils.losses import stratify_key
         stratify = None
@@ -189,10 +117,22 @@ def _split_val_to_match_test_pmf(
     split_ratio: float,
     seed: int,
     bin_width: float = 0.025,
+    val_split_alpha: float = 1.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build val by sampling per-Y-bin so that the val marginal P_val(Y) = P_test(Y).
+    """Build val with target distribution P_val = α·P_test + (1−α)·P_train (v9).
 
-    Falls back to a smaller val when high-Y bins have too few samples on train.
+    val_split_alpha (∈ [0, 1]) controls the trade-off train/eval :
+      * α=1 : val matches P_test exact (v8 B' behavior). Eval lisible, train perd
+              une grosse part proportionnelle des bins haut-Y rares.
+      * α=0 : val matches P_train marginal. Train préserve les bins rares mais eval
+              nécessite un reweight ×10 sur les bins haut-Y (variance amplifiée).
+      * α=0.5 : mid-ground. Train récupère ~50% des high-Y rares vs α=1, eval reweight
+                modéré (×~1.7 sur bin 18 vs ×5 pour α=0).
+
+    Eval reweight = P_test / P_val_target compensera dans train.py pour rester
+    estimateur non-biaisé du risque test sous H1 (covariate shift Y-only).
+
+    Falls back to a smaller val when bins rares have too few samples on train.
     """
     from src.utils.losses import _TEST_PMF_0025
     test_pmf = np.asarray(_TEST_PMF_0025, dtype=np.float64).flatten()
@@ -201,7 +141,20 @@ def _split_val_to_match_test_pmf(
     bin_idx = np.clip((y / bin_width).astype(int), 0, n_bins - 1)
 
     val_size_target = max(int(len(df) * split_ratio), 1)
-    target_per_bin = (test_pmf * val_size_target).astype(int)
+
+    # v9 : interpolation P_test ↔ P_train sur le target val
+    alpha = float(np.clip(val_split_alpha, 0.0, 1.0))
+    if alpha < 1.0:
+        train_counts = np.bincount(bin_idx, minlength=n_bins).astype(np.float64)
+        train_pmf = train_counts / max(train_counts.sum(), 1e-9)
+        target_pmf = alpha * test_pmf + (1.0 - alpha) * train_pmf
+        target_pmf = target_pmf / max(target_pmf.sum(), 1e-9)
+        print(f"  val_split_alpha={alpha:.2f} → interpolation P_test ({alpha*100:.0f}%) + P_train ({(1-alpha)*100:.0f}%)")
+    else:
+        target_pmf = test_pmf
+        print(f"  val_split_alpha=1.0 → val matches P_test exact (B' behavior)")
+
+    target_per_bin = (target_pmf * val_size_target).astype(int)
     rng = np.random.RandomState(seed)
     val_indices: List[int] = []
     skipped: List[Tuple[int, int, int]] = []
@@ -278,100 +231,3 @@ class FaceOccDataset(Dataset):
         return _encode(self.processor, img, self.targets[idx], self.genders[idx], self.transform)
 
 
-class YConditionalAugDataset(Dataset):
-    """Expansion virtuelle d'un dataset où chaque sample est répliqué selon le bin Y.
-
-    Pour chaque sample i dans le bin b_i, l'espérance du nombre de copies virtuelles est :
-        k_i = (P_test(b_i) / P_train(b_i))^aug_power, clippé à [1/clip, clip]
-
-    Stochastic Bernoulli rounding préserve E[copies] = k_i exact :
-        copies = floor(k_i) + 1{Bernoulli(k_i - floor(k_i))}
-
-    Chaque accès __getitem__ ré-applique la pipeline d'augmentation (côté base dataset
-    via FaceOccDataset.transform stochastique) → vue différente pour chaque copie
-    virtuelle d'un même sample base. Combiné avec un sampler test_pmf ou un loss
-    reweight, l'effet total sur le gradient = r^(sampler_power + loss_power + aug_power).
-
-    **DESIGN NOTE** : virtual_to_base est fixé au __init__ et NE CHANGE PAS pendant
-    le training. Sinon le sampler (qui prend des poids alignés sur virtual_to_base à
-    sa création) deviendrait incohérent à chaque re-roll. La diversité epoch-à-epoch
-    vient de :
-      (a) la pipeline d'augmentation stochastique sur chaque __getitem__ call
-      (b) le sampler (with replacement) qui pioche différentes virtual_idx par epoch
-      (c) le DataLoader random shuffle
-    Largement suffisant pour éviter la memorization.
-
-    Stochastic Bernoulli rounding (au __init__) préserve E[copies] = k_float exact :
-        copies = floor(k_float) + 1{Bernoulli(k_float - floor(k_float))}
-    """
-
-    def __init__(
-        self,
-        base_dataset: Dataset,
-        y_array: np.ndarray,
-        aug_power: float,
-        test_pmf: np.ndarray,
-        bin_width: float = 0.025,
-        clip: float = 10.0,
-        seed: int = 42,
-    ) -> None:
-        self.base = base_dataset
-        self.y_array = np.asarray(y_array, dtype=np.float64)
-        self.aug_power = float(aug_power)
-        self.bin_width = bin_width
-        self.clip = clip
-
-        n_bins = len(test_pmf)
-        self.bin_idx = np.clip((self.y_array / bin_width).astype(int), 0, n_bins - 1)
-        train_pmf = np.bincount(self.bin_idx, minlength=n_bins).astype(np.float64) / max(len(self.y_array), 1)
-        ratio = test_pmf / np.maximum(train_pmf, 1e-6)
-        if self.aug_power > 0:
-            ratio = np.power(ratio, self.aug_power)
-        else:
-            ratio = np.ones_like(ratio)
-        ratio = np.clip(ratio, 1.0 / clip, clip)
-        self.k_float = ratio[self.bin_idx]   # shape (N,) — espérance copies par sample
-
-        # Bernoulli stochastic rounding (deterministic seed → reproducible across runs).
-        # Fixed mapping after __init__ (no per-epoch reroll, see DESIGN NOTE).
-        rng = np.random.RandomState(seed)
-        floor = np.floor(self.k_float).astype(int)
-        frac = self.k_float - floor
-        extra = (rng.uniform(size=len(self.k_float)) < frac).astype(int)
-        k = np.maximum(floor + extra, 0)
-        self.virtual_to_base = np.repeat(np.arange(len(self.k_float)), k)
-
-    def __len__(self) -> int:
-        return len(self.virtual_to_base)
-
-    def __getitem__(self, virtual_idx: int) -> Dict[str, Any]:
-        base_idx = int(self.virtual_to_base[virtual_idx])
-        return self.base[base_idx]
-
-
-def create_sampler_weights_for_virtual(
-    y_base: np.ndarray,
-    test_pmf: np.ndarray,
-    virtual_to_base: np.ndarray,
-    sampler_power: float,
-    bin_width: float = 0.025,
-    clip: float = 10.0,
-) -> WeightedRandomSampler:
-    """Poids sampler pour un dataset virtuel (expansé via YConditionalAugDataset).
-
-    weight[virtual_idx] = (P_test(b) / P_train(b))^sampler_power
-    où b est le bin de y_base[virtual_to_base[virtual_idx]]. Si sampler_power=0, poids uniformes.
-    """
-    n_bins = len(test_pmf)
-    bin_idx_base = np.clip((np.asarray(y_base) / bin_width).astype(int), 0, n_bins - 1)
-    train_pmf = np.bincount(bin_idx_base, minlength=n_bins).astype(np.float64) / max(len(y_base), 1)
-    ratio = test_pmf / np.maximum(train_pmf, 1e-6)
-    if sampler_power != 1.0:
-        ratio = np.power(ratio, sampler_power)
-    ratio = np.clip(ratio, 1.0 / clip, clip)
-    weights_virtual = ratio[bin_idx_base][virtual_to_base]
-    return WeightedRandomSampler(
-        weights=weights_virtual.tolist(),
-        num_samples=len(weights_virtual),
-        replacement=True,
-    )

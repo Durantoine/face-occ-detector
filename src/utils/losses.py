@@ -4,48 +4,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.utils.distributions import _TEST_DIST, _TRAIN_DIST
 
-# Extracted pixel-by-pixel from example/task_brief.pdf page 3 (test histogram, 29980 images).
-# Calibration verified: same-method extraction of the train histogram has 0.9999 correlation
-# with local train.csv at 100-bin resolution. Integrated test count = 29961 / 29980 (99.94%).
-#
-# v6 : fit d'une vraie distribution paramétrique pour éliminer le saw-tooth (artefact
-# de label-rounding ~0.05 visible dans la PDF source) :
-#     P_test(y) = π_0 · δ(0) + (1 − π_0) · Beta(α, β; y · 2)
-# avec π_0 = 0.069 (visages "no occlusion" parfaitement), α = 1.67, β = 2.85.
-# Fit par minimisation L2 vs raw histogram → L2 = 0.0334 (meilleur parmi Beta/Gamma/Exp
-# seuls qui font 0.057-0.083 et écrasent le spike bin 0). Bin 0 préservé à 0.096 (−1%
-# vs raw 0.0967). Interprétation : 6.9% du test = aucune occlusion, le reste suit une
-# Beta avec mode ~0.12 et tail jusqu'à 0.5.
-_TEST_PMF_0025_RAW = np.array([
-    0.0967, 0.0546, 0.0847, 0.0642, 0.0812, 0.0692, 0.0838, 0.0677, 0.0790, 0.0713,
-    0.0681, 0.0589, 0.0448, 0.0316, 0.0228, 0.0118, 0.0056, 0.0023, 0.0012, 0.0006,
-], dtype=np.float64)
-_TEST_PMF_0025 = np.array([
-    0.0960, 0.0531, 0.0679, 0.0764, 0.0807, 0.0817, 0.0801, 0.0765, 0.0713, 0.0650,
-    0.0578, 0.0500, 0.0420, 0.0339, 0.0262, 0.0189, 0.0124, 0.0070, 0.0029, 0.0005,
-], dtype=np.float64)
+
+# v9 : P_test et P_train viennent maintenant de distributions paramétriques
+# (Mix(spike + Beta)) fittées une fois (cf src/utils/distributions.py). Les
+# arrays ci-dessous sont les PMF évaluées sur la grille canonique 20 bins de
+# width 0.025, exposés pour compat (utilisés direct par eval_pmf_ratio dans
+# train.py et build_importance_weights).
+_TEST_PMF_0025 = _TEST_DIST.pmf_at_bins(n_bins=20, bin_width=0.025)
+_TRAIN_PMF_0025 = _TRAIN_DIST.pmf_at_bins(n_bins=20, bin_width=0.025)
 
 
 def build_importance_weights(
-    train_targets: np.ndarray,
-    n_bins: int = 20,
-    bin_width: float = 0.025,
+    train_targets: Optional[np.ndarray] = None,
     test_pmf: np.ndarray = _TEST_PMF_0025,
-    clip: float = 10.0,
+    train_pmf: np.ndarray = _TRAIN_PMF_0025,
+    clip: float = 20.0,
     power: float = 1.0,
 ) -> np.ndarray:
     """Per-bin importance weights w[b] = (P_test[b] / P_train[b])^power, clipped + normalized.
 
-    `power` (paired-α design v6.5) :
-      * 1.0 → full loss-side correction (default, legacy behavior)
-      * 0.5 → √-strength : combined with √-strength sampler donne la correction complète
-      * 0.0 → all-ones après normalisation → no loss effect (sampler à 100%)
+    v9 : P_train est lu depuis `_TRAIN_PMF_0025` (smoothed Mix(spike+Beta)). `train_targets`
+    est ignoré, gardé pour signature ascendante (callers passent `y_train` positionnel).
     """
-    edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
-    train_hist, _ = np.histogram(np.clip(train_targets, 0.0, edges[-1] - 1e-9), bins=edges)
-    train_pmf = train_hist / max(train_hist.sum(), 1)
-    w = test_pmf / np.clip(train_pmf, 1e-6, None)
+    del train_targets
+    w = test_pmf / np.maximum(train_pmf, 1e-6)
     if power != 1.0:
         w = np.power(w, power)
     w = np.clip(w, 1.0 / clip, clip)
@@ -69,14 +53,13 @@ def build_cell_weights(
     n_bins: int = 20,
     bin_width: float = 0.025,
     power: float = 1.0,
+    base_exp: float = 0.75,
 ) -> np.ndarray:
-    """Cell weights soft via 1/sqrt(count(g, b)), normalisé à mean=1.
+    """Cell weights soft : w = (1 / count(g,b)^base_exp)^power, normalisé à mean=1.
 
-    `power` (v8 paired-α design) :
-      * 1.0  → standard sqrt-soft compensation (legacy v3/v4 cell_rw)
-      * 0.5  → encore plus doux : (1/sqrt(count))^0.5 = 1/count^0.25
-      * 0.0  → tous les poids = 1, équivalent no-correction
-    Permet à TPE de tuner l'intensité de la compensation sans switcher de mécanisme.
+    v9 : base_exp passe de 0.5 (sqrt) à 0.75 (entre sqrt et inverse plein) → plus mordant
+    sur cellules rares sans dépasser power=1 par mécanisme. Au max (power=1, base_exp=0.75)
+    le ratio cell rare/dense ≈ 43× (vs 12× avec sqrt). À power=0 → uniform.
     """
     g = (np.asarray(train_gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(train_targets) / bin_width).astype(int), 0, n_bins - 1)
@@ -84,76 +67,10 @@ def build_cell_weights(
     for gi, bi in zip(g, b):
         counts[gi, bi] += 1
     counts = np.maximum(counts, 1.0)
-    w = 1.0 / np.sqrt(counts)
+    w = 1.0 / np.power(counts, base_exp)
     if power != 1.0:
         w = np.power(w, power)
     w = w / w.mean()
-    return w
-
-
-def build_cell_weights_within(
-    train_targets: np.ndarray,
-    train_gender: np.ndarray,
-    target_pmf: Optional[np.ndarray] = None,
-    n_bins: int = 20,
-    bin_width: float = 0.025,
-    clip: float = 10.0,
-    power: float = 1.0,
-) -> np.ndarray:
-    """Cell weights qui égalisent F/M *intra-bin* tout en suivant `target_pmf` sur Y.
-
-    Pour chaque cellule (g, b) :
-        W[g, b] = (0.5 × target_pmf[b] × N / count(g, b))^power      (ratio r)
-    Normalisé à moyenne pondérée = 1.
-
-    `power` (paired-α design v6.5) :
-      * 1.0 → correction loss-side complète (default, legacy behavior)
-      * 0.5 → √-strength : combiné avec sampler √-strength = correction complète
-      * 0.0 → all-ones → no loss effect (sampler fait 100% du boulot)
-
-    Si `target_pmf=None` → utilise P_train(Y) empirique (préserve la distribution Y).
-    Si `target_pmf=_TEST_PMF_0025` → matche P_test (corrige aussi le shift Y).
-    """
-    g = (np.asarray(train_gender) >= 0.5).astype(int)
-    b = np.clip((np.asarray(train_targets) / bin_width).astype(int), 0, n_bins - 1)
-    counts = np.zeros((2, n_bins), dtype=np.float64)
-    for gi, bi in zip(g, b):
-        counts[gi, bi] += 1
-
-    if target_pmf is None:
-        bin_counts = counts.sum(axis=0)
-        target = bin_counts / max(bin_counts.sum(), 1)
-    else:
-        target = np.asarray(target_pmf, dtype=np.float64).flatten()
-        if len(target) != n_bins:
-            raise ValueError(f"target_pmf has len {len(target)}, expected {n_bins}")
-        target = target / max(target.sum(), 1e-9)
-
-    safe_counts = np.maximum(counts, 1.0)
-    w = 0.5 * target[None, :] / safe_counts   # broadcast → shape (2, n_bins)
-    w[counts == 0] = 0.0
-
-    # Apply power on the per-cell ratio. We power-up before the renormalization so that
-    # the mean-weighted-to-1 invariant holds for any α.
-    if power != 1.0:
-        nonzero_mask = w > 0
-        w_pow = np.zeros_like(w)
-        w_pow[nonzero_mask] = np.power(w[nonzero_mask], power)
-        w = w_pow
-
-    # Normalize so that the average weight across the actual train distribution = 1.
-    # i.e. Σ_{g,b} count(g,b) × W[g,b] / N = 1
-    total_count = counts.sum()
-    mean_w = float((counts * w).sum() / max(total_count, 1))
-    if mean_w > 0:
-        w = w / mean_w
-
-    # Clip cellules ultra-rares pour éviter gradient bruité
-    nonzero = w[w > 0]
-    if len(nonzero) > 0:
-        median_w = float(np.median(nonzero))
-        w = np.clip(w, 0.0, median_w * clip)
-
     return w
 
 
@@ -221,7 +138,7 @@ class WeightedMSELoss(nn.Module):
             w = w * self.cell_class_weights[g_idx, b_idx]
 
         if self.focal_gamma > 0:
-            w = w * (1.0 + err.detach().pow(self.focal_gamma))
+            w = w * (err.detach() + 0.05).pow(self.focal_gamma)
 
         if gender is None:
             return (w * err).sum() / w.sum().clamp(min=1e-8)

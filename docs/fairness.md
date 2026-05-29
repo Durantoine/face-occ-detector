@@ -15,10 +15,16 @@
 >   Reste `none`, `mmd`, `mixup_gender`. La stratégie G (DANN) ci-dessous reste documentée
 >   à titre de référence théorique, mais le code DANN n'est plus activé par le sweep v6.
 >
-> **Mise à jour v8 (current)** — **Refonte complète** sur la base du constat empirique
-> que le top historique (Sapiens t18, score 0.00120) utilisait `cell_joint + MMD`
-> (réintroduit en v8 sous forme de `axis2_power`). 5 axes orthogonaux, plus de
-> `correction_strategy / correction_alpha / correction_strength` (v6.5/v7 retirés).
+> **Mise à jour v9 (current)** — Ajout du param **`val_split_alpha`** ∈ [0, 1] dans
+> `data:` (yaml, pas Optuna). Interpole la distribution cible du val set entre
+> P_test (α=1, ≡ v8 B') et P_train (α=0, ≡ stratified_yg). Compensation
+> automatique de la loss eval pour rester non-biaisé sous H1. Voir §"v9 —
+> `val_split_alpha`". Défaut v9 = 0.5 (mid-ground).
+>
+> **Mise à jour v8 (SUPERSEDED par v9, axes 1-5 inchangés)** — **Refonte complète** sur
+> la base du constat empirique que le top historique (Sapiens t18, score 0.00120) utilisait
+> `cell_joint + MMD` (réintroduit en v8 sous forme de `axis2_power`). 5 axes orthogonaux,
+> plus de `correction_strategy / correction_alpha / correction_strength` (v6.5/v7 retirés).
 > Axe 1 (Y shift) : 3 mécaniques (sampler + loss + aug Y-conditional) via stick-breaking
 > sur le 2-simplexe, intensité totale γ ∈ [0, 1]. Voir §"v8 design — refonte axes
 > orthogonaux" en fin de doc pour le détail.
@@ -408,6 +414,69 @@ Resample le val à partir du train pour que **P_val(Y) = P_test(Y)** par constru
 | Stabilité, gros val, courbes lisses | `stratified_yg` |
 | Estimation directe perf test, plus rigoureux | `test_pmf` |
 | Comparer empiriquement les 2 | Lance 2 sweeps en parallèle |
+
+### Trade-off pernicieux de `test_pmf` (v8 B' — observable)
+
+Cas concret bin 18 (Y=0.45-0.475, 19 samples total : 12 F + 7 M) avec `val_split_ratio=0.15` :
+
+```
+val_target bin 18 = P_test[18] × 15000 = 0.001 × 15000 = 15 samples
+disponibles = 19 → val prend 15, train garde 4
+```
+
+→ **Train post-split garde seulement 21% des bin 18 (4 sur 19)**. Comparé à bin 0 où train garde 96%, le train est **encore plus biaisé vers low-Y** qu'avant le split.
+
+Implications :
+- Train post-split a un shift Y *plus* fort à corriger par axe 1
+- Les samples M-bin18 critiques (originalement 7) ne sont que 2-3 dans le train → memo extrême
+- Mais l'eval reste lisible et représentatif de P_test
+
+### v9 — `val_split_alpha` (Option B implémentée)
+
+v9 expose un nouveau param **`val_split_alpha`** dans `data:` (yaml, pas Optuna) qui
+interpole la distribution cible du val entre P_test et P_train :
+
+```
+P_val_target(y) = α × P_test(y) + (1−α) × P_train(y)
+```
+
+| α | Effet sur train (bin 18 ex.) | Effet sur eval |
+|---|---|---|
+| 1.0 | train perd 79% bin 18 (= B' v8) | val ≡ P_test, weight=1 |
+| 0.5 | train garde 53% bin 18 | val mix, weight≈1.67 sur bin 18 |
+| 0.0 | train garde 84% bin 18 (≡ stratified_yg) | val ≡ P_train, weight≈5 sur bin 18 |
+
+**Compensation eval** : pour rester estimateur non-biaisé du `challenge_score` sous H1,
+la loss d'évaluation est repondérée :
+
+```
+eval_weight(y) = P_test(y) / P_val_target(y) = P_test / [α P_test + (1−α) P_train]
+```
+
+Codé dans `src/train.py` (`eval_pmf_ratio = clip(P_test / P_val_target, 0.1, 10).mean=1`),
+clippé pour éviter explosion variance sur bins quasi-vides.
+
+**Cas dégénérés** :
+- α=1 → `eval_weight ≡ 1` partout (B' v8 inchangé, équivalence parfaite).
+- α=0 → `eval_weight = P_test/P_train` (équivalent à `stratified_yg` + `eval_importance_reweight: true`,
+  l'ancienne Option A).
+- α∈(0,1) → mid-ground continu, jamais possible avant v9.
+
+**Défaut v9 : α=0.5**. Compromis : on récupère >50% des bin 18 pour le training (au lieu
+de 21% avec B' v8), tout en gardant des poids eval modérés (max ≈ 1.67 au lieu de 5).
+
+**Reproduire B' v8** : `val_split_alpha: 1.0` dans le yaml.
+**Reproduire stratified_yg + reweight** : `val_split_alpha: 0.0`.
+
+#### Alternative non-implémentée — Cap split
+
+```python
+target_per_bin = min(P_test[b] × N_val, K_cap)
+```
+
+Avec `K_cap=5` : pour les bins rares (high-Y), val ne prend que 5 samples max.
+Plus simple mais moins continu que `val_split_alpha`. Non retenu : `val_split_alpha`
+couvre déjà le spectre `train_preserved ↔ eval_clean` avec un seul scalaire.
 
 ---
 

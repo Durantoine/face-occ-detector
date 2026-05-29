@@ -65,6 +65,7 @@ training:
   ema_decay: 0
   ema_warmup_steps: 0
   layer_decay: 0.85
+  save_qualitative_k: 10         # save 10 worst + 10 best images en MLflow artifacts
 
 optuna:
   n_trials: 200

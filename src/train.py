@@ -900,8 +900,11 @@ def train(
             except Exception as e_chart:
                 print(f"WARNING: could not save diagnostic charts: {e_chart}")
 
-            if use_mlflow and use_client and client and run_id:
-                client.log_artifacts(run_id, str(qual_root), "qualitative")
+            if use_mlflow:
+                if use_client and client and run_id:
+                    client.log_artifacts(run_id, str(qual_root), "qualitative")
+                elif mlflow.active_run():
+                    mlflow.log_artifacts(str(qual_root), "qualitative")
         except Exception as e:
             print(f"WARNING: could not save qualitative-K: {e}")
 

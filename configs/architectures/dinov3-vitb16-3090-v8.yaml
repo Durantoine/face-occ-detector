@@ -80,11 +80,12 @@ training:
   bf16: true
   fp16: false
   gradient_checkpointing: false
-  augmentation_level: medium     # PINNED : magnitude safe, quantité gérée par aug_share
+  augmentation_level: medium     # PINNED : magnitude safe, quantité gérée par aug_power
   loss_type: weighted_mse        # PINNED : data v4 confirme weighted_mse > group_dro
   ema_decay: 0                   # PINNED : EMA off, load_best_model_at_end actif
   ema_warmup_steps: 0
   layer_decay: 0.85
+  save_qualitative_k: 10         # save 10 worst + 10 best images en MLflow artifacts
 
 optuna:
   n_trials: 200

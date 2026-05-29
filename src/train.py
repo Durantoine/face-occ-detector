@@ -61,7 +61,7 @@ _NON_HF_TRAIN_KEYS = {
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_cell_reweight",
     # v8 axis 1 : 3-mechanism Y shift correction with strength γ
-    "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+    "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
     "sampler_power", "loss_power", "aug_share",
     # v8 axis 2 : soft cell rw via build_cell_weights^power
     "axis2_power",
@@ -541,10 +541,12 @@ def train(
     )
 
     model_name = model_cfg.get("model_name", "dinov3_vits16")
+    # v8 : log sans préfixe train_/model_/data_ pour simplicité UI/analyse.
+    # Risque de collision si même nom dans plusieurs sections — pas le cas chez nous.
     ml_log_params(client, run_id, {"architecture": cfg["name"]})
-    ml_log_params(client, run_id, {f"model_{k}": v for k, v in model_cfg.items()})
-    ml_log_params(client, run_id, {f"train_{k}": v for k, v in train_cfg.items()})
-    ml_log_params(client, run_id, {f"data_{k}": v for k, v in data_cfg.items()})
+    ml_log_params(client, run_id, dict(model_cfg))
+    ml_log_params(client, run_id, dict(train_cfg))
+    ml_log_params(client, run_id, dict(data_cfg))
 
     processor = get_image_processor(model_name)
     val_split_strategy = train_cfg.get("val_split_strategy", "stratified_yg")

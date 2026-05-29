@@ -91,7 +91,7 @@ optuna:
       type: float
       low: 0.0
       high: 1.0
-    axis1_loss_share:
+    axis1_loss_fraction:
       type: float
       low: 0.0
       high: 1.0

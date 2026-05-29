@@ -111,12 +111,14 @@ optuna:
       type: float
       low: 0.0
       high: 1.0
-    axis1_loss_share:
+    axis1_loss_fraction:
       type: float
       low: 0.0
       high: 1.0
-      # Note : si sampler_share + loss_share > 1, normalisation auto dans _refresh_axis1_powers
-      # (cf src/optimize.py). aug_share = max(0, 1 - sampler_share - loss_share).
+      # Stick-breaking sur le 2-simplexe (cf _refresh_axis1_powers) :
+      #   b = (1 - sampler_share) × loss_fraction         (loss share effectif)
+      #   c = (1 - sampler_share) × (1 - loss_fraction)   (aug share déduit)
+      # Garantit a + b + c = 1 sans normalisation post-hoc. TPE explore proprement le simplexe.
 
     # === Axe 2 — Soft G compensation (cell_rw 1/sqrt^power) ===
     axis2_power:

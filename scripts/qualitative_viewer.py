@@ -64,17 +64,17 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 HOVER_PARAMS = [
     "pretrained_source",
     "pooling_type",
-    "loss_focal_gamma",
-    "loss_fairness_lambda",
     # v8 — design 5 axes orthogonaux
     "axis1_strength",          # γ (force totale axe 1)
     "axis1_sampler_share",     # a (poids sampler test_pmf)
-    "axis1_loss_share",        # b (poids loss imp_rw)
+    "axis1_loss_fraction",     # f (stick-breaking : b = (1-a)·f)
     "sampler_power",           # = γ × a (effectif)
     "loss_power",              # = γ × b (effectif)
-    "aug_share",               # = γ × (1-a-b) (Y-conditional aug)
+    "aug_share",               # = γ × c (Y-conditional aug share)
     "axis2_power",             # soft cell_rw power
-    "feature_fairness",
+    "feature_fairness",        # {none, mmd, mixup_gender}
+    "loss_focal_gamma",
+    "loss_fairness_lambda",
     "learning_rate",
     "weight_decay",
     "num_train_epochs",
@@ -560,7 +560,7 @@ def _render_inter_trial(
             "pretrained_source", "pooling_type",
             "loss_focal_gamma", "loss_fairness_lambda",
             # v8 — 5 axes
-            "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+            "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
             "sampler_power", "loss_power", "aug_share",
             "axis2_power",
             "feature_fairness",
@@ -878,10 +878,11 @@ with tab_params:
         st.info("No params logged for this run.")
     else:
         # Highlight panel : v8 search-space params (the things that actually vary).
+        # v8 : pas de préfixe train_/model_/data_ — train.py log les keys directement.
         OPTUNA_KEYS = [
             "pretrained_source", "pooling_type",
-            # v8 — axe 1 (Y shift) + dérivés
-            "axis1_strength", "axis1_sampler_share", "axis1_loss_share",
+            # v8 — axe 1 (Y shift) + dérivés computés
+            "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
             "sampler_power", "loss_power", "aug_share",
             # v8 — axe 2-5
             "axis2_power",

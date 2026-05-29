@@ -649,7 +649,7 @@ l'appliquent à des stages différents :
 Paramètres v8 :
 - `axis1_strength` (γ) ∈ [0.5, 1.0] : intensité totale de la correction
 - `axis1_sampler_share` (a) ∈ [0, 1]
-- `axis1_loss_share` (b) ∈ [0, 1]
+- `axis1_loss_fraction` (f) ∈ [0, 1] — **stick-breaking** : b = (1 − a) × f, c = (1 − a) × (1 − f). Garantit a+b+c = 1 sans normalisation.
 - `aug_share` (c) = max(0, 1 − a − b) (déduit, normalisé si a+b>1)
 
 Effet combiné sur le gradient pour un sample dans bin b :
@@ -692,7 +692,7 @@ catastrophique des cellules ultra-rares.
 ### Reproduction du top v4 via le nouveau design
 
 Top v4 (Sapiens trial 18, score 0.00120) = `(none, cell_joint, mmd)` correspond à :
-- `axis1_strength=1.0, axis1_sampler_share=0, axis1_loss_share=1` → pure imp_rw (loss-side)
+- `axis1_strength=1.0, axis1_sampler_share=0, axis1_loss_fraction=1` → pure imp_rw (loss-side : b = (1-0)×1 = 1, a = 0, c = 0)
 - `axis2_power=1.0` → cell_rw sqrt full
 - `feature_fairness=mmd`
 - `loss_focal_gamma, loss_fairness_lambda` libres

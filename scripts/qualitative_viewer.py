@@ -613,24 +613,35 @@ def _render_inter_trial(
             cols = [c for c in focus_cols if c in top_per_exp.columns]
             st.dataframe(top_per_exp[cols], use_container_width=True, hide_index=True)
 
-        # Per-axis breakdown : pour chaque param catégoriel du search space, agrégation
-        # (best/avg/n_trials) par valeur. Permet de voir d'un coup d'œil quels choix
-        # gagnent et lesquels sont à pruner.
-        AXIS_PARAMS = [
-            "pretrained_source", "pooling_type",
-            "feature_fairness",
+        # Per-axis breakdown : agrégation (best/avg/med/n_trials) par valeur (catégoriels)
+        # ou par bin (continus). Permet d'identifier d'un coup d'œil quels choix gagnent.
+        AXIS_CATEGORICAL = [
+            "pretrained_source", "pooling_type", "feature_fairness",
         ]
+        # v8 : breakdown des continus binnés en quartiles. Permet de voir si γ haut/bas
+        # marche mieux, si focal_gamma converge vers une zone, etc.
+        AXIS_CONTINUOUS = [
+            "axis1_power",
+            "axis1_sampler_share", "axis1_share_loss", "axis1_share_aug",
+            "sampler_power", "loss_power", "aug_power",
+            "axis2_power",
+            "loss_focal_gamma", "loss_fairness_lambda",
+            "learning_rate", "layer_decay",
+        ]
+        N_BINS_CONTINUOUS = 4
         for fam_label, fam_key in families:
             fam_df = df[df["_family"] == fam_key]
             if fam_df.empty:
                 continue
             st.markdown(f"### Per-axis breakdown — {fam_label}")
             st.caption(
-                f"Pour chaque axe Optuna catégoriel : best score, avg score, n trials par choix. "
-                f"Trier par best ASC → identifier les choix gagnants et ceux à pruner."
+                f"Catégoriels : 1 ligne par choix. Continus : 4 quantiles. "
+                f"Best = min score dans le groupe. Trier par best ASC → identifier les "
+                f"valeurs gagnantes pour pruner le search space dans une future version."
             )
             rows: List[Dict[str, Any]] = []
-            for axis in AXIS_PARAMS:
+            # Catégoriels
+            for axis in AXIS_CATEGORICAL:
                 if axis not in fam_df.columns:
                     continue
                 axis_df = fam_df[["final_value", axis]].dropna(subset=[axis])
@@ -641,18 +652,41 @@ def _render_inter_trial(
                     if len(sub) == 0:
                         continue
                     rows.append({
-                        "axis": axis,
-                        "choice": str(choice),
-                        "n": int(len(sub)),
+                        "axis": axis, "choice": str(choice), "n": int(len(sub)),
+                        "best": float(sub["final_value"].min()),
+                        "avg": float(sub["final_value"].mean()),
+                        "med": float(sub["final_value"].median()),
+                    })
+            # Continus binnés en quartiles
+            for axis in AXIS_CONTINUOUS:
+                if axis not in fam_df.columns:
+                    continue
+                axis_df = fam_df[["final_value", axis]].copy()
+                # Convert string params → float (MLflow stores all as strings)
+                axis_df[axis] = pd.to_numeric(axis_df[axis], errors="coerce")
+                axis_df = axis_df.dropna(subset=[axis])
+                axis_df = axis_df[axis_df["final_value"].notna()]
+                if len(axis_df) < N_BINS_CONTINUOUS:
+                    continue
+                try:
+                    bins = pd.qcut(axis_df[axis], q=N_BINS_CONTINUOUS, duplicates="drop")
+                except ValueError:
+                    continue
+                for interval, sub in axis_df.groupby(bins, observed=True):
+                    if len(sub) == 0:
+                        continue
+                    # Format interval as readable range
+                    label = f"[{interval.left:.3f}, {interval.right:.3f}]"
+                    rows.append({
+                        "axis": axis, "choice": label, "n": int(len(sub)),
                         "best": float(sub["final_value"].min()),
                         "avg": float(sub["final_value"].mean()),
                         "med": float(sub["final_value"].median()),
                     })
             if not rows:
-                st.info("No categorical params available for this family.")
+                st.info("No params available for this family.")
                 continue
             ax_df = pd.DataFrame(rows).sort_values(["axis", "best"]).reset_index(drop=True)
-            # Cast for clean display
             for col in ("best", "avg", "med"):
                 ax_df[col] = ax_df[col].round(5)
             st.dataframe(ax_df, use_container_width=True, hide_index=True)

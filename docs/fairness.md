@@ -15,14 +15,19 @@
 >   Reste `none`, `mmd`, `mixup_gender`. La stratégie G (DANN) ci-dessous reste documentée
 >   à titre de référence théorique, mais le code DANN n'est plus activé par le sweep v6.
 >
-> **Mise à jour v6.5 — Paired-α design** : les axes 1 et 2 ont été **collapsés** en un seul
-> axe `correction_strategy` (4 choix) + un continu `correction_alpha ∈ [0, 1]`.
-> Constat clé : chaque paire (sampler, loss) ciblait la même correction r(y, g), juste
-> appliquée à des stages différents. Avec α, on partage la correction :
-> sampler ∝ r^α, loss ∝ r^(1−α), effet combiné = r exact (∀α).
-> α=1 ⇔ pur sampler (legacy), α=0 ⇔ pur loss, α=0.5 ⇔ hybride √-strength (poids effectifs
-> divisés par √r côté chaque mécanisme → moins d'extrêmes, moins de variance).
-> Voir §"Paired-α design" en fin de doc.
+> **Mise à jour v8 (current)** — **Refonte complète** sur la base du constat empirique
+> que le top historique (Sapiens t18, score 0.00120) utilisait `cell_joint + MMD`
+> (réintroduit en v8 sous forme de `axis2_power`). 5 axes orthogonaux, plus de
+> `correction_strategy / correction_alpha / correction_strength` (v6.5/v7 retirés).
+> Axe 1 (Y shift) : 3 mécaniques (sampler + loss + aug Y-conditional) via stick-breaking
+> sur le 2-simplexe, intensité totale γ ∈ [0, 1]. Voir §"v8 design — refonte axes
+> orthogonaux" en fin de doc pour le détail.
+>
+> **Mise à jour v6.5 (SUPERSEDED par v8)** : design `correction_strategy` collapsé +
+> `correction_alpha`. Retiré en v8 au profit du design 5 axes orthogonaux + stick-breaking.
+>
+> **Mise à jour v7 (SUPERSEDED par v8)** : ajout `correction_strength` β. Remplacé en v8
+> par `axis1_power` (γ) ∈ [0, 1] qui joue le même rôle (intensité totale axe 1).
 
 ---
 
@@ -525,7 +530,10 @@ The math: avec `f_sampler(b)` la fréquence par-bin du sampler et `w_imp(b)` le 
 
 ---
 
-## Paired-α design (v6.5)
+## Paired-α design (v6.5 — SUPERSEDED par v8, conservé pour historique)
+
+> ⚠️ Ce design n'est plus actif. v8 retire `correction_strategy` / `correction_alpha`
+> au profit du design 5 axes orthogonaux + stick-breaking. Voir §"v8 design" en fin de doc.
 
 ### Constat motivant le refactor
 
@@ -596,7 +604,10 @@ Le sampler est **discret** (sélection de samples → batch), pas différentiabl
 - [src/optimize.py](../src/optimize.py) — `_CORRECTION_STRATEGY_PAIRS` map les 4 corrections vers leur paire (sampler, loss). `_apply_trial_param` propage `correction_alpha` → `sampler_power=α`, `loss_power=1-α`.
 - [src/train.py](../src/train.py) — short-circuit propre quand power=0 (skip sampler/loss respectivement).
 
-### Extension v7 : `correction_strength` (β)
+### Extension v7 : `correction_strength` (β) — SUPERSEDED par v8
+
+> ⚠️ `correction_strength` retiré en v8 → remplacé par `axis1_power` (γ) ∈ [0, 1] qui
+> joue exactement le même rôle (intensité totale axe 1).
 
 v7 ajoute un coefficient β ∈ [0.3, 1.0] qui contrôle l'**intensité totale** de la correction (orthogonal à α qui contrôle la répartition sampler/loss) :
 
@@ -635,45 +646,82 @@ On peut atteindre cet objectif sans modifier P(G|Y) train, via :
 - `loss_fairness_lambda` : pression directe sur le gap d'erreur
 - `axis2_power` (cell_rw soft) : compensation douce des cellules rares (top v4)
 
-### Axe 1 — Y shift correction (3 mécaniques)
+### Axe 1 — Y shift correction (3 mécaniques + stick-breaking)
 
 Les 3 mécaniques partagent la même correction `r(b) = P_test(b) / P_train(b)` mais
 l'appliquent à des stages différents :
 
-| Mécanique | Effet | Implementation |
+| Mécanique | Effet sur gradient | Implementation |
 |---|---|---|
-| **Sampler test_pmf** (poids `a × γ`) | Tire plus souvent les bins haut-Y | [`create_test_pmf_sampler(power=...)`](../src/data/dataset.py) |
-| **Loss imp_rw** (poids `b × γ`) | Pondère gradient par r^power | [`build_importance_weights(power=...)`](../src/utils/losses.py) |
-| **Aug Y-conditional** (poids `c × γ`) | Réplique k_i = r^power copies augmentées | [`YConditionalAugDataset`](../src/data/dataset.py) |
+| **Sampler test_pmf** | tirage ∝ `r^sampler_power` | [`create_test_pmf_sampler(power=...)`](../src/data/dataset.py) |
+| **Loss imp_rw** | weight ∝ `r^loss_power` | [`build_importance_weights(power=...)`](../src/utils/losses.py) |
+| **Aug Y-conditional** | k_i copies = `r^aug_power` | [`YConditionalAugDataset`](../src/data/dataset.py) |
 
-Paramètres v8 :
-- `axis1_strength` (γ) ∈ [0.5, 1.0] : intensité totale de la correction
-- `axis1_sampler_share` (a) ∈ [0, 1]
-- `axis1_loss_fraction` (f) ∈ [0, 1] — **stick-breaking** : b = (1 − a) × f, c = (1 − a) × (1 − f). Garantit a+b+c = 1 sans normalisation.
-- `aug_share` (c) = max(0, 1 − a − b) (déduit, normalisé si a+b>1)
+#### Paramètres TPE (raw, dans search_space yaml)
 
-Effet combiné sur le gradient pour un sample dans bin b :
-> tirage `r^(γa)` × loss weight `r^(γb)` × aug count `r^(γc)` = `r^(γ × (a+b+c)) = r^γ`
+| Param | Range | Sens |
+|---|---|---|
+| `axis1_power` (γ) | [0, 1] | **Puissance globale axe 1**. γ=0 → aucune correction (ERM baseline). γ=1 → correction complète (effet `r^γ` = `r` sur gradient). |
+| `axis1_sampler_share` (a) | [0, 1] | Fraction de γ allouée au sampler |
+| `axis1_loss_fraction` (f) | [0, 1] | **Stick-breaking** : fraction du reste (1−a) allouée au loss. Le reste va à aug. |
 
-γ=1 → correction complète. γ=0.5 → correction modérée (√r). La répartition (a, b, c)
-détermine **comment** la correction est appliquée (data-side, gradient-side, ou diversity).
+#### Computed normalized shares (visible UI, somment à 1)
+
+```
+axis1_sampler_share  = a                  (déjà normalisé)
+axis1_share_loss     = (1 − a) × f
+axis1_share_aug      = (1 − a) × (1 − f)
+```
+
+Le **stick-breaking** garantit `share_sampler + share_loss + share_aug = 1` sans
+normalisation post-hoc qui décalerait les valeurs samplées par TPE. TPE explore
+proprement le 2-simplexe.
+
+#### Effective powers (= γ × share, somment à γ)
+
+```
+sampler_power = γ × axis1_sampler_share
+loss_power    = γ × axis1_share_loss
+aug_power     = γ × axis1_share_aug
+```
+
+#### Effet combiné sur le gradient
+
+Pour un sample dans bin `b` avec ratio `r = P_test(b)/P_train(b)` :
+
+```
+tirage_sampler × poids_loss × copies_aug
+  = r^sampler_power × r^loss_power × r^aug_power
+  = r^(γ × (a + (1-a)f + (1-a)(1-f)))
+  = r^(γ × 1)
+  = r^γ
+```
+
+→ γ détermine **à quel point** on corrige (0=rien, 1=correction complète).
+→ (a, f) déterminent **comment** la correction est appliquée (data-side, gradient-side, diversité).
 
 ### Aug Y-conditional — stochastic Bernoulli rounding
 
 Pour chaque sample `i` dans bin `b(i)`, on calcule l'espérance de copies :
-> `k_float_i = r(b_i)^c`
+```
+k_float_i = r(b_i)^aug_power
+```
 
 On tire le nombre réel de copies via Bernoulli rounding :
 - `k_int = floor(k_float)` (copies garanties)
-- Plus 1 copie supplémentaire avec proba `k_float - floor(k_float)`
+- Plus 1 copie supplémentaire avec probabilité `k_float - floor(k_float)`
 
-Cette procédure préserve **exactement** E[k] = k_float (vérifié à 30 seeds dans le test
-de validation). Chaque copie passe par la pipeline d'augmentation standard, donc chaque
-copie est une vue **différente** du même sample base. Combiné, ça produit la diversité
-demandée sans memo des samples rares.
+Cette procédure préserve **exactement** E[k] = k_float (validé à 30 seeds dans
+l'audit). Chaque copie passe par la pipeline d'augmentation stochastique (flip,
+color jitter, rotation 8°), donc chaque copie est une **vue différente** du même
+sample base. Combiné, ça produit la diversité demandée sans memo des samples rares.
 
-`set_epoch()` re-roll le mapping virtuel à chaque epoch via un `TrainerCallback` dédié,
-évitant que la même sélection de copies se fige sur tout le training.
+**Design note** : `virtual_to_base` est fixé au `__init__` du dataset (pas de re-roll
+par epoch). Sinon le sampler (poids alignés à init time) deviendrait incohérent. La
+diversité epoch-à-epoch vient de :
+1. L'augmentation stochastique sur chaque `__getitem__`
+2. Le sampler with replacement qui tire différentes virtual_idx par epoch
+3. Le shuffle du DataLoader
 
 ### Axe 2 — Soft G compensation (cell_rw)
 
@@ -692,18 +740,31 @@ catastrophique des cellules ultra-rares.
 ### Reproduction du top v4 via le nouveau design
 
 Top v4 (Sapiens trial 18, score 0.00120) = `(none, cell_joint, mmd)` correspond à :
-- `axis1_strength=1.0, axis1_sampler_share=0, axis1_loss_fraction=1` → pure imp_rw (loss-side : b = (1-0)×1 = 1, a = 0, c = 0)
+- `axis1_power=1.0, axis1_sampler_share=0, axis1_loss_fraction=1`
+  → shares = (sampler=0, loss=1, aug=0) → pure imp_rw (loss-side)
 - `axis2_power=1.0` → cell_rw sqrt full
 - `feature_fairness=mmd`
-- `loss_focal_gamma, loss_fairness_lambda` libres
+- `loss_focal_gamma`, `loss_fairness_lambda` libres
 
 Le sweep v8 inclut cette configuration et toutes ses voisines, en plus de couvrir le
 sweet spot 3-mécaniques (sampler + loss + aug Y-conditional).
+
+#### Exemples de configurations TPE et leurs effets
+
+| γ | a | f | share_sampler | share_loss | share_aug | Interprétation |
+|---|---|---|---|---|---|---|
+| 1.0 | 1.0 | — | 1.00 | 0.00 | 0.00 | Pure sampler (legacy v6 test_pmf) |
+| 1.0 | 0.0 | 1.0 | 0.00 | 1.00 | 0.00 | Pure loss imp_rw (cell_joint composant Y) |
+| 1.0 | 0.0 | 0.0 | 0.00 | 0.00 | 1.00 | Pure aug Y-conditional (NEW) |
+| 1.0 | 0.33 | 0.5 | 0.33 | 0.33 | 0.33 | 3 mécaniques équilibrées |
+| 0.5 | 0.5 | 0.5 | 0.50 | 0.25 | 0.25 | Correction √r modérée, sampler dominant |
+| 0.0 | * | * | 0.00 | 0.00 | 0.00 | ERM baseline (pas de correction Y) |
 
 ### Implémentation
 
 - [src/data/dataset.py](../src/data/dataset.py) — `YConditionalAugDataset`, `create_sampler_weights_for_virtual`
 - [src/utils/losses.py](../src/utils/losses.py) — `build_cell_weights(..., power)` (cell_rw soft)
-- [src/optimize.py](../src/optimize.py) — `_refresh_axis1_powers()` : recompute sampler_power/loss_power/aug_share depuis γ × shares
-- [src/train.py](../src/train.py) — wiring complet, callback `_YCondAugEpochCallback` pour re-roll virtual mapping
-- Pinned : `ema_decay=0`, `loss_type=weighted_mse`, `augmentation_level=medium`, `val_split_strategy=test_pmf`, `eval_importance_reweight=false`
+- [src/optimize.py](../src/optimize.py) — `_refresh_axis1_powers()` : recompute shares + powers depuis (γ, a, f) via stick-breaking
+- [src/train.py](../src/train.py) — wiring complet (sampler avec power, loss avec power, dataset virtuel YCondAug)
+- **Pinned defaults** : `ema_decay=0`, `loss_type=weighted_mse`, `augmentation_level=medium`, `val_split_strategy=test_pmf`, `eval_importance_reweight=false`
+- **Perfo** : `dataloader_persistent_workers=True` (évite re-spawn workers par epoch)

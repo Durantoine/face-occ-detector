@@ -27,8 +27,8 @@ from src.utils.mlflow_utils import get_or_create_experiment
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vits16-face-occ"),
-    "n_trials": 30,
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v10"),
+    "n_trials": 100,
     "study_name": None,
     "tracking_uri": "sqlite:///mlflow.db",
     "storage": "sqlite:///optuna.db",
@@ -40,25 +40,17 @@ CONFIG: Dict[str, Any] = {
 }
 
 _TRAINING_KEYS = {
+    # Optim / Reg
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
-    "augmentation_level", "ema_decay", "layer_decay",
+    # v10 design
+    "augmentation_level",
+    "axis1_power", "axis2_power", "aug_share",
+    "feature_fairness", "mmd_lambda", "adv_lambda",
     "loss_focal_gamma", "loss_fairness_lambda",
-    "sampler_strategy", "loss_importance_reweight", "loss_cell_reweight",
-    # v9 axes :
-    # Axe 1 stick-breaking 2-way (sampler + loss seul, aug retirée) :
-    #   Raw TPE = axis1_power (γ), axis1_sampler_share (a)
-    #   Computed = sampler_power=γa, loss_power=γ(1-a)
-    # Axe 2 = intensité directe cell_rw soft avec base 1/count^0.75.
-    "axis1_power", "axis1_sampler_share",
-    "sampler_power", "loss_power",
-    "axis2_power",
-    "loss_query_diversity_lambda", "loss_type", "group_dro_alpha",
-    "loss_mmd_alignment", "mixup_inter_gender",
-    "mmd_lambda", "mixup_alpha",
-    "val_split_strategy",
-    "feature_fairness",
+    "loss_query_diversity_lambda",
 }
+
 _MODEL_KEYS = {
     "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
     "backbone_drop_path_rate",
@@ -67,69 +59,27 @@ _MODEL_KEYS = {
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
     "num_heads", "gem_p_init",
     "pool_attn_dropout", "pool_proj_dropout",
-    "attn_dropout", "proj_dropout",
 }
 
-# v8 — Design 5 axes, axe 1 à 3 mécaniques (sampler, loss, aug Y-conditional) dont
-# les shares (a, b, c) somment à 1, multipliées par axis1_strength ∈ [0.5, 1.0].
-# Effet combiné sur gradient pour bin b : r(b)^(γ × (a+b+c)) = r(b)^γ.
-#   γ = 1 → correction complète. γ = 0.5 → correction modérée (sqrt).
-# Décomposition lisible :
-#   - sampler_power = γ × sampler_share : intensité du test_pmf sampler
-#   - loss_power = γ × loss_share : intensité du imp_rw loss reweight
-#   - aug_share_eff = γ × aug_share : intensité de l'aug Y-conditional (multiplicateur k_i)
-# Voir docs/fairness.md §"v8 design" pour le détail.
-
-_FEATURE_FAIRNESS_MAP: Dict[str, Dict[str, Any]] = {
-    "none":         {"loss_mmd_alignment": False, "mixup_inter_gender": False},
-    "mmd":          {"loss_mmd_alignment": True,  "mixup_inter_gender": False},
-    "mixup_gender": {"loss_mmd_alignment": False, "mixup_inter_gender": True},
-}
-
-
-def _refresh_axis1_powers(cfg: Dict[str, Any]) -> None:
-    """Compute axe 1 effective powers from TPE raw params.
-
-    v9 : stick-breaking 2-way (sampler + loss seulement, aug retirée — pas concluant en v8).
-      γ = axis1_power            ∈ [0, 1]   — intensité totale axe 1
-      a = axis1_sampler_share    ∈ [0, 1]   — fraction sampler
-
-    Effective powers :
-      sampler_power = γ × a
-      loss_power    = γ × (1 - a)
-
-    Combined gradient effect ≈ r^γ.
-    """
-    t = cfg["training"]
-    gamma = float(t.get("axis1_power", 1.0))
-    a = min(max(float(t.get("axis1_sampler_share", 1.0)), 0.0), 1.0)
-    t["sampler_power"] = gamma * a
-    t["loss_power"] = gamma * (1.0 - a)
+_FEATURE_FAIRNESS_CHOICES = ("none", "mmd", "dann", "both")
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    if name in ("axis1_power", "axis1_sampler_share"):
-        cfg["training"][name] = float(value)
-        _refresh_axis1_powers(cfg)
-        return
-    if name == "feature_fairness":
-        if str(value) not in _FEATURE_FAIRNESS_MAP:
-            raise ValueError(f"Unknown feature_fairness: {value!r}")
-        for k, v in _FEATURE_FAIRNESS_MAP[str(value)].items():
-            cfg["training"][k] = v
-        return
+    """v10 — no stick-breaking or derived params. Direct assignment from TPE knobs."""
     if name == "pretrained_source":
-        # "lvd"            → default pretrained backbone, no MLflow override
-        # "ibot:runs:/..." → default pretrained backbone, THEN override with the
-        #                    MLflow-registered iBOT encoder from the given run.
         s = str(value)
         cfg["model"]["pretrained"] = True
-        if s == "lvd" or s == "sapiens_default":
+        if s in ("lvd", "sapiens_default"):
             cfg["model"]["init_backbone_from"] = None
         elif s.startswith("ibot:"):
             cfg["model"]["init_backbone_from"] = s[len("ibot:"):]
         else:
             raise ValueError(f"Unknown pretrained_source: {s}")
+        return
+    if name == "feature_fairness":
+        if str(value) not in _FEATURE_FAIRNESS_CHOICES:
+            raise ValueError(f"Unknown feature_fairness: {value!r}")
+        cfg["training"]["feature_fairness"] = str(value)
         return
     if name in _TRAINING_KEYS:
         cfg["training"][name] = value
@@ -151,8 +101,6 @@ def _suggest(trial: optuna.Trial, name: str, spec: Dict[str, Any]) -> Any:
 
 
 def _spec_active(spec: Dict[str, Any], sampled: Dict[str, Any]) -> bool:
-    """Conditional gating: a spec with `conditional_on: {param: [allowed, values]}` is
-    sampled only when sampled[param] is in the allowed list. Missing dependency → skip."""
     cond = spec.get("conditional_on")
     if not cond:
         return True
@@ -170,7 +118,6 @@ def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int
     if not search_space:
         raise ValueError(f"No search_space in config '{base_config.get('name')}'")
 
-    # Two-pass: unconditional first (so parents are sampled), then conditional children.
     sampled: Dict[str, Any] = {}
     for name, spec in search_space.items():
         if name == "seed" or spec.get("conditional_on"):
@@ -280,18 +227,14 @@ def objective(
             import sys
             import traceback
             print(f"!!! TRIAL {trial_data['n']} FAILED: {type(exc).__name__}: {exc}", flush=True)
-            traceback.print_exc(file=sys.stdout)  # visible in .out alongside the silent score=inf
-            traceback.print_exc()                 # also stderr (.err) for legacy log scrapers
+            traceback.print_exc(file=sys.stdout)
+            traceback.print_exc()
             if client and run_id:
                 try:
                     client.set_terminated(run_id, "FAILED")
                 except Exception:
                     pass
 
-    # Post-train MLflow ops + user attrs in a SEPARATE try/except so a failed
-    # MLflow call (e.g. run already terminated by _save_model_to_mlflow) does NOT
-    # poison the Optuna trial value (which would record `inf` instead of the
-    # actual score returned by train()).
     if is_main() and client and run_id:
         try:
             for k, v in [
@@ -301,7 +244,7 @@ def objective(
                 client.log_metric(run_id, k, v)
             client.set_terminated(run_id, "FINISHED")
         except Exception as e:
-            print(f"WARNING: post-train MLflow logging failed (trial value preserved): {e}")
+            print(f"WARNING: post-train MLflow logging failed: {e}")
         print(f"Trial {trial_data['n']}: score={score:.5f} err_F={err_F:.5f} err_M={err_M:.5f} err_diff={err_diff:.5f}")
     try:
         trial.set_user_attr("score", float(score))
@@ -309,16 +252,14 @@ def objective(
         trial.set_user_attr("err_M", float(err_M))
         trial.set_user_attr("err_diff", float(err_diff))
         trial.set_user_attr("eval_loss", float(eval_loss))
-        # Pull additional diagnostic metrics from MLflow (already logged by train.py)
         if client and run_id:
             try:
                 run_data = client.get_run(run_id).data.metrics
-                # v8 clean : noms canoniques uniquement (pas de legacy fallback).
-                for k in ["eval_mae_pct", "eval_r2", "eval_challenge_score_raw"]:
+                for k in ["eval_mae_pct", "eval_r2"]:
                     if k in run_data:
                         trial.set_user_attr(k.replace("eval_", ""), float(run_data[k]))
             except Exception as e_pull:
-                print(f"WARNING: could not pull metrics from MLflow to user_attrs: {e_pull}")
+                print(f"WARNING: could not pull metrics from MLflow: {e_pull}")
     except Exception as e:
         print(f"WARNING: trial.set_user_attr failed: {e}")
     finally:
@@ -379,13 +320,7 @@ def _top_n_threshold(study: optuna.Study, mode: str, n: int) -> float:
 
 
 class _PruneRegistryToTopN:
-    def __init__(
-        self,
-        client: Optional[MlflowClient],
-        base_arch: str,
-        mode: str,
-        n: int,
-    ) -> None:
+    def __init__(self, client: Optional[MlflowClient], base_arch: str, mode: str, n: int) -> None:
         self.client = client
         self.base_arch = base_arch
         self.mode = mode
@@ -420,56 +355,57 @@ class _PruneRegistryToTopN:
                 print(f"WARNING: could not delete registered model {model_name}: {e}")
 
 
-def _validate_v4_search_space(base_config: Dict[str, Any]) -> None:
-    """Reject legacy v3 yamls that use `balancing_strategy` (replaced by 3 axes in v4).
-
-    Fails fast with a clear migration message instead of silently ignoring the old
-    parameter and producing meaningless trials.
-    """
+def _validate_search_space(base_config: Dict[str, Any]) -> None:
+    """Reject legacy keys (v3-v9) explicitly to fail fast on bad yamls."""
     ss = base_config.get("optuna", {}).get("search_space", {})
     LEGACY = {
-        "balancing_strategy": "v3 monolithic axis (use axis1/axis2 in v8)",
-        "sampler_strategy": "v4-v7 (replaced by axis1_sampler_share in v8)",
-        "loss_rw_strategy": "v4-v7 (replaced by axis1_loss_share + axis2_power in v8)",
-        "correction_strategy": "v6.5 paired-α (replaced by axis1_* in v8)",
-        "correction_alpha": "v6.5 (replaced by axis1_sampler/loss_share)",
-        "correction_strength": "v7 (replaced by axis1_strength)",
+        "balancing_strategy": "v3 monolithic axis",
+        "sampler_strategy": "v4-v7 (sampler retiré en v10)",
+        "loss_rw_strategy": "v4-v7",
+        "correction_strategy": "v6.5",
+        "correction_alpha": "v6.5",
+        "correction_strength": "v7",
+        "axis1_sampler_share": "v8-v9 stick-breaking (retiré v10)",
+        "axis1_loss_fraction": "v8 stick-breaking",
+        "axis1_share_loss": "v8",
+        "axis1_share_aug": "v8",
+        "aug_power": "v8",
+        "sampler_power": "v9",
+        "loss_power": "v9",
+        "val_split_alpha": "v9 interpolation (retiré v10)",
+        "loss_mmd_alignment": "v8 (remplacé par feature_fairness)",
+        "mixup_inter_gender": "v8 (retiré v10)",
+        "loss_adv_debiasing": "v8 (remplacé par feature_fairness=dann)",
+        "loss_importance_reweight": "v3-v7",
+        "loss_cell_reweight": "v3-v7",
+        "ema_decay": "v4-v9 (EMA retiré v10)",
+        "layer_decay": "v6-v9 (LLRD retiré v10)",
+        "group_dro_alpha": "v6 (GroupDRO retiré v10)",
+        "val_split_strategy": "v6-v9 (pinned test_pmf v10)",
     }
     bad = [k for k in LEGACY if k in ss]
     if bad:
-        msg = "Legacy search_space params detected (v8 cleanup removes them) :\n"
+        msg = "Legacy search_space params detected (v10 cleanup) :\n"
         for k in bad:
             msg += f"  - {k} : {LEGACY[k]}\n"
-        msg += "Migrate the yaml to v8 axis1/axis2 design or use the corresponding branch."
+        msg += "Migrate the yaml to v10 axis1/axis2/aug_share design."
         raise ValueError(msg)
 
 
 def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_uri: str) -> None:
-    """Fail-fast validation of `pretrained_source` choices in the search space.
-
-    Catches two common errors before the sweep burns GPU hours:
-      - Forgotten placeholders like `__FILL_VITH16PLUS_IBOT_RUN_ID__` in the iBOT URI
-      - Non-existent MLflow runs (typo, wrong tracking URI, run deleted)
-
-    Choices follow the schema `"lvd" | "sapiens_default" | "ibot:runs:/<run_id>/<artifact>"`.
-    Only the `ibot:...` branch is validated against MLflow.
-    """
     import re
-
     ss = base_config.get("optuna", {}).get("search_space", {})
     spec = ss.get("pretrained_source")
     if not spec or spec.get("type") != "categorical":
         return
     choices = spec.get("choices") or []
-
     placeholder_pattern = re.compile(r"__FILL[_A-Z0-9]*__")
     run_id_pattern = re.compile(r"^ibot:runs:/([^/]+)/")
-
     bad: List[str] = []
     for c in choices:
         s = str(c)
         if placeholder_pattern.search(s):
-            bad.append(f"  ✗ '{s}' contains a placeholder — fill the MLflow run_id of the iBOT pretrain")
+            bad.append(f"  ✗ '{s}' contains a placeholder")
             continue
         m = run_id_pattern.match(s)
         if m:
@@ -477,14 +413,9 @@ def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_ur
             try:
                 MlflowClient(tracking_uri=tracking_uri).get_run(run_id)
             except Exception as e:
-                bad.append(f"  ✗ '{s}' → MLflow lookup of run {run_id} failed: {e}")
-
+                bad.append(f"  ✗ '{s}' → MLflow lookup failed: {e}")
     if bad:
-        msg = (
-            "Invalid pretrained_source choices in search_space — fix the yaml before starting the sweep:\n"
-            + "\n".join(bad)
-        )
-        raise ValueError(msg)
+        raise ValueError("Invalid pretrained_source:\n" + "\n".join(bad))
 
 
 def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna.Study:
@@ -506,12 +437,12 @@ def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna
                 time.sleep(random.uniform(1, 3))
             else:
                 raise
-    raise RuntimeError(f"Could not create study {study_name} after retries")
+    raise RuntimeError(f"Could not create study {study_name}")
 
 
 def optimize_hyperparameters(
     architecture: str,
-    n_trials: int = 30,
+    n_trials: int = 100,
     study_name: Optional[str] = None,
     tracking_uri: str = "sqlite:///mlflow.db",
     storage: str = "sqlite:///optuna.db",
@@ -532,14 +463,11 @@ def optimize_hyperparameters(
     n_trials = optuna_cfg.get("n_trials", n_trials)
     keep_top_n = int(optuna_cfg.get("keep_top_n", 3))
 
-    # Early validation: fail fast on common config bugs (legacy params, broken URIs).
     if is_main():
-        _validate_v4_search_space(base_config)
+        _validate_search_space(base_config)
         if use_mlflow:
             _validate_pretrained_source_choices(base_config, tracking_uri)
     if study_name is None:
-        # No date suffix: chained SLURM links must resume the same study via load_if_exists=True.
-        # To start fresh, delete the study manually: `optuna delete-study --study-name optuna-<arch> --storage sqlite:///optuna.db`
         study_name = f"optuna-{architecture}"
 
     study: Optional[optuna.Study] = None

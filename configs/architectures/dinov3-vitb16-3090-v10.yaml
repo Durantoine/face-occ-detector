@@ -1,0 +1,195 @@
+name: dinov3-vitb16-3090-v10
+description: |
+  DINOv3 ViT-B/16 (86M) v10 — Back to basics. Inspired by v4 top (0.001198).
+
+  CORE DESIGN — UNIFIED REBALANCING TARGET :
+    P_target(g, y) = mix_y(α1) × mix_g(α2)
+      mix_y(α1) = (1-α1) × P_train_marg_y + α1 × P_test_y
+      mix_g(α2) = (1-α2) × P_train(g|y) + α2 × 0.5
+    target_weight_i = P_target(g_i, y_i) / P_train_emp(g_i, y_i)
+
+  Split LOSS / AUG via aug_share :
+    loss_weight_i = target_weight_i^(1 - aug_share)
+    aug_repli_i   = bernoulli_round(target_weight_i^aug_share), capped at K_max=3
+
+  AXES :
+    Axe 1 = α1 (axis1_power)     : tension P_test sur Y marginal
+    Axe 2 = α2 (axis2_power)     : tension 50/50 F/M intra-Y
+    Axe 3 = feature_fairness     : {none, mmd, dann, both} + mmd_lambda
+
+  RETIRÉ vs v9 :
+    - LLRD (layer_decay), EMA, sampler (test_pmf), val_split_alpha
+    - GroupDRO, mixup_inter_gender, cell_class_weights, gender_class_weights
+    - MixSpikeBeta (retour empirique 10 bins × 0.05)
+    - eval_pmf_ratio compensation (val = P_test exact)
+
+  FIX v10 :
+    - MMD bandwidth via median heuristic (au lieu de sigmas fixes cassés)
+    - LR/WD ranges narrowed à zones historiquement productives
+    - DANN réactivé (feature_fairness=dann|both) avec adv_lambda=0.01 fixé
+
+model:
+  model_name: dinov3_vitb16
+  output_dim: 1
+  head_dropout: 0.1
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  num_heads: 4
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+
+training:
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 128
+  gradient_accumulation_steps: 1
+  num_train_epochs: 8   # default si pas override par HPO
+  learning_rate: 5.0e-05
+  weight_decay: 0.10
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine_with_min_lr_rate
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.1
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: light_v10
+  loss_type: weighted_mse
+  loss_fairness_lambda: 1.0   # PINNED = formule métrique
+  adv_lambda: 0.01            # PINNED si DANN actif
+  aug_repli_max: 3            # cap anti-overfit
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 100
+  objective_mode: score
+  rotate_val_seed: true
+  keep_top_n: 3
+  search_space:
+    # === Architecture ===
+    pretrained_source:
+      type: categorical
+      choices:
+        - "lvd"
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder"
+    pooling_type:
+      type: categorical
+      choices: [cls, attention_k_query, multihead_attention]
+
+    # === Rebalancing v10 (3 knobs simples) ===
+    axis1_power: {type: float, low: 0.0, high: 1.0}
+    axis2_power: {type: float, low: 0.0, high: 1.0}
+    aug_share:   {type: float, low: 0.0, high: 0.5}
+
+    # === Feature fairness ===
+    feature_fairness:
+      type: categorical
+      choices: [none, mmd, dann, both]
+    mmd_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: [mmd, both]
+    adv_lambda:
+      type: float
+      low: 0.001
+      high: 0.05
+      log: true
+      conditional_on:
+        feature_fairness: [dann, both]
+
+    # === Loss ===
+    loss_focal_gamma: {type: float, low: 0.0, high: 2.5}
+    loss_fairness_lambda: {type: float, low: 0.5, high: 1.5}
+
+    # === Optim + Reg (narrowed historiquement) ===
+    learning_rate: {type: float, low: 1.5e-05, high: 4.0e-04, log: true}
+    num_train_epochs: {type: int, low: 6, high: 12}
+    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    head_dropout:  {type: float, low: 0.0, high: 0.4}
+    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
+
+    # === Pool dropouts (conditional sur attention pools) ===
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.5
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.5
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+
+    # === K-query pool params ===
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_focal_init:
+      type: float
+      low: 0.08
+      high: 0.3
+      log: true
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_diffuse_init:
+      type: float
+      low: 1.0
+      high: 4.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      low: 1
+      high: 6
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      low: 0
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # === MHA pool params ===
+    num_heads:
+      type: categorical
+      choices: [2, 4, 8, 16]
+      conditional_on:
+        pooling_type: multihead_attention

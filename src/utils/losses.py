@@ -4,115 +4,142 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.utils.distributions import _TEST_DIST, _TRAIN_DIST
+
+# v10 : retour aux distributions empiriques avec 10 bins de width 0.05.
+# Grille plus large = smoothing implicite (bin 19 anomalie disparaît, ratios stables).
+# P_test extraite du PDF page 3 (29980 images), re-binnée à 10 bins.
+N_BINS = 10
+BIN_WIDTH = 0.05
+
+# P_test 10 bins (somme des 20 bins originaux par paires) — raw extraction PDF.
+_TEST_PMF = np.array([
+    0.0967 + 0.0546,    # bin 0 : Y ∈ [0.00, 0.05)
+    0.0847 + 0.0642,    # bin 1 : Y ∈ [0.05, 0.10)
+    0.0812 + 0.0692,    # bin 2 : Y ∈ [0.10, 0.15)
+    0.0838 + 0.0677,    # bin 3 : Y ∈ [0.15, 0.20)
+    0.0790 + 0.0713,    # bin 4 : Y ∈ [0.20, 0.25)
+    0.0681 + 0.0589,    # bin 5 : Y ∈ [0.25, 0.30)
+    0.0448 + 0.0316,    # bin 6 : Y ∈ [0.30, 0.35)
+    0.0228 + 0.0118,    # bin 7 : Y ∈ [0.35, 0.40)
+    0.0056 + 0.0023,    # bin 8 : Y ∈ [0.40, 0.45)
+    0.0012 + 0.0006,    # bin 9 : Y ∈ [0.45, 0.50)
+], dtype=np.float64)
+_TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
 
 
-# v9 : P_test et P_train viennent maintenant de distributions paramétriques
-# (Mix(spike + Beta)) fittées une fois (cf src/utils/distributions.py). Les
-# arrays ci-dessous sont les PMF évaluées sur la grille canonique 20 bins de
-# width 0.025, exposés pour compat (utilisés direct par eval_pmf_ratio dans
-# train.py et build_importance_weights).
-_TEST_PMF_0025 = _TEST_DIST.pmf_at_bins(n_bins=20, bin_width=0.025)
-_TRAIN_PMF_0025 = _TRAIN_DIST.pmf_at_bins(n_bins=20, bin_width=0.025)
+def compute_empirical_pmf(targets: np.ndarray, n_bins: int = N_BINS, bin_width: float = BIN_WIDTH) -> np.ndarray:
+    edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
+    y = np.clip(np.asarray(targets, dtype=np.float64), 0.0, edges[-1] - 1e-9)
+    hist, _ = np.histogram(y, bins=edges)
+    return hist.astype(np.float64) / max(hist.sum(), 1)
 
 
-def build_importance_weights(
-    train_targets: Optional[np.ndarray] = None,
-    test_pmf: np.ndarray = _TEST_PMF_0025,
-    train_pmf: np.ndarray = _TRAIN_PMF_0025,
-    clip: float = 20.0,
-    power: float = 1.0,
+def compute_empirical_pmf_cell(
+    targets: np.ndarray, gender: np.ndarray,
+    n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
 ) -> np.ndarray:
-    """Per-bin importance weights w[b] = (P_test[b] / P_train[b])^power, clipped + normalized.
-
-    v9 : P_train est lu depuis `_TRAIN_PMF_0025` (smoothed Mix(spike+Beta)). `train_targets`
-    est ignoré, gardé pour signature ascendante (callers passent `y_train` positionnel).
-    """
-    del train_targets
-    w = test_pmf / np.maximum(train_pmf, 1e-6)
-    if power != 1.0:
-        w = np.power(w, power)
-    w = np.clip(w, 1.0 / clip, clip)
-    w = w / w.mean()
-    return w
-
-
-def importance_weight_of(
-    targets: torch.Tensor,
-    pmf_ratio: torch.Tensor,
-    bin_width: float = 0.025,
-) -> torch.Tensor:
-    n_bins = pmf_ratio.numel()
-    idx = torch.clamp((targets / bin_width).long(), 0, n_bins - 1)
-    return pmf_ratio[idx]
-
-
-def build_cell_weights(
-    train_targets: np.ndarray,
-    train_gender: np.ndarray,
-    n_bins: int = 20,
-    bin_width: float = 0.025,
-    power: float = 1.0,
-    base_exp: float = 0.75,
-) -> np.ndarray:
-    """Cell weights soft : w = (1 / count(g,b)^base_exp)^power, normalisé à mean=1.
-
-    v9 : base_exp passe de 0.5 (sqrt) à 0.75 (entre sqrt et inverse plein) → plus mordant
-    sur cellules rares sans dépasser power=1 par mécanisme. Au max (power=1, base_exp=0.75)
-    le ratio cell rare/dense ≈ 43× (vs 12× avec sqrt). À power=0 → uniform.
-    """
-    g = (np.asarray(train_gender) >= 0.5).astype(int)
-    b = np.clip((np.asarray(train_targets) / bin_width).astype(int), 0, n_bins - 1)
+    """Empirical joint pmf P(g, y), shape (2, n_bins). Sums to 1."""
+    g = (np.asarray(gender) >= 0.5).astype(int)
+    b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
     counts = np.zeros((2, n_bins), dtype=np.float64)
     for gi, bi in zip(g, b):
         counts[gi, bi] += 1
-    counts = np.maximum(counts, 1.0)
-    w = 1.0 / np.power(counts, base_exp)
-    if power != 1.0:
-        w = np.power(w, power)
-    w = w / w.mean()
-    return w
+    return counts / max(counts.sum(), 1)
+
+
+def compute_target_weights(
+    targets: np.ndarray, gender: np.ndarray,
+    axis1_power: float, axis2_power: float,
+    n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
+    test_pmf_y: np.ndarray = _TEST_PMF,
+    clip: float = 20.0,
+) -> np.ndarray:
+    """v10 — UNIFIED target weight per sample i.
+
+    P_target(g, y) = mix_y(α1) × mix_g(α2)
+      mix_y(α1) = (1-α1) × P_train_marg_y + α1 × P_test_y
+      mix_g(α2) = (1-α2) × P_train(g|y) + α2 × 0.5
+
+    Returns per-sample weight = P_target(g_i, y_i) / P_train_emp(g_i, y_i), clipped.
+    """
+    g = (np.asarray(gender) >= 0.5).astype(int)
+    b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
+    p_joint = compute_empirical_pmf_cell(targets, gender, n_bins=n_bins, bin_width=bin_width)   # (2, n_bins)
+    p_train_y = p_joint.sum(axis=0)                                                              # (n_bins,)
+    safe_y = np.maximum(p_train_y, 1e-9)
+    p_train_g_given_y = p_joint / safe_y[None, :]                                                # (2, n_bins)
+
+    # mix targets
+    p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
+    uniform_g = np.full_like(p_train_g_given_y, 0.5)
+    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * uniform_g
+    p_target_joint = p_target_y[None, :] * p_target_g_given_y                                    # (2, n_bins)
+
+    # per-cell weight = P_target / P_train_emp
+    ratio = p_target_joint / np.maximum(p_joint, 1e-9)
+    ratio = np.clip(ratio, 1.0 / clip, clip)
+    return ratio[g, b]                                                                            # (N,) per-sample
+
+
+def split_loss_aug(
+    target_weight: np.ndarray, aug_share: float, k_max: int = 3, seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split unified target into loss weight + aug replication count.
+
+    loss_weight_i = target_weight_i ^ (1 - aug_share)
+    aug_repli_i  = round_bernoulli(target_weight_i ^ aug_share), clipped to [1, k_max]
+
+    En espérance : loss_weight × aug_repli = target_weight, mais aug_repli capé à k_max
+    pour éviter mémorisation sur cells rares.
+    """
+    w = np.asarray(target_weight, dtype=np.float64)
+    loss_w = np.power(w, 1.0 - aug_share)
+    aug_w = np.power(w, aug_share)
+    # Stochastic Bernoulli rounding preserves E[copies] when uncapped
+    rng = np.random.RandomState(seed)
+    floor = np.floor(aug_w).astype(int)
+    frac = aug_w - floor
+    extra = (rng.uniform(size=len(aug_w)) < frac).astype(int)
+    aug_repli = np.clip(floor + extra, 1, k_max)
+    return loss_w, aug_repli
+
+
+def importance_weight_of(
+    targets: torch.Tensor, sample_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Index per-sample weights by sample id (not bin) — assumes weights aligned with batch."""
+    return sample_weights
 
 
 class WeightedMSELoss(nn.Module):
+    """v10 — challenge metric formula + optional regularizers.
+
+    Base (= métrique officielle PDF page 4) :
+        Err_g = Σ w_i·(p-y)² / Σ w_i   avec w_i = 1/30 + y_i
+        Score = (Err_F + Err_M)/2 + λ·|Err_F - Err_M|
+
+    Optional :
+      * sample_loss_weight : per-sample multiplier (axe 1+2 unified target)
+      * focal_gamma > 0   : multiplier (err + 0.05)^γ (auto hard-example focus)
+    """
+
     def __init__(
         self,
         weight_offset: float = 1.0 / 30.0,
         focal_gamma: float = 0.0,
         fairness_lambda: float = 1.0,
-        importance_pmf_ratio: np.ndarray | None = None,
-        importance_bin_width: float = 0.025,
-        gender_class_weights: np.ndarray | None = None,
-        cell_class_weights: np.ndarray | None = None,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset
         self.focal_gamma = focal_gamma
         self.fairness_lambda = fairness_lambda
-        self.importance_bin_width = importance_bin_width
-        if importance_pmf_ratio is not None:
-            self.register_buffer(
-                "importance_pmf_ratio",
-                torch.as_tensor(importance_pmf_ratio, dtype=torch.float32),
-            )
-        else:
-            self.importance_pmf_ratio = None
-        if gender_class_weights is not None:
-            self.register_buffer(
-                "gender_class_weights",
-                torch.as_tensor(gender_class_weights, dtype=torch.float32),
-            )
-        else:
-            self.gender_class_weights = None
-        if cell_class_weights is not None:
-            self.register_buffer(
-                "cell_class_weights",
-                torch.as_tensor(cell_class_weights, dtype=torch.float32),
-            )
-        else:
-            self.cell_class_weights = None
 
-    def forward(self, preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        preds: torch.Tensor,
+        labels: torch.Tensor,
+        sample_loss_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         preds = preds.view(-1)
         if labels.dim() == 2 and labels.size(1) >= 2:
             targets = labels[:, 0]
@@ -124,18 +151,8 @@ class WeightedMSELoss(nn.Module):
         err = (preds - targets) ** 2
         w = self.weight_offset + targets
 
-        if self.importance_pmf_ratio is not None:
-            w = w * importance_weight_of(targets, self.importance_pmf_ratio, self.importance_bin_width)
-
-        if self.gender_class_weights is not None and gender is not None:
-            g_idx = (gender >= 0.5).long()
-            w = w * self.gender_class_weights[g_idx]
-
-        if self.cell_class_weights is not None and gender is not None:
-            n_bins = self.cell_class_weights.shape[1]
-            b_idx = torch.clamp((targets / self.importance_bin_width).long(), 0, n_bins - 1)
-            g_idx = (gender >= 0.5).long()
-            w = w * self.cell_class_weights[g_idx, b_idx]
+        if sample_loss_weight is not None:
+            w = w * sample_loss_weight.to(w.device).to(w.dtype)
 
         if self.focal_gamma > 0:
             w = w * (err.detach() + 0.05).pow(self.focal_gamma)
@@ -155,154 +172,25 @@ class WeightedMSELoss(nn.Module):
         return (err_f + err_m) / 2.0 + self.fairness_lambda * (err_f - err_m).abs()
 
 
-class GroupDROLoss(nn.Module):
-    def __init__(
-        self,
-        alpha: float = 0.5,
-        weight_offset: float = 1.0 / 30.0,
-        num_groups: int = 2,
-    ) -> None:
-        super().__init__()
-        self.alpha = alpha
-        self.weight_offset = weight_offset
-        self.num_groups = num_groups
+def mmd_rbf(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """RBF MMD² avec median heuristic (bandwidth auto adapté à l'échelle des features).
 
-    def forward(self, preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        preds = preds.view(-1)
-        if labels.dim() != 2 or labels.size(1) < 2:
-            targets = labels.view(-1)
-            err = (preds - targets) ** 2
-            w = self.weight_offset + targets
-            return (w * err).sum() / w.sum().clamp(min=1e-8)
+    v10 fix : σ² = median(||x-y||²) au lieu de sigmas fixes (1, 5, 10) qui saturaient
+    à 0 pour features ViT-B 768-dim (pairwise distances ~1500).
 
-        targets = labels[:, 0]
-        gender = labels[:, 1]
-        err = (preds - targets) ** 2
-        w = self.weight_offset + targets
-
-        group_losses = []
-        for g in range(self.num_groups):
-            mask = (gender >= g - 0.5) & (gender < g + 0.5)
-            if mask.any():
-                num = (w[mask] * err[mask]).sum()
-                den = w[mask].sum().clamp(min=1e-8)
-                group_losses.append(num / den)
-
-        if not group_losses:
-            return (w * err).sum() / w.sum().clamp(min=1e-8)
-
-        stacked = torch.stack(group_losses)
-        mean_loss = stacked.mean()
-        worst_loss = stacked.max()
-        return (1.0 - self.alpha) * mean_loss + self.alpha * worst_loss
-
-
-def mmd_rbf(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    sigmas: Tuple[float, ...] = (1.0, 5.0, 10.0),
-) -> torch.Tensor:
-    """Multi-bandwidth RBF Maximum Mean Discrepancy² between two sets of features.
-
-    x: (n_x, D), y: (n_y, D). Returns scalar MMD² ≥ 0.
-    Returns 0 if either side is empty (no group in batch).
+    Robuste aux mini-batches : retourne 0 si moins de 2 samples par groupe (median
+    indéfini sur 1 sample, MMD non-significatif sur singletons).
     """
-    if x.shape[0] == 0 or y.shape[0] == 0:
+    if x.shape[0] < 2 or y.shape[0] < 2:
         return torch.zeros((), device=x.device, dtype=x.dtype)
 
-    xx_sq = x.pow(2).sum(-1)
-    yy_sq = y.pow(2).sum(-1)
-    dxx = xx_sq.unsqueeze(1) + xx_sq.unsqueeze(0) - 2.0 * (x @ x.T)
-    dyy = yy_sq.unsqueeze(1) + yy_sq.unsqueeze(0) - 2.0 * (y @ y.T)
-    dxy = xx_sq.unsqueeze(1) + yy_sq.unsqueeze(0) - 2.0 * (x @ y.T)
+    dxy = torch.cdist(x, y).pow(2)
+    sigma_sq = dxy.detach().median().clamp(min=1e-6)
 
-    mmd = torch.zeros((), device=x.device, dtype=x.dtype)
-    for sigma in sigmas:
-        denom = 2.0 * sigma * sigma
-        mmd = mmd + (-dxx / denom).exp().mean() + (-dyy / denom).exp().mean() - 2.0 * (-dxy / denom).exp().mean()
-    return mmd / len(sigmas)
+    dxx = torch.cdist(x, x).pow(2)
+    dyy = torch.cdist(y, y).pow(2)
 
-
-def inter_gender_mixup(
-    pixel_values: torch.Tensor,
-    labels: torch.Tensor,
-    alpha: float = 0.2,
-    bin_width: float = 0.025,
-    max_bucket_distance: int = 2,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """In-batch inter-gender mixup. For each F sample, pair with the M sample whose
-    Y bucket is closest (within `max_bucket_distance` bins of `bin_width`). Interpolate
-    image + y. Gender stays F (no label noise on the gender dimension).
-
-    pixel_values: (B, C, H, W). labels: (B, 2) — col 0 = y, col 1 = gender ∈ {0,1}.
-    F samples without a valid (close-Y) M partner are left unchanged.
-    Returns (mixed_pixel_values, mixed_labels) — both same shape as inputs.
-    """
-    if labels.dim() != 2 or labels.size(1) < 2 or alpha <= 0:
-        return pixel_values, labels
-
-    device = pixel_values.device
-    y = labels[:, 0]
-    g = labels[:, 1]
-    f_idx = torch.nonzero(g < 0.5, as_tuple=False).flatten()
-    m_idx = torch.nonzero(g >= 0.5, as_tuple=False).flatten()
-    if f_idx.numel() == 0 or m_idx.numel() == 0:
-        return pixel_values, labels
-
-    f_y = y[f_idx]
-    m_y = y[m_idx]
-    f_bin = (f_y / bin_width).floor()
-    m_bin = (m_y / bin_width).floor()
-    # For each F, find nearest M in bin space (|Δbin|), break ties by random order
-    diff = (f_bin.unsqueeze(1) - m_bin.unsqueeze(0)).abs()
-    perm = torch.randperm(m_idx.numel(), device=device)
-    diff = diff[:, perm]
-    nearest = diff.argmin(dim=1)
-    nearest_dist = diff.gather(1, nearest.unsqueeze(1)).squeeze(1)
-    # Only mix F samples that found a partner within max_bucket_distance bins.
-    valid = nearest_dist <= float(max_bucket_distance)
-    if not valid.any():
-        return pixel_values, labels
-    f_idx_valid = f_idx[valid]
-    partner_idx = m_idx[perm[nearest[valid]]]
-
-    mix = pixel_values.clone()
-    new_labels = labels.clone()
-    lam = torch.distributions.Beta(alpha, alpha).sample((f_idx_valid.numel(),)).to(
-        device=device, dtype=pixel_values.dtype,
-    )
-    lam_x = lam.view(-1, 1, 1, 1)
-    lam_y = lam.view(-1)
-
-    mix[f_idx_valid] = lam_x * pixel_values[f_idx_valid] + (1.0 - lam_x) * pixel_values[partner_idx]
-    new_labels[f_idx_valid, 0] = lam_y * y[f_idx_valid] + (1.0 - lam_y) * y[partner_idx]
-    # Gender stays F (label of the original slot, not the partner's). The mixed sample is
-    # "F image contaminated by M pixels", label remains F → forces features to predict Y
-    # invariantly to gender, without introducing label noise on the gender dimension.
-    return mix, new_labels
-
-
-def occlusion_bucket(labels, n_buckets: int = 5):
-    arr = np.asarray(labels, dtype=float)
-    bins = np.quantile(arr, np.linspace(0, 1, n_buckets + 1)[1:-1])
-    return np.digitize(arr, bins)
-
-
-def stratify_key(gender, occlusion, n_buckets: int = 5):
-    g = np.asarray(gender).astype(int)
-    b = occlusion_bucket(occlusion, n_buckets=n_buckets).astype(int)
-    return g * (n_buckets + 1) + b
-
-
-def make_sampler_keys(
-    df,
-    strategy: str = "gender",
-    n_buckets: int = 10,
-) -> np.ndarray:
-    if strategy == "gender":
-        return np.asarray(df["gender"]).astype(int)
-    if strategy == "occlusion":
-        return occlusion_bucket(df["FaceOcclusion"], n_buckets=n_buckets).astype(int)
-    if strategy == "gender_x_occ":
-        return stratify_key(df["gender"], df["FaceOcclusion"], n_buckets=n_buckets).astype(int)
-    raise ValueError(f"Unknown sampler strategy: {strategy}")
+    k_xx = (-dxx / sigma_sq).exp().mean()
+    k_yy = (-dyy / sigma_sq).exp().mean()
+    k_xy = (-dxy / sigma_sq).exp().mean()
+    return (k_xx + k_yy - 2.0 * k_xy).clamp(min=0.0)

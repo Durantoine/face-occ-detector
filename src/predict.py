@@ -72,12 +72,11 @@ def _collect_metadata(
             "pretrained":           params.get("pretrained"),
             "init_backbone_from":   params.get("init_backbone_from"),
             "pooling_type":         params.get("pooling_type"),
-            # v9 axes (2-way stick-breaking)
+            # v10 unified rebalancing
             "axis1_power":           params.get("axis1_power"),
-            "axis1_sampler_share":   params.get("axis1_sampler_share"),
-            "sampler_power":         params.get("sampler_power"),
-            "loss_power":            params.get("loss_power"),
             "axis2_power":           params.get("axis2_power"),
+            "aug_share":             params.get("aug_share"),
+            "mmd_lambda":            params.get("mmd_lambda"),
             "feature_fairness":      params.get("feature_fairness"),
             "loss_focal_gamma":      params.get("loss_focal_gamma"),
             "loss_fairness_lambda":  params.get("loss_fairness_lambda"),
@@ -85,7 +84,6 @@ def _collect_metadata(
             "learning_rate":         params.get("learning_rate"),
             "num_train_epochs":      params.get("num_train_epochs"),
             "augmentation_level":    params.get("augmentation_level"),
-            "layer_decay":           params.get("layer_decay"),
         }
     except Exception as e:
         metadata["mlflow_fetch_error"] = str(e)
@@ -110,10 +108,11 @@ def _print_metadata_summary(metadata: Dict[str, Any]) -> None:
     init = key.get("init_backbone_from") or "—"
     print(f"  iBOT init         : {init}")
     print(f"  Pooling           : {key.get('pooling_type')}")
-    # v9 axes
-    print(f"  Axis 1 (Y shift) : strength={key.get('axis1_power')} "
-          f"(sampler={key.get('sampler_power')}, loss={key.get('loss_power')})")
-    print(f"  Axis 2 (cell_rw) : power={key.get('axis2_power')}")
+    # v10 axes
+    print(f"  Axe 1 (Y shift) : α1={key.get('axis1_power')}")
+    print(f"  Axe 2 (G balance): α2={key.get('axis2_power')}")
+    print(f"  aug_share       : {key.get('aug_share')}")
+    print(f"  MMD λ           : {key.get('mmd_lambda')}")
     print(f"  Feature fairness : {key.get('feature_fairness')}")
     print(f"  Focal γ          : {key.get('loss_focal_gamma')}")
     print(f"  λ_fairness        : {key.get('loss_fairness_lambda')}")
@@ -201,7 +200,7 @@ def predict_csv(
                            bias_correction.get("delta_m", 0.0))
 
     if match_test_pmf:
-        from src.utils.losses import _TEST_PMF_0025
+        from src.utils.losses import _TEST_PMF as _TEST_PMF_0025
         before_mean = float(preds.mean())
         preds = quantile_match_to_test_pmf(preds, _TEST_PMF_0025)
         after_mean = float(preds.mean())

@@ -1,7 +1,7 @@
-name: sapiens2-01b-3090-v9
+name: sapiens2-01b-3090-v10
 description: |
-  Sapiens2-0.1B (114M) v9 — 2x RTX 3090 24GB (BF16). Miroir de dinov3-vitb16 v9.
-  Voir dinov3-vitb16-3090-v9.yaml pour le rationale (val_split_alpha + axes 1-5 inchangés v8).
+  Sapiens2-0.1B v10 — Back to basics. Miroir de dinov3-vitb16 v10.
+  Voir dinov3-vitb16-3090-v10.yaml pour le rationale détaillé.
 
 model:
   model_name: sapiens2_0.1b
@@ -18,7 +18,6 @@ model:
   tau_free_init: 1.0
   learnable_tau: true
   num_heads: 4
-  gem_p_init: 3.0
   pool_attn_dropout: 0.0
   pool_proj_dropout: 0.0
   backbone_drop_path_rate: 0.0
@@ -31,39 +30,39 @@ data:
   data_csv: data/raw/train.csv
   extra_train_csv: null
   val_split_ratio: 0.15
-  val_split_alpha: 0.5            # v9 : mid-ground. 1.0=B' v8 (val=P_test), 0.0=stratified_yg
 
 training:
-  per_device_train_batch_size: 32
-  per_device_eval_batch_size: 64
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 128
   gradient_accumulation_steps: 1
-  num_train_epochs: 10
+  num_train_epochs: 8   # default si pas override par HPO
   learning_rate: 5.0e-05
-  weight_decay: 0.05
+  weight_decay: 0.10
   warmup_ratio: 0.1
-  lr_scheduler_type: cosine
+  lr_scheduler_type: cosine_with_min_lr_rate
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.1
   max_grad_norm: 1.0
   early_stopping_patience: 3
   seed: 42
   logging_steps: 50
   metric_for_best_model: eval_challenge_score
   greater_is_better: false
-  val_split_strategy: test_pmf
-  eval_importance_reweight: false
   bf16: true
   fp16: false
   gradient_checkpointing: false
-  augmentation_level: medium
+  augmentation_level: light_v10
   loss_type: weighted_mse
-  ema_decay: 0
-  ema_warmup_steps: 0
-  layer_decay: 0.85
-  save_qualitative_k: 10         # save 10 worst + 10 best images en MLflow artifacts
+  loss_fairness_lambda: 1.0
+  adv_lambda: 0.01
+  aug_repli_max: 3
+  save_qualitative_k: 10
 
 optuna:
-  n_trials: 200
+  n_trials: 100
   objective_mode: score
   rotate_val_seed: true
+  keep_top_n: 3
   search_space:
     pretrained_source:
       type: categorical
@@ -74,87 +73,52 @@ optuna:
         - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
     pooling_type:
       type: categorical
-      choices: [attention_k_query, multihead_attention]
+      choices: [cls, attention_k_query, multihead_attention]
 
-    # === Axe 1 — Y shift correction (v9 : 2 mécaniques, aug retirée) ===
-    axis1_power:
-      type: float
-      low: 0.0
-      high: 1.0
-    axis1_sampler_share:
-      type: float
-      low: 0.0
-      high: 1.0
+    axis1_power: {type: float, low: 0.0, high: 1.0}
+    axis2_power: {type: float, low: 0.0, high: 1.0}
+    aug_share:   {type: float, low: 0.0, high: 0.5}
 
-    # === Axe 2 — Soft G compensation (cell_rw v9 : base 1/count^0.75) ===
-    axis2_power:
-      type: float
-      low: 0.0
-      high: 1.0
-
-    # === Axe 3 — Feature fairness ===
     feature_fairness:
       type: categorical
-      choices: [none, mmd, mixup_gender]
-
-    # === Axe 4 — Auto hard examples (focal v9 : (err + 0.05)^γ) ===
-    loss_focal_gamma:
+      choices: [none, mmd, dann, both]
+    mmd_lambda:
       type: float
-      low: 0.0
-      high: 2.5
-
-    # === Axe 5 — Assurance fairness gap ===
-    loss_fairness_lambda:
-      type: float
-      low: 0.0
-      high: 2.0
-
-    # === Hyperparams classiques ===
-    learning_rate:
-      type: float
-      low: 1.0e-05
-      high: 2.0e-04
+      low: 0.01
+      high: 1.0
       log: true
-    weight_decay:
+      conditional_on:
+        feature_fairness: [mmd, both]
+    adv_lambda:
       type: float
-      low: 0.0
-      high: 0.3
-    num_train_epochs:
-      type: int
-      low: 8
-      high: 15
-    warmup_ratio:
-      type: float
-      low: 0.05
-      high: 0.2
-    head_dropout:
-      type: float
-      low: 0.0
-      high: 0.3
-    layer_decay:
-      type: float
-      low: 0.65
-      high: 0.95
-    backbone_drop_path_rate:
-      type: float
-      low: 0.0
-      high: 0.2
+      low: 0.001
+      high: 0.05
+      log: true
+      conditional_on:
+        feature_fairness: [dann, both]
 
-    # === Conditional on pooling_type ∈ {attention_k_query, multihead_attention} ===
+    loss_focal_gamma: {type: float, low: 0.0, high: 2.5}
+    loss_fairness_lambda: {type: float, low: 0.5, high: 1.5}
+
+    learning_rate: {type: float, low: 1.5e-05, high: 4.0e-04, log: true}
+    num_train_epochs: {type: int, low: 6, high: 12}
+    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    head_dropout:  {type: float, low: 0.0, high: 0.4}
+    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
+
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.5
       conditional_on:
         pooling_type: [attention_k_query, multihead_attention]
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.5
       conditional_on:
         pooling_type: [attention_k_query, multihead_attention]
 
-    # === Conditional on pooling_type == attention_k_query ===
     loss_query_diversity_lambda:
       type: float
       low: 0.0
@@ -193,25 +157,8 @@ optuna:
       conditional_on:
         pooling_type: attention_k_query
 
-    # === Conditional on pooling_type == multihead_attention ===
     num_heads:
       type: categorical
       choices: [2, 4, 8, 16]
       conditional_on:
         pooling_type: multihead_attention
-
-    # === Conditional on feature_fairness ===
-    mmd_lambda:
-      type: float
-      low: 0.01
-      high: 1.0
-      log: true
-      conditional_on:
-        feature_fairness: mmd
-    mixup_alpha:
-      type: float
-      low: 0.1
-      high: 1.0
-      log: true
-      conditional_on:
-        feature_fairness: mixup_gender

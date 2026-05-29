@@ -15,7 +15,6 @@ from transformers import (
     Trainer,
     TrainerCallback,
     TrainingArguments,
-    default_data_collator,
 )
 
 from src.data.dataset import (
@@ -23,21 +22,16 @@ from src.data.dataset import (
     DEFAULT_IMAGE_COL,
     DEFAULT_LABEL_COL,
     FaceOccDataset,
+    TargetedAugDataset,
     _load_data,
 )
 from src.data.transforms import build_train_transform
 from src.models.dinov3_loader import get_image_processor
 from src.models.face_occ_regressor import FaceOccRegressor
-from src.training.callbacks import MlflowClientCallback, make_ema_callback_from_cfg
+from src.training.callbacks import MlflowClientCallback
 from src.utils.config import load_architecture_config
 from src.utils.environment import setup_environment
-from src.utils.losses import (
-    GroupDROLoss,
-    WeightedMSELoss,
-    _TEST_PMF_0025,
-    build_cell_weights,
-    build_importance_weights,
-)
+from src.utils.losses import WeightedMSELoss
 from src.utils.metrics import make_compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
 from src.utils.mlflow_utils import log_params as ml_log_params
@@ -45,7 +39,7 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vits16-face-occ"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v10"),
     "data_csv": "data/raw/train.csv",
     "val_data_csv": None,
     "output_dir": "./results",
@@ -54,22 +48,18 @@ CONFIG: Dict[str, Any] = {
     "resume_from": None,
 }
 
+# Keys consumed by our custom logic (not passed to HF TrainingArguments)
 _NON_HF_TRAIN_KEYS = {
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
-    "augmentation_level", "ema_decay", "ema_warmup_steps",
-    "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
-    "loss_importance_reweight", "loss_cell_reweight",
-    # v9 axis 1 : 2-mechanism Y shift correction (sampler + loss, aug retirée)
-    "axis1_power", "axis1_sampler_share",
-    "sampler_power", "loss_power",
-    # v8 axis 2 : soft cell rw via build_cell_weights^power
-    "axis2_power",
-    "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
-    "group_dro_alpha", "layer_decay",
-    "loss_mmd_alignment", "mixup_inter_gender",
-    "mmd_lambda", "mixup_alpha",
-    "val_split_strategy",
-    "feature_fairness",
+    "augmentation_level",
+    "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
+    # v10 axes (rebalancing target)
+    "axis1_power", "axis2_power", "aug_share", "aug_repli_max",
+    # v10 feature fairness (lambdas HPO, activation via feature_fairness)
+    "feature_fairness", "mmd_lambda", "adv_lambda",
+    # pool diversity penalty
+    "loss_query_diversity_lambda",
+    "save_qualitative_k",
 }
 
 
@@ -77,79 +67,52 @@ def _unwrap(module: Any) -> Any:
     return getattr(module, "module", module)
 
 
+def _custom_collator(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    """Default collator + stack loss_weight if present (from TargetedAugDataset)."""
+    out: Dict[str, torch.Tensor] = {}
+    for key in batch[0]:
+        if key == "loss_weight":
+            out[key] = torch.stack([torch.as_tensor(b[key]) for b in batch]).float()
+        else:
+            out[key] = torch.stack([b[key] for b in batch])
+    return out
+
+
 class WeightedMSETrainer(Trainer):
+    """v10 — simplifie l'héritage HF Trainer.
+    Loss = WeightedMSELoss avec sample_loss_weight passé via le batch.
+    Optional extras : query_diversity, DANN adv, MMD.
+    LLRD, EMA, custom sampler, group_dro retirés.
+    """
+
     def __init__(
         self,
-        loss_type: str = "weighted_mse",
         focal_gamma: float = 0.0,
-        fairness_lambda: float = 0.0,
-        group_dro_alpha: float = 0.5,
-        importance_pmf_ratio: Optional[Any] = None,
-        gender_class_weights: Optional[Any] = None,
-        cell_class_weights: Optional[Any] = None,
+        fairness_lambda: float = 1.0,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
-        mixup_alpha: float = 0.0,
-        mixup_bin_width: float = 0.025,
-        train_sampler: Optional[Any] = None,
-        layer_decay: float = 1.0,
         *args: Any,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
-        self._custom_train_sampler = train_sampler
-        self._layer_decay = layer_decay
         self._query_diversity_lambda = float(query_diversity_lambda)
         self._adv_lambda = float(adv_lambda)
         self._mmd_lambda = float(mmd_lambda)
-        self._mixup_alpha = float(mixup_alpha)
-        self._mixup_bin_width = float(mixup_bin_width)
-        if loss_type == "group_dro":
-            self.loss_fct = GroupDROLoss(alpha=group_dro_alpha)
-            print(f"GroupDROLoss: alpha={group_dro_alpha}")
-        else:
-            self.loss_fct = WeightedMSELoss(
-                focal_gamma=focal_gamma,
-                fairness_lambda=fairness_lambda,
-                importance_pmf_ratio=importance_pmf_ratio,
-                gender_class_weights=gender_class_weights,
-                cell_class_weights=cell_class_weights,
-            )
-            tags = []
-            if importance_pmf_ratio is not None:
-                tags.append(f"importance_reweight=on (mean={float(importance_pmf_ratio.mean()):.2f})")
-            if gender_class_weights is not None:
-                tags.append(f"gender_reweight=on (F={gender_class_weights[0]:.2f}, M={gender_class_weights[1]:.2f})")
-            if cell_class_weights is not None:
-                tags.append(f"cell_reweight=on (max={float(cell_class_weights.max()):.2f}, min={float(cell_class_weights.min()):.2f})")
-            extra = ", " + ", ".join(tags) if tags else ""
-            print(f"WeightedMSELoss: focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}{extra}")
-
-    def _get_train_sampler(self, train_dataset: Any = None) -> Any:
-        if self._custom_train_sampler is not None:
-            return self._custom_train_sampler
-        try:
-            return super()._get_train_sampler(train_dataset)
-        except TypeError:
-            return super()._get_train_sampler()
-
-    def training_step(self, model: Any, inputs: Dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        if self._mixup_alpha > 0 and model.training and "labels" in inputs and "pixel_values" in inputs:
-            from src.utils.losses import inter_gender_mixup
-            inputs = dict(inputs)
-            inputs["pixel_values"], inputs["labels"] = inter_gender_mixup(
-                inputs["pixel_values"], inputs["labels"],
-                alpha=self._mixup_alpha, bin_width=self._mixup_bin_width,
-            )
-        return super().training_step(model, inputs, *args, **kwargs)
+        self.loss_fct = WeightedMSELoss(
+            focal_gamma=focal_gamma,
+            fairness_lambda=fairness_lambda,
+        )
+        print(f"WeightedMSELoss : focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}, "
+              f"query_div_lambda={query_diversity_lambda}, adv_lambda={adv_lambda}, mmd_lambda={mmd_lambda}")
 
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:
         labels = inputs["labels"]
+        sample_loss_weight = inputs.pop("loss_weight", None)
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         self.loss_fct = self.loss_fct.to(preds.device)
-        loss = self.loss_fct(preds, labels)
+        loss = self.loss_fct(preds, labels, sample_loss_weight=sample_loss_weight)
 
         if self._query_diversity_lambda > 0 and isinstance(outputs, dict) and "attn_weights" in outputs:
             from src.models.face_occ_regressor import _query_diversity_penalty
@@ -174,66 +137,6 @@ class WeightedMSETrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
-    def create_optimizer(self) -> torch.optim.Optimizer:
-        if self.optimizer is not None:
-            return self.optimizer
-        if self._layer_decay >= 1.0:
-            return super().create_optimizer()
-
-        base_lr = self.args.learning_rate
-        wd = self.args.weight_decay
-        inner = _unwrap(self.model)
-        backbone = inner.backbone
-
-        if hasattr(backbone, "blocks"):
-            n_layers = len(backbone.blocks)
-            block_attr = "blocks"
-        elif hasattr(backbone, "encoder") and hasattr(backbone.encoder, "layer"):
-            n_layers = len(backbone.encoder.layer)
-            block_attr = "encoder.layer"
-        else:
-            return super().create_optimizer()
-
-        decay = self._layer_decay
-        groups: List[Dict[str, Any]] = []
-        assigned: set[int] = set()
-
-        def _take(predicate, lr: float) -> List[torch.nn.Parameter]:
-            picked: List[torch.nn.Parameter] = []
-            for n, p in self.model.named_parameters():
-                if id(p) in assigned or not p.requires_grad:
-                    continue
-                if predicate(n):
-                    picked.append(p)
-                    assigned.add(id(p))
-            if picked:
-                groups.append({"params": picked, "lr": lr, "weight_decay": wd})
-            return picked
-
-        _take(
-            lambda n: "backbone" in n and any(k in n for k in ("embed", "cls_token", "mask_token", "storage_tokens", "register_tokens")),
-            base_lr * decay ** (n_layers + 1),
-        )
-        for i in range(n_layers):
-            pattern = f"backbone.{block_attr}.{i}."
-            _take(lambda n, p=pattern: p in n, base_lr * decay ** (n_layers - i))
-
-        _take(lambda n: "backbone" in n, base_lr)
-
-        _take(lambda n: True, base_lr)
-
-        leftover = [n for n, p in self.model.named_parameters()
-                    if p.requires_grad and id(p) not in assigned]
-        if leftover:
-            raise RuntimeError(f"LLRD did not cover {len(leftover)} trainable params: {leftover[:5]}")
-
-        print(f"LLRD: {len(groups)} groups, LR ∈ [{groups[0]['lr']:.2e}, {base_lr:.2e}]")
-        self.optimizer = torch.optim.AdamW(
-            groups, lr=base_lr, weight_decay=wd,
-            betas=(self.args.adam_beta1, self.args.adam_beta2),
-        )
-        return self.optimizer
-
 
 def _resolve_data_path(data_cfg: Dict[str, Any], data_csv: Optional[str]) -> str:
     return data_csv or data_cfg.get("data_csv") or ""
@@ -244,14 +147,12 @@ def _load_train_val(
     data_csv: Optional[str],
     val_data_csv: Optional[str],
     seed: int,
-    val_split_strategy: str = "stratified_yg",
-    val_split_alpha: float = 1.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     image_col = data_cfg.get("image_col", DEFAULT_IMAGE_COL)
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     gender_col = data_cfg.get("gender_col", DEFAULT_GENDER_COL)
     extra_train = data_cfg.get("extra_train_csv")
-    val_split_ratio = float(data_cfg.get("val_split_ratio", 0.2))
+    val_split_ratio = float(data_cfg.get("val_split_ratio", 0.12))
 
     train_path = _resolve_data_path(data_cfg, data_csv)
     if not train_path:
@@ -264,12 +165,7 @@ def _load_train_val(
         print(f"Pre-split: train={len(train_df):,} val={len(val_df):,}")
         return train_df, val_df
 
-    return _load_data(
-        train_path, **common, extra_train_csv=extra_train, seed=seed,
-        split_ratio=val_split_ratio,
-        val_split_strategy=val_split_strategy,
-        val_split_alpha=val_split_alpha,
-    )
+    return _load_data(train_path, **common, extra_train_csv=extra_train, seed=seed, split_ratio=val_split_ratio)
 
 
 def _build_datasets(
@@ -278,15 +174,33 @@ def _build_datasets(
     processor: Any,
     image_base_dir: Optional[str],
     augmentation_level: str,
-) -> Tuple[FaceOccDataset, FaceOccDataset]:
+    axis1_power: float,
+    axis2_power: float,
+    aug_share: float,
+    aug_repli_max: int,
+    seed: int,
+) -> Tuple[Any, FaceOccDataset, Dict[str, float]]:
+    # v10 : base dataset SANS transform (image raw). Aug appliqué SEULEMENT sur replicas
+    # par TargetedAugDataset.get_with_transform() → originaux jamais augmentés.
     transform = build_train_transform(augmentation_level)
-    train_ds = FaceOccDataset(
+    train_base = FaceOccDataset(
         image_paths=train_data["image_path"].tolist(),
         targets=train_data["FaceOcclusion"].astype(float).tolist(),
         genders=train_data["gender"].astype(float).tolist(),
         processor=processor,
         image_base_dir=image_base_dir,
-        transform=transform,
+        transform=None,   # ← v10 : pas d'aug sur base. Replicas only.
+    )
+    targeted = TargetedAugDataset(
+        base_dataset=train_base,
+        targets=train_data["FaceOcclusion"].astype(float).values,
+        gender=train_data["gender"].astype(float).values,
+        axis1_power=axis1_power,
+        axis2_power=axis2_power,
+        aug_share=aug_share,
+        k_max=aug_repli_max,
+        seed=seed,
+        transform=transform,   # ← appliqué uniquement sur replicas
     )
     val_ds = FaceOccDataset(
         image_paths=val_data["image_path"].tolist(),
@@ -296,7 +210,7 @@ def _build_datasets(
         image_base_dir=image_base_dir,
         transform=None,
     )
-    return train_ds, val_ds
+    return targeted, val_ds, targeted.summary()
 
 
 def _start_or_attach_run(
@@ -323,20 +237,8 @@ def _save_model_to_mlflow(
     run_id: str,
     model_register_name: str,
 ) -> str:
-    """Save the trained model + processor to MLflow.
-
-    mlflow.pytorch.log_model() requires an active run, so we resume the trial run
-    imperatively (NOT via a context manager — the latter calls end_run() on exit,
-    which would terminate the run *before* optimize.py has logged final_eval_loss /
-    best_score / err_*, producing the "FINISHED + late metrics" UI artifact).
-
-    The trial run is terminated exactly once, by optimize.py:
-        client.set_terminated(run_id, "FINISHED")
-    after all post-train metric calls succeed.
-    """
     import torch.nn as _nn
 
-    # Defensive cleanup if a previous trial leaked an active run into process state.
     while mlflow.active_run():
         mlflow.end_run()
 
@@ -370,10 +272,6 @@ def _save_model_to_mlflow(
                 delattr(_nn.Module, "__getstate__")
             except AttributeError:
                 pass
-        # Do NOT call mlflow.end_run() — leaving the active run set lets the next
-        # trial's defensive `while mlflow.active_run(): mlflow.end_run()` clean
-        # things up after optimize.py has already terminated this run via the
-        # client API.
 
     return model_uri
 
@@ -388,21 +286,9 @@ def _save_diagnostic_charts(
     preds: np.ndarray,
     gt: np.ndarray,
     gender: np.ndarray,
-    bin_width: float = 0.025,
-    importance_pmf_ratio: Optional[Any] = None,
+    bin_width: float = 0.05,
 ) -> None:
-    """Save a 4-panel PNG diagnostic chart (`qual_root/diagnostics/`).
-
-    Panel A — MAE par bin × genre, **brute** (avec CI 95%).
-        Vue intrinsèque : où le modèle pèche absolument, sans pondération.
-    Panel B — Contribution au score par bin × genre (= Σ wᵢ·(p-y)² / Σ wᵢ_total).
-        Vue "réelle" dans la loss : un gros gap à haut-Y avec peu de samples → barre
-        microscopique ici → l'écart n'a pas d'impact sur le score officiel.
-    Panel C — Densité de samples par bin × genre.
-        Contexte : où vivent les données, où le ratio F/M se déforme.
-    Panel D — Distribution de |pred - gt| par genre.
-        Heavy tails (quelques mauvaises preds) vs shift systématique.
-    """
+    """Diagnostic chart : MAE per bin × gender + density."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -413,29 +299,16 @@ def _save_diagnostic_charts(
     abs_err = np.abs(preds - gt)
     sq_err = (preds - gt) ** 2
     weight_offset = 1.0 / 30.0
-    # When importance_pmf_ratio is provided, Panel B contributions match err_*_test_estimated
-    # (the Optuna target). Otherwise they match err_*_val (no shift correction).
-    if importance_pmf_ratio is not None:
-        ratio = np.asarray(importance_pmf_ratio).astype(np.float64).flatten()
-        b_imp = np.clip((gt / bin_width).astype(int), 0, len(ratio) - 1)
-        w_sample = (weight_offset + gt) * ratio[b_imp]
-        contrib_label = "err_*_test_estimated"
-    else:
-        w_sample = weight_offset + gt
-        contrib_label = "err_*_val"
+    w_sample = weight_offset + gt
 
     mask_f = gender < 0.5
     mask_m = gender >= 0.5
 
-    n_bins = 20
+    n_bins = 10
     edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:]) * 100.0  # pct points
+    centers = 0.5 * (edges[:-1] + edges[1:]) * 100.0
 
     def _binned_stats(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return (mean_err, se_err, count, contribution) per bin for the subset under `mask`.
-
-        contribution[b] = Σ wᵢ·(pᵢ-yᵢ)² over (bin == b AND mask), divided by Σ wᵢ over mask
-            → fraction of the err_G that comes from this bin. Sums to err_G across bins."""
         means = np.full(n_bins, np.nan)
         ses = np.full(n_bins, np.nan)
         counts = np.zeros(n_bins)
@@ -466,56 +339,46 @@ def _save_diagnostic_charts(
     axA, axB = axes[0]
     axC, axD = axes[1]
 
-    # --- Panel A : MAE per Y bin × gender, raw (with 95% CI) ---
     Z = 1.96
     axA.plot(centers, overall_means * 100.0, "-", lw=1.5, color="black", alpha=0.5, label="Overall")
     axA.errorbar(centers, f_means * 100.0, yerr=f_se * Z * 100.0, fmt="-s", color="tab:red",
-                 alpha=0.85, capsize=3, label=f"Female (n={int(mask_f.sum())})")
+                 alpha=0.85, capsize=3, label=f"F (n={int(mask_f.sum())})")
     axA.errorbar(centers, m_means * 100.0, yerr=m_se * Z * 100.0, fmt="-^", color="tab:blue",
-                 alpha=0.85, capsize=3, label=f"Male (n={int(mask_m.sum())})")
+                 alpha=0.85, capsize=3, label=f"M (n={int(mask_m.sum())})")
     axA.set_xlabel("True occlusion Y (% points)")
     axA.set_ylabel("MAE (% points), ±95% CI")
-    axA.set_title("A — MAE brute par bin × genre (avec CI)\n"
-                  "Vue intrinsèque : où le modèle pèche par niveau d'occlusion")
+    axA.set_title("A — MAE per Y bin × gender")
     axA.grid(alpha=0.3); axA.legend(loc="upper left")
 
-    # --- Panel B : Contribution to err_G per bin (Σwᵢ·sqErr / Σw_G) ---
     bw_x = (centers[1] - centers[0]) * 0.4
     axB.bar(centers - bw_x/2, f_contrib, width=bw_x, color="tab:red", alpha=0.85,
-            label=f"Female (err_F = Σ = {f_contrib.sum():.5f})")
+            label=f"F (Σ={f_contrib.sum():.5f})")
     axB.bar(centers + bw_x/2, m_contrib, width=bw_x, color="tab:blue", alpha=0.85,
-            label=f"Male (err_M = Σ = {m_contrib.sum():.5f})")
-    axB.set_xlabel("True occlusion Y (% points)")
-    axB.set_ylabel("Σwᵢ·(p-y)² in bin / Σw_G")
-    axB.set_title(f"B — Contribution au score par bin × genre ({contrib_label})\n"
-                  "Vue réelle dans la loss : c'est ÇA qui pilote err_F, err_M, err_diff")
+            label=f"M (Σ={m_contrib.sum():.5f})")
+    axB.set_xlabel("True occlusion Y (%)")
+    axB.set_ylabel("Σwᵢ·(p-y)² / Σw_g")
+    axB.set_title("B — Contribution to err_g per bin")
     axB.grid(alpha=0.3, axis="y"); axB.legend(loc="upper right")
 
-    # --- Panel C : Sample density per bin × gender ---
     axC.bar(centers - bw_x/2, f_counts, width=bw_x, color="tab:red", alpha=0.75,
-            label=f"Female (Σ={int(f_counts.sum())})")
+            label=f"F (Σ={int(f_counts.sum())})")
     axC.bar(centers + bw_x/2, m_counts, width=bw_x, color="tab:blue", alpha=0.75,
-            label=f"Male (Σ={int(m_counts.sum())})")
-    axC.set_xlabel("True occlusion Y (% points)")
+            label=f"M (Σ={int(m_counts.sum())})")
+    axC.set_xlabel("True occlusion Y (%)")
     axC.set_ylabel("Sample count")
-    axC.set_title("C — Densité de samples par bin × genre\n"
-                  "Où vivent les données, où le ratio F/M se déforme")
+    axC.set_title("C — Sample density per bin × gender")
     axC.grid(alpha=0.3, axis="y"); axC.legend(loc="upper right")
 
-    # --- Panel D : Error distribution by gender ---
     bins = np.linspace(0.0, max(0.3, float(abs_err.max() + 0.01)), 60)
-    axD.hist(abs_err[mask_f], bins=bins, density=True, alpha=0.6, color="tab:red",
-             label=f"Female (n={int(mask_f.sum())})")
-    axD.hist(abs_err[mask_m], bins=bins, density=True, alpha=0.6, color="tab:blue",
-             label=f"Male (n={int(mask_m.sum())})")
+    axD.hist(abs_err[mask_f], bins=bins, density=True, alpha=0.6, color="tab:red", label="F")
+    axD.hist(abs_err[mask_m], bins=bins, density=True, alpha=0.6, color="tab:blue", label="M")
     axD.axvline(abs_err[mask_f].mean(), color="tab:red", linestyle="--", lw=1.5,
                 label=f"MAE_F = {abs_err[mask_f].mean()*100:.2f}%")
     axD.axvline(abs_err[mask_m].mean(), color="tab:blue", linestyle="--", lw=1.5,
                 label=f"MAE_M = {abs_err[mask_m].mean()*100:.2f}%")
-    axD.set_xlabel("|pred - gt| (Y units)")
+    axD.set_xlabel("|pred - gt|")
     axD.set_ylabel("Density")
-    axD.set_title("D — Distribution d'erreur par genre\n"
-                  "Heavy tails (quelques mauvaises preds) vs shift systématique")
+    axD.set_title("D — Error distribution by gender")
     axD.grid(alpha=0.3); axD.legend(loc="upper right")
 
     plt.tight_layout()
@@ -539,161 +402,81 @@ def train(
     mlflow_run_id: Optional[str] = None,
     test_data_csv: Optional[str] = None,
     min_score_to_save: Optional[float] = None,
-) -> Tuple[float, float, float, str]:
+) -> Tuple[float, float, float, str, float, float]:
     cfg = load_architecture_config(architecture_name).to_dict()
     train_cfg = cfg.get("training", {})
     model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", {})
 
     output_dim = model_cfg.get("output_dim", 1)
-    best_metric = train_cfg.get("metric_for_best_model", "eval_score")
+    best_metric = train_cfg.get("metric_for_best_model", "eval_challenge_score")
     greater_is_better = bool(train_cfg.get("greater_is_better", False))
     image_base_dir = data_cfg.get("image_base_dir")
-    augmentation_level = train_cfg.get("augmentation_level", "medium")
-    loss_type = train_cfg.get("loss_type", "weighted_mse")
+    augmentation_level = train_cfg.get("augmentation_level", "light_v10")
+
+    # v10 axes
+    axis1_power = float(train_cfg.get("axis1_power", 0.0))
+    axis2_power = float(train_cfg.get("axis2_power", 0.0))
+    aug_share = float(train_cfg.get("aug_share", 0.0))
+    aug_repli_max = int(train_cfg.get("aug_repli_max", 3))
+
+    # v10 fairness features
+    feature_fairness = str(train_cfg.get("feature_fairness", "none"))
+    mmd_active = feature_fairness in ("mmd", "both")
+    dann_active = feature_fairness in ("dann", "both")
+    mmd_lambda = float(train_cfg.get("mmd_lambda", 0.0)) if mmd_active else 0.0
+    adv_lambda = float(train_cfg.get("adv_lambda", 0.01)) if dann_active else 0.0
 
     client, run_id, use_client = _start_or_attach_run(
         cfg, mlflow_tracking_uri, mlflow_run_id, mlflow_experiment, use_mlflow,
     )
 
     model_name = model_cfg.get("model_name", "dinov3_vits16")
-    # v8 : log sans préfixe train_/model_/data_ pour simplicité UI/analyse.
-    # Risque de collision si même nom dans plusieurs sections — pas le cas chez nous.
     ml_log_params(client, run_id, {"architecture": cfg["name"]})
     ml_log_params(client, run_id, dict(model_cfg))
     ml_log_params(client, run_id, dict(train_cfg))
     ml_log_params(client, run_id, dict(data_cfg))
 
     processor = get_image_processor(model_name)
-    val_split_strategy = train_cfg.get("val_split_strategy", "stratified_yg")
-    val_split_alpha = float(data_cfg.get("val_split_alpha", 1.0))
-    train_data, val_data = _load_train_val(
-        data_cfg, data_csv, val_data_csv, val_seed or seed,
-        val_split_strategy=val_split_strategy,
-        val_split_alpha=val_split_alpha,
-    )
-    train_dataset, val_dataset = _build_datasets(
+    train_data, val_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
+    train_dataset, val_dataset, aug_summary = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
+        axis1_power=axis1_power, axis2_power=axis2_power, aug_share=aug_share,
+        aug_repli_max=aug_repli_max, seed=val_seed or seed,
     )
+    print(f"TargetedAugDataset summary: {aug_summary}")
+    ml_log_metrics(client, run_id, {f"aug_{k}": v for k, v in aug_summary.items() if isinstance(v, (int, float))})
 
-    # === v8 axis 1 : sampler + loss imp_rw + aug Y-conditional ===
-    label_col_for_sampler = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
-    sampler_power = float(train_cfg.get("sampler_power", 0.0))
-    loss_power    = float(train_cfg.get("loss_power", 0.0))
-
-    y_train = train_data[label_col].astype(float).values
-
-    # Sampler test_pmf : intensité = sampler_power (axe 1 sampler leg).
-    train_sampler = None
-    if sampler_power > 0:
-        from src.data.dataset import create_test_pmf_sampler
-        train_sampler = create_test_pmf_sampler(
-            y_train, test_pmf=_TEST_PMF_0025, power=sampler_power,
-        )
-        print(f"Sampler test_pmf (power={sampler_power:.3f}): "
-              f"{train_sampler.num_samples} samples/epoch")
-    else:
-        print(f"Sampler test_pmf disabled (sampler_power=0)")
-
-    # Loss imp_rw (axis 1 loss leg) — intensité = loss_power
-    test_pmf_ratio_full = build_importance_weights(y_train, power=1.0)
-    ml_log_params(client, run_id, {
-        "test_pmf_ratio_per_bin": ",".join(f"{x:.3f}" for x in test_pmf_ratio_full.tolist()),
-    })
-    importance_pmf_ratio = None
-    if loss_power > 0 and loss_type == "weighted_mse":
-        importance_pmf_ratio = build_importance_weights(y_train, power=loss_power)
-        print(f"loss_importance_reweight ON (power={loss_power:.3f}): "
-              f"min={importance_pmf_ratio.min():.3f} max={importance_pmf_ratio.max():.3f}")
-    else:
-        print(f"loss_importance_reweight disabled (loss_power={loss_power:.3f}, loss_type={loss_type})")
-
-    # === v9 : eval reweight automatique compensant val_split_alpha ===
-    # val_split_alpha couple le SPLIT (dataset.py) et le REWEIGHT (ici) pour rester
-    # estimateur non-biaisé du risque test sous H1 (covariate shift Y-only).
-    #   eval_weight(y) = P_test(y) / P_val_target(y)
-    #                  = P_test(y) / [α × P_test(y) + (1−α) × P_train(y)]
-    #
-    # α=1.0 → P_val=P_test → eval_weight=1 partout (équiv. B' actuel, pas de reweight)
-    # α=0.0 → P_val=P_train → eval_weight=P_test/P_train (= full reweight v4 stratified_yg)
-    # α=0.5 → mid-ground → eval_weight intermédiaire (~1.67 sur bin 18)
-    eval_pmf_ratio = None
-    if val_split_alpha < 1.0:
-        from src.utils.losses import _TRAIN_PMF_0025
-        p_val_target = val_split_alpha * _TEST_PMF_0025 + (1.0 - val_split_alpha) * _TRAIN_PMF_0025
-        eval_pmf_ratio = _TEST_PMF_0025 / np.maximum(p_val_target, 1e-6)
-        eval_pmf_ratio = np.clip(eval_pmf_ratio, 0.05, 20.0)
-        eval_pmf_ratio = eval_pmf_ratio / eval_pmf_ratio.mean()
-        ml_log_params(client, run_id, {
-            "val_split_alpha": val_split_alpha,
-            "eval_reweight_max": float(eval_pmf_ratio.max()),
-            "eval_reweight_min": float(eval_pmf_ratio.min()),
-        })
-        print(f"v9 eval reweight (val_split_alpha={val_split_alpha:.2f}): "
-              f"min={eval_pmf_ratio.min():.3f} max={eval_pmf_ratio.max():.3f}")
-    elif bool(train_cfg.get("eval_importance_reweight", False)):
-        # Legacy v6 override : eval reweight full (compatible v4 stratified_yg behavior)
-        eval_pmf_ratio = test_pmf_ratio_full
-        ml_log_params(client, run_id, {"eval_importance_reweight": True})
-        print("eval_importance_reweight ON (legacy v6 full reweight)")
-    else:
-        print(f"eval reweight disabled (val_split_alpha=1.0 → val already matches P_test)")
-    compute_metrics = make_compute_metrics(importance_pmf_ratio=eval_pmf_ratio)
-
-    # === v8 axis 2 : cell_rw soft via build_cell_weights avec power ===
-    gender_class_weights = None
-    cell_class_weights = None
-    axis2_power = float(train_cfg.get("axis2_power", 0.0))
-    if axis2_power > 0 and loss_type == "weighted_mse" and "gender" in train_data.columns:
-        cell_class_weights = build_cell_weights(
-            y_train, train_data["gender"].astype(float).values,
-            power=axis2_power,
-        )
-        ml_log_params(client, run_id, {
-            "axis2_power": axis2_power,
-            "axis2_cell_weights_max": float(cell_class_weights.max()),
-            "axis2_cell_weights_min": float(cell_class_weights.min()),
-        })
-        print(f"Cell rw SOFT (axis2_power={axis2_power:.3f}): "
-              f"min={cell_class_weights.min():.3f} max={cell_class_weights.max():.3f}")
-    else:
-        print(f"Cell rw SOFT disabled (axis2_power={axis2_power:.3f})")
-
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())
     n_val_f = int((val_data["gender"] < 0.5).sum())
     n_val_m = int((val_data["gender"] >= 0.5).sum())
     ml_log_params(client, run_id, {
         "seed": seed,
-        "num_train": len(train_dataset),
+        "num_train_base": len(train_data),
+        "num_train_virtual": len(train_dataset),
         "num_val": len(val_data),
         "num_train_female": n_train_f,
         "num_train_male": n_train_m,
         "num_val_female": n_val_f,
         "num_val_male": n_val_m,
-        "train_gender_ratio_M_over_F": round(n_train_m / max(n_train_f, 1), 3),
     })
     ml_log_metrics(client, run_id, {
         "data_train_occ_mean": _safe_mean(train_data["FaceOcclusion"]),
-        "data_train_occ_std": float(train_data["FaceOcclusion"].std() or 0.0),
         "data_val_occ_mean": _safe_mean(val_data["FaceOcclusion"]),
-        "data_val_occ_std": float(val_data["FaceOcclusion"].std() or 0.0),
         "data_train_occ_female_mean": _safe_mean(train_data.loc[train_data["gender"] < 0.5, "FaceOcclusion"]),
         "data_train_occ_male_mean": _safe_mean(train_data.loc[train_data["gender"] >= 0.5, "FaceOcclusion"]),
-        "data_val_occ_female_mean": _safe_mean(val_data.loc[val_data["gender"] < 0.5, "FaceOcclusion"]),
-        "data_val_occ_male_mean": _safe_mean(val_data.loc[val_data["gender"] >= 0.5, "FaceOcclusion"]),
     })
 
     pretrained = bool(model_cfg.get("pretrained", True))
-    enable_adv_disc = bool(train_cfg.get("loss_adv_debiasing", False))
     model = (
         FaceOccRegressor.load_from_mlflow(resume_from_checkpoint, output_dim=output_dim)
         if resume_from_checkpoint
         else FaceOccRegressor(
             model_name=model_name,
             output_dim=output_dim,
-            head_dropout=float(model_cfg.get("head_dropout", model_cfg.get("hidden_dropout_prob", 0.1))),
+            head_dropout=float(model_cfg.get("head_dropout", 0.1)),
             projection_size=model_cfg.get("projection_size"),
             output_activation=model_cfg.get("output_activation", "sigmoid"),
             backbone_drop_path_rate=float(model_cfg.get("backbone_drop_path_rate", 0.0)),
@@ -707,10 +490,9 @@ def train(
             tau_free_init=float(model_cfg.get("tau_free_init", 1.0)),
             learnable_tau=bool(model_cfg.get("learnable_tau", True)),
             num_heads=int(model_cfg.get("num_heads", 4)),
-            gem_p_init=float(model_cfg.get("gem_p_init", 3.0)),
-            pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", model_cfg.get("attn_dropout", 0.0))),
-            pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", model_cfg.get("proj_dropout", 0.0))),
-            enable_adv_disc=enable_adv_disc,
+            pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
+            pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", 0.0)),
+            enable_adv_disc=dann_active,
         )
     )
 
@@ -719,8 +501,8 @@ def train(
         import re
         import mlflow as _ml
         print(f"Loading pretrained backbone from {init_backbone_from}")
-        pretrained = _ml.pytorch.load_model(init_backbone_from)
-        missing, unexpected = model.backbone.load_state_dict(pretrained.state_dict(), strict=False)
+        pretrained_model = _ml.pytorch.load_model(init_backbone_from)
+        missing, unexpected = model.backbone.load_state_dict(pretrained_model.state_dict(), strict=False)
         print(f"  loaded ({len(missing)} missing, {len(unexpected)} unexpected keys)")
         m = re.match(r"runs:/([^/]+)/", init_backbone_from)
         pretrain_run_id = m.group(1) if m else None
@@ -735,41 +517,27 @@ def train(
                 pre_run = _ml.tracking.MlflowClient().get_run(pretrain_run_id)
                 pre_params = {f"pretrain_{k}": v for k, v in pre_run.data.params.items()}
                 ml_log_params(client, run_id, pre_params)
-                client.set_tag(run_id, "pretrain_run_id", pretrain_run_id)
-                print(f"  logged {len(pre_params)} pretrain_* params from run {pretrain_run_id}")
             except Exception as e:
                 print(f"  WARNING: could not fetch pretrain run params: {e}")
 
     forwarded = {k: v for k, v in train_cfg.items() if k not in _NON_HF_TRAIN_KEYS}
-    forwarded.setdefault("fp16", True)
+    forwarded.setdefault("fp16", False)
     if not torch.cuda.is_available():
         if forwarded.get("bf16") or forwarded.get("fp16"):
-            print(f"WARNING: non-CUDA device — disabling bf16/fp16")
+            print(f"WARNING: non-CUDA — disabling bf16/fp16")
         forwarded["bf16"] = False
         forwarded["fp16"] = False
-    # EMA + load_best_model_at_end are incompatible: on_train_end (EMA swap)
-    # runs BEFORE _load_best_model → swap gets wiped. Disable load_best when EMA is on.
-    # NOTE: metric_for_best_model stays set even when load_best is disabled — it's still
-    # needed by EarlyStoppingCallback to know which metric to monitor.
-    ema_active = float(train_cfg.get("ema_decay", 0)) > 0
-    load_best_at_end = not ema_active
-    if ema_active:
-        print(f"EMA active (decay={train_cfg.get('ema_decay')}) → load_best_model_at_end disabled "
-              "(final model = EMA-swapped, not best checkpoint).")
     training_args = TrainingArguments(
         output_dir=output_dir,
         report_to=["mlflow"] if (use_mlflow and not use_client) else [],
         eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
-        load_best_model_at_end=load_best_at_end,
+        load_best_model_at_end=True,
         metric_for_best_model=best_metric,
         greater_is_better=greater_is_better,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        # v8 perfo : persistent_workers évite le re-spawn des workers à chaque epoch
-        # (gain ~5-10s par epoch × N epochs = significatif sur sweeps longs).
-        # prefetch_factor=2 (default) suffit avec 4 workers.
         dataloader_persistent_workers=True,
         seed=seed,
         remove_unused_columns=False,
@@ -784,31 +552,21 @@ def train(
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=patience))
     if use_client and client and run_id:
         callbacks.append(MlflowClientCallback(client, run_id))
-    ema_cb = make_ema_callback_from_cfg(train_cfg)
-    if ema_cb is not None:
-        callbacks.append(ema_cb)
-        print(f"EMA enabled: decay={ema_cb.decay}, warmup_steps={ema_cb.warmup_steps}")
+
+    compute_metrics = make_compute_metrics()   # v10 : pas de eval_pmf_ratio (val ≡ P_test direct)
 
     trainer = WeightedMSETrainer(
-        loss_type=loss_type,
-        focal_gamma=train_cfg.get("loss_focal_gamma", 0.0),
-        fairness_lambda=train_cfg.get("loss_fairness_lambda", 0.0),
-        group_dro_alpha=train_cfg.get("group_dro_alpha", 0.5),
-        importance_pmf_ratio=importance_pmf_ratio,
-        gender_class_weights=gender_class_weights,
-        cell_class_weights=cell_class_weights,
-        query_diversity_lambda=train_cfg.get("loss_query_diversity_lambda", 0.0),
-        adv_lambda=float(train_cfg.get("adv_lambda", 0.0)) if train_cfg.get("loss_adv_debiasing", False) else 0.0,
-        mmd_lambda=float(train_cfg.get("mmd_lambda", 0.0)) if train_cfg.get("loss_mmd_alignment", False) else 0.0,
-        mixup_alpha=float(train_cfg.get("mixup_alpha", 0.0)) if train_cfg.get("mixup_inter_gender", False) else 0.0,
-        train_sampler=train_sampler,
-        layer_decay=train_cfg.get("layer_decay", 1.0),
+        focal_gamma=float(train_cfg.get("loss_focal_gamma", 0.0)),
+        fairness_lambda=float(train_cfg.get("loss_fairness_lambda", 1.0)),
+        query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
+        adv_lambda=adv_lambda,
+        mmd_lambda=mmd_lambda,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
-        data_collator=default_data_collator,
+        data_collator=_custom_collator,
         callbacks=callbacks or None,
     )
 
@@ -816,24 +574,15 @@ def train(
     trainer.train()
 
     eval_results = trainer.evaluate()
-    eval_loss = eval_results["eval_loss"]
-    # v8 clean : noms canoniques uniquement (compute_score retourne sans legacy alias).
-    eval_score     = eval_results.get("eval_challenge_score", 0.0)
-    err_diff       = eval_results.get("eval_err_diff", 0.0)
-    err_F          = eval_results.get("eval_err_F", 0.0)
-    err_M          = eval_results.get("eval_err_M", 0.0)
-    eval_score_val = eval_results.get("eval_challenge_score_raw", 0.0)
-    err_diff_val   = eval_results.get("eval_err_diff_val", 0.0)
-    err_F_val      = eval_results.get("eval_err_F_raw", 0.0)
-    err_M_val      = eval_results.get("eval_err_M_raw", 0.0)
-    print(f"loss={eval_loss:.5f}")
-    print(f"  test-estimated : score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
-    print(f"  val direct     : score={eval_score_val:.5f}  err_F={err_F_val:.5f}  err_M={err_M_val:.5f}  err_diff={err_diff_val:.5f}")
-    mae_pct_te = eval_results.get("eval_mae_pct", 0.0)
-    mae_pct_va = eval_results.get("eval_mae_pct_val", 0.0)
-    r2_te = eval_results.get("eval_r2", 0.0)
-    r2_va = eval_results.get("eval_r2_val", 0.0)
-    print(f"  human-readable : MAE_pct test={mae_pct_te:.2f}% val={mae_pct_va:.2f}%  |  R² test={r2_te:.3f} val={r2_va:.3f}")
+    eval_loss = eval_results.get("eval_loss", float("inf"))
+    eval_score = eval_results.get("eval_challenge_score", 0.0)
+    err_diff = eval_results.get("eval_err_diff", 0.0)
+    err_F = eval_results.get("eval_err_F", 0.0)
+    err_M = eval_results.get("eval_err_M", 0.0)
+    print(f"loss={eval_loss:.5f}  score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
+    mae_pct = eval_results.get("eval_mae_pct", 0.0)
+    r2 = eval_results.get("eval_r2", 0.0)
+    print(f"  human-readable : MAE_pct={mae_pct:.2f}%  R²={r2:.3f}")
 
     try:
         pred_out = trainer.predict(val_dataset)
@@ -851,12 +600,7 @@ def train(
         gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
 
-    # v6.5 : matched eval metrics retirées (eval_challenge_score_matched_*, _best_).
-    # Avec val_split_strategy=test_pmf (B'), val matche déjà P_test → matched = post-process
-    # potentiellement utile mais redondant comme métrique de sélection ; quantile_match reste
-    # dispo dans predict.py pour la post-inference si besoin.
-
-    save_qualitative_k = int(train_cfg.get("save_qualitative_k", train_cfg.get("save_worst_k", 0)))
+    save_qualitative_k = int(train_cfg.get("save_qualitative_k", 0))
     if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():
         try:
             w = 1.0 / 30.0 + gt
@@ -895,16 +639,13 @@ def train(
                     if dst.exists():
                         dst.unlink()
                     shutil.copy(src, dst)
-                print(f"Saved {len(df)} {label} predictions: {sub}/{label}.csv + {img_dir}")
+                print(f"Saved {len(df)} {label} : {sub}/{label}.csv + {img_dir}")
 
             _dump(worst_order, "worst")
             _dump(best_order, "best")
 
             try:
-                _save_diagnostic_charts(
-                    qual_root, preds, gt, gender,
-                    importance_pmf_ratio=eval_pmf_ratio,
-                )
+                _save_diagnostic_charts(qual_root, preds, gt, gender)
             except Exception as e_chart:
                 print(f"WARNING: could not save diagnostic charts: {e_chart}")
 
@@ -916,38 +657,13 @@ def train(
         except Exception as e:
             print(f"WARNING: could not save qualitative-K: {e}")
 
-    if test_data_csv and trainer.is_world_process_zero():
-        try:
-            test_df, _ = _load_data(
-                test_data_csv,
-                image_col=data_cfg.get("image_col", DEFAULT_IMAGE_COL),
-                label_col=data_cfg.get("label_col", DEFAULT_LABEL_COL),
-                gender_col=data_cfg.get("gender_col", DEFAULT_GENDER_COL),
-                split_ratio=0,
-            )
-            test_ds = FaceOccDataset(
-                image_paths=test_df["image_path"].tolist(),
-                targets=test_df["FaceOcclusion"].astype(float).tolist(),
-                genders=test_df["gender"].astype(float).tolist(),
-                processor=processor, image_base_dir=image_base_dir, transform=None,
-            )
-            test_res = trainer.evaluate(eval_dataset=test_ds, metric_key_prefix="test")
-            print(f"Test score={test_res.get('test_score', 0):.5f}")
-            ml_log_metrics(client, run_id, {
-                "test_score": test_res.get("test_score", 0.0),
-                "test_err_F": test_res.get("test_err_F", 0.0),
-                "test_err_M": test_res.get("test_err_M", 0.0),
-            })
-        except Exception as e:
-            print(f"WARNING test eval: {e}")
-
     if not trainer.is_world_process_zero():
         return eval_loss, eval_score, err_diff, "", err_F, err_M
 
     ml_log_metrics(client, run_id, {
         "val_score": eval_score,
-        "val_err_F": eval_results.get("eval_err_F", 0.0),
-        "val_err_M": eval_results.get("eval_err_M", 0.0),
+        "val_err_F": err_F,
+        "val_err_M": err_M,
         "val_err_diff": err_diff,
         "final_eval_loss": eval_loss,
     })

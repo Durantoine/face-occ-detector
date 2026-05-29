@@ -62,19 +62,17 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # Params we show in hover tooltips on the trials comparison chart. Order matters
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
-    # v9 — axe 1 2-way (power globale + sampler share, loss share = 1-sampler)
-    "axis1_power",              # γ : puissance globale axe 1
-    "axis1_sampler_share",      # a : fraction sampler (loss = 1-a)
-    # Effectifs axe 1 (= γ × share)
-    "sampler_power",
-    "loss_power",
-    # Axes 2-5
-    "axis2_power",              # soft cell_rw power
-    "feature_fairness",         # {none, mmd, mixup_gender}
+    # v10 — unified rebalancing target
+    "axis1_power",              # α1 : tension vers P_test sur Y marginal
+    "axis2_power",              # α2 : tension vers 50/50 F/M intra-Y
+    "aug_share",                # split loss vs aug replication
+    # Feature fairness
+    "feature_fairness",         # {none, mmd, dann, both}
+    "mmd_lambda",
+    "adv_lambda",
+    # Loss
     "loss_focal_gamma",
     "loss_fairness_lambda",
-    # v9 — val distribution
-    "val_split_alpha",          # α : interp P_test ↔ P_train pour le val set
     # Architecture
     "pretrained_source",
     "pooling_type",
@@ -324,7 +322,7 @@ def _render_trials_comparison() -> None:
     # Fallback ladders: optuna-*-v9 → all optuna-* → all experiments. v6/v7/v8 et antérieurs
     # restent sélectionnables manuellement via le multiselect.
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v9$")
+    _CURRENT_VERSION_RE = re.compile(r"-v10$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:
@@ -561,21 +559,13 @@ def _render_inter_trial(
 
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value", "err_diff",
-            # v9 — axe 1 2-way : power globale + sampler share
-            "axis1_power",
-            "axis1_sampler_share",
-            # Effectifs axe 1
-            "sampler_power", "loss_power",
-            # Axes 2-5
-            "axis2_power",
-            "feature_fairness",
-            "loss_focal_gamma",
-            "loss_fairness_lambda",
-            # v9 — val distribution
-            "val_split_alpha",
+            # v10 — unified rebalancing
+            "axis1_power", "axis2_power", "aug_share",
+            "feature_fairness", "mmd_lambda", "adv_lambda",
+            "loss_focal_gamma", "loss_fairness_lambda",
             # Architecture + hyperparams
             "pretrained_source", "pooling_type",
-            "learning_rate", "layer_decay",
+            "learning_rate", "weight_decay",
         ]
 
         def _family(name: str) -> str:
@@ -622,12 +612,11 @@ def _render_inter_trial(
         # v8 : breakdown des continus binnés en quartiles. Permet de voir si γ haut/bas
         # marche mieux, si focal_gamma converge vers une zone, etc.
         AXIS_CONTINUOUS = [
-            "axis1_power",
-            "axis1_sampler_share",
-            "sampler_power", "loss_power",
-            "axis2_power",
-            "loss_focal_gamma", "loss_fairness_lambda",
-            "learning_rate", "layer_decay",
+            "axis1_power", "axis2_power", "aug_share",
+            "mmd_lambda",
+            "loss_focal_gamma",
+            "learning_rate", "weight_decay",
+            "head_dropout", "backbone_drop_path_rate",
         ]
         N_BINS_CONTINUOUS = 4
         for fam_label, fam_key in families:
@@ -922,30 +911,23 @@ with tab_params:
     if not params:
         st.info("No params logged for this run.")
     else:
-        # Highlight panel : v9 search-space params ordonnés par lisibilité.
+        # Highlight panel : v10 search-space params ordonnés par lisibilité.
         OPTUNA_KEYS = [
-            # === Axe 1 (2-way stick-breaking) : γ × (sampler, loss) ===
-            "axis1_power",
-            "axis1_sampler_share",
-            "sampler_power", "loss_power",
-            # === Axes 2-5 ===
-            "axis2_power",
-            "feature_fairness",
+            # === v10 unified rebalancing target ===
+            "axis1_power", "axis2_power", "aug_share",
+            # === Feature fairness ===
+            "feature_fairness", "mmd_lambda",
+            # === Loss ===
             "loss_focal_gamma",
-            "loss_fairness_lambda",
-            # === v9 — val distribution ===
-            "val_split_alpha",
             # === Architecture ===
             "pretrained_source", "pooling_type",
             # === Hyperparams ===
-            "learning_rate", "weight_decay", "num_train_epochs",
-            "warmup_ratio", "head_dropout", "layer_decay",
-            "backbone_drop_path_rate",
+            "learning_rate", "weight_decay",
+            "head_dropout", "backbone_drop_path_rate",
             "pool_attn_dropout", "pool_proj_dropout",
             "tau_focal_init", "tau_diffuse_init",
             "n_focal", "n_diffuse", "n_free", "num_heads",
             "loss_query_diversity_lambda",
-            "mmd_lambda", "mixup_alpha",
         ]
         # v9 : afficher TOUS les OPTUNA_KEYS (même les manquants → "—") pour qu'on voie
         # explicitement les params absents (legacy v6-v8, conditionnels non samplés, etc.).

@@ -62,19 +62,24 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # Params we show in hover tooltips on the trials comparison chart. Order matters
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
-    "pretrained_source",
-    "pooling_type",
-    # v8 — design 5 axes orthogonaux
-    "axis1_strength",          # γ (force totale axe 1)
-    "axis1_sampler_share",     # a (poids sampler test_pmf)
-    "axis1_loss_fraction",     # f (stick-breaking : b = (1-a)·f)
-    "sampler_power",           # = γ × a (effectif)
-    "loss_power",              # = γ × b (effectif)
-    "aug_share",               # = γ × c (Y-conditional aug share)
-    "axis2_power",             # soft cell_rw power
-    "feature_fairness",        # {none, mmd, mixup_gender}
+    # v8 — axe 1 prioritaire (power globale + 3 shares normalisés)
+    "axis1_power",              # γ : puissance globale axe 1
+    "axis1_sampler_share",      # share normalisé sampler
+    "axis1_share_loss",         # share normalisé loss (computed)
+    "axis1_share_aug",          # share normalisé aug (computed)
+    # Effectifs axe 1 (= γ × share)
+    "sampler_power",
+    "loss_power",
+    "aug_power",
+    # Axes 2-5
+    "axis2_power",              # soft cell_rw power
+    "feature_fairness",         # {none, mmd, mixup_gender}
     "loss_focal_gamma",
     "loss_fairness_lambda",
+    # Architecture
+    "pretrained_source",
+    "pooling_type",
+    # Hyperparams
     "learning_rate",
     "weight_decay",
     "num_train_epochs",
@@ -557,13 +562,18 @@ def _render_inter_trial(
 
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value", "err_diff",
-            "pretrained_source", "pooling_type",
-            "loss_focal_gamma", "loss_fairness_lambda",
-            # v8 — 5 axes
-            "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
-            "sampler_power", "loss_power", "aug_share",
+            # v8 — axe 1 : power globale + 3 shares normalisés (sum=1)
+            "axis1_power",
+            "axis1_sampler_share", "axis1_share_loss", "axis1_share_aug",
+            # Effectifs axe 1
+            "sampler_power", "loss_power", "aug_power",
+            # Axes 2-5
             "axis2_power",
             "feature_fairness",
+            "loss_focal_gamma",
+            "loss_fairness_lambda",
+            # Architecture + hyperparams
+            "pretrained_source", "pooling_type",
             "learning_rate", "layer_decay",
         ]
 
@@ -877,33 +887,43 @@ with tab_params:
     if not params:
         st.info("No params logged for this run.")
     else:
-        # Highlight panel : v8 search-space params (the things that actually vary).
-        # v8 : pas de préfixe train_/model_/data_ — train.py log les keys directement.
+        # Highlight panel : v8 search-space params ordonnés par lisibilité.
         OPTUNA_KEYS = [
-            "pretrained_source", "pooling_type",
-            # v8 — axe 1 (Y shift) + dérivés computés
-            "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
-            "sampler_power", "loss_power", "aug_share",
-            # v8 — axe 2-5
+            # === Axe 1 : power globale + 3 shares normalisés (sum=1) ===
+            "axis1_power",
+            "axis1_sampler_share", "axis1_share_loss", "axis1_share_aug",
+            # === Axe 1 effectifs (= γ × share) ===
+            "sampler_power", "loss_power", "aug_power",
+            # === Axes 2-5 ===
             "axis2_power",
             "feature_fairness",
-            "loss_focal_gamma", "loss_fairness_lambda",
-            "loss_query_diversity_lambda",
-            "mmd_lambda", "mixup_alpha",
+            "loss_focal_gamma",
+            "loss_fairness_lambda",
+            # === Architecture ===
+            "pretrained_source", "pooling_type",
+            # === Hyperparams ===
             "learning_rate", "weight_decay", "num_train_epochs",
             "warmup_ratio", "head_dropout", "layer_decay",
             "backbone_drop_path_rate",
             "pool_attn_dropout", "pool_proj_dropout",
             "tau_focal_init", "tau_diffuse_init",
             "n_focal", "n_diffuse", "n_free", "num_heads",
+            "loss_query_diversity_lambda",
+            "mmd_lambda", "mixup_alpha",
+            # === Raw TPE stick-breaking (hidden from primary, in full dump) ===
+            "axis1_loss_fraction",
         ]
-        highlight = [(k, params[k]) for k in OPTUNA_KEYS if k in params]
-        if highlight:
-            st.markdown("### Optuna search-space (params samplés)")
-            st.dataframe(
-                pd.DataFrame(highlight, columns=["param", "value"]),
-                use_container_width=True, hide_index=True,
-            )
+        # v8 : afficher TOUS les OPTUNA_KEYS (même les manquants → "—") pour qu'on voie
+        # explicitement les params absents (legacy runs, conditionnels non samplés, etc.).
+        # Sinon le filtre `if k in params` cache silencieusement des params importants
+        # comme axis2_power, sampler_power, aug_power pour les runs qui ne les ont pas.
+        highlight = [(k, params.get(k, "—")) for k in OPTUNA_KEYS]
+        st.markdown("### Optuna search-space (params samplés)")
+        st.caption("'—' = param absent de ce run (legacy v6/v7, ou conditionnel non samplé)")
+        st.dataframe(
+            pd.DataFrame(highlight, columns=["param", "value"]),
+            use_container_width=True, hide_index=True,
+        )
 
         # Full dump — toutes les params (train_*, pretrain_*, model_*, data_*, etc.)
         # avec filtre texte pour naviguer.

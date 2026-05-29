@@ -61,8 +61,9 @@ _NON_HF_TRAIN_KEYS = {
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
     "loss_importance_reweight", "loss_cell_reweight",
     # v8 axis 1 : 3-mechanism Y shift correction with strength γ
-    "axis1_strength", "axis1_sampler_share", "axis1_loss_fraction",
-    "sampler_power", "loss_power", "aug_share",
+    "axis1_power", "axis1_sampler_share", "axis1_loss_fraction",
+    "axis1_share_loss", "axis1_share_aug",
+    "sampler_power", "loss_power", "aug_power",
     # v8 axis 2 : soft cell rw via build_cell_weights^power
     "axis2_power",
     "loss_query_diversity_lambda", "eval_importance_reweight", "save_worst_k", "save_qualitative_k",
@@ -563,27 +564,27 @@ def train(
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     sampler_power = float(train_cfg.get("sampler_power", 0.0))
     loss_power    = float(train_cfg.get("loss_power", 0.0))
-    aug_share     = float(train_cfg.get("aug_share", 0.0))
+    aug_power     = float(train_cfg.get("aug_power", 0.0))
 
-    # Y-conditional aug : si aug_share > 0, on enveloppe train_dataset dans un
+    # Y-conditional aug : si aug_power > 0, on enveloppe train_dataset dans un
     # YConditionalAugDataset qui réplique stochastiquement chaque sample selon
-    # k_i = (P_test[b] / P_train[b])^aug_share. set_epoch() est appelé via callback.
+    # k_i = (P_test[b] / P_train[b])^aug_power.
     y_train = train_data[label_col].astype(float).values
     yc_dataset = None
-    if aug_share > 0:
+    if aug_power > 0:
         from src.data.dataset import YConditionalAugDataset
         yc_dataset = YConditionalAugDataset(
             base_dataset=train_dataset,
             y_array=y_train,
-            aug_share=aug_share,
+            aug_power=aug_power,
             test_pmf=_TEST_PMF_0025,
             seed=seed,
         )
         train_dataset = yc_dataset
-        print(f"YConditionalAugDataset enabled (aug_share={aug_share:.3f}): "
+        print(f"YConditionalAugDataset enabled (aug_power={aug_power:.3f}): "
               f"virtual len={len(yc_dataset)} (vs base {len(y_train)}, expansion ×{len(yc_dataset)/len(y_train):.2f})")
     else:
-        print(f"YConditionalAugDataset disabled (aug_share={aug_share:.3f})")
+        print(f"YConditionalAugDataset disabled (aug_power={aug_power:.3f})")
 
     # Sampler test_pmf : intensité = sampler_power. Sur le dataset virtuel si yc actif.
     train_sampler = None
@@ -752,6 +753,10 @@ def train(
         greater_is_better=greater_is_better,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
+        # v8 perfo : persistent_workers évite le re-spawn des workers à chaque epoch
+        # (gain ~5-10s par epoch × N epochs = significatif sur sweeps longs).
+        # prefetch_factor=2 (default) suffit avec 4 workers.
+        dataloader_persistent_workers=True,
         seed=seed,
         remove_unused_columns=False,
         prediction_loss_only=False,

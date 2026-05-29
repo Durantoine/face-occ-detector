@@ -73,12 +73,14 @@ def _collect_metadata(
             "init_backbone_from":   params.get("init_backbone_from"),
             "pooling_type":         params.get("pooling_type"),
             # v8 axes
-            "axis1_strength":        params.get("axis1_strength"),
+            "axis1_power":        params.get("axis1_power"),
             "axis1_sampler_share":   params.get("axis1_sampler_share"),
             "axis1_loss_fraction":   params.get("axis1_loss_fraction"),
+            "axis1_share_loss":      params.get("axis1_share_loss"),
+            "axis1_share_aug":       params.get("axis1_share_aug"),
             "sampler_power":         params.get("sampler_power"),
             "loss_power":            params.get("loss_power"),
-            "aug_share":             params.get("aug_share"),
+            "aug_power":             params.get("aug_power"),
             "axis2_power":           params.get("axis2_power"),
             "feature_fairness":      params.get("feature_fairness"),
             "loss_focal_gamma":      params.get("loss_focal_gamma"),
@@ -113,8 +115,8 @@ def _print_metadata_summary(metadata: Dict[str, Any]) -> None:
     print(f"  iBOT init         : {init}")
     print(f"  Pooling           : {key.get('pooling_type')}")
     # v8 axes
-    print(f"  Axis 1 (Y shift) : strength={key.get('axis1_strength')} "
-          f"(sampler={key.get('sampler_power')}, loss={key.get('loss_power')}, aug={key.get('aug_share')})")
+    print(f"  Axis 1 (Y shift) : strength={key.get('axis1_power')} "
+          f"(sampler={key.get('sampler_power')}, loss={key.get('loss_power')}, aug={key.get('aug_power')})")
     print(f"  Axis 2 (cell_rw) : power={key.get('axis2_power')}")
     print(f"  Feature fairness : {key.get('feature_fairness')}")
     print(f"  Focal γ          : {key.get('loss_focal_gamma')}")

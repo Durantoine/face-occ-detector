@@ -282,7 +282,7 @@ class YConditionalAugDataset(Dataset):
     """Expansion virtuelle d'un dataset où chaque sample est répliqué selon le bin Y.
 
     Pour chaque sample i dans le bin b_i, l'espérance du nombre de copies virtuelles est :
-        k_i = (P_test(b_i) / P_train(b_i))^aug_share, clippé à [1/clip, clip]
+        k_i = (P_test(b_i) / P_train(b_i))^aug_power, clippé à [1/clip, clip]
 
     Stochastic Bernoulli rounding préserve E[copies] = k_i exact :
         copies = floor(k_i) + 1{Bernoulli(k_i - floor(k_i))}
@@ -290,7 +290,7 @@ class YConditionalAugDataset(Dataset):
     Chaque accès __getitem__ ré-applique la pipeline d'augmentation (côté base dataset
     via FaceOccDataset.transform stochastique) → vue différente pour chaque copie
     virtuelle d'un même sample base. Combiné avec un sampler test_pmf ou un loss
-    reweight, l'effet total sur le gradient = r^(sampler_power + loss_power + aug_share).
+    reweight, l'effet total sur le gradient = r^(sampler_power + loss_power + aug_power).
 
     **DESIGN NOTE** : virtual_to_base est fixé au __init__ et NE CHANGE PAS pendant
     le training. Sinon le sampler (qui prend des poids alignés sur virtual_to_base à
@@ -309,7 +309,7 @@ class YConditionalAugDataset(Dataset):
         self,
         base_dataset: Dataset,
         y_array: np.ndarray,
-        aug_share: float,
+        aug_power: float,
         test_pmf: np.ndarray,
         bin_width: float = 0.025,
         clip: float = 10.0,
@@ -317,7 +317,7 @@ class YConditionalAugDataset(Dataset):
     ) -> None:
         self.base = base_dataset
         self.y_array = np.asarray(y_array, dtype=np.float64)
-        self.aug_share = float(aug_share)
+        self.aug_power = float(aug_power)
         self.bin_width = bin_width
         self.clip = clip
 
@@ -325,8 +325,8 @@ class YConditionalAugDataset(Dataset):
         self.bin_idx = np.clip((self.y_array / bin_width).astype(int), 0, n_bins - 1)
         train_pmf = np.bincount(self.bin_idx, minlength=n_bins).astype(np.float64) / max(len(self.y_array), 1)
         ratio = test_pmf / np.maximum(train_pmf, 1e-6)
-        if self.aug_share > 0:
-            ratio = np.power(ratio, self.aug_share)
+        if self.aug_power > 0:
+            ratio = np.power(ratio, self.aug_power)
         else:
             ratio = np.ones_like(ratio)
         ratio = np.clip(ratio, 1.0 / clip, clip)

@@ -83,9 +83,11 @@ optuna:
       choices: [attention_k_query, multihead_attention]
 
     # === Axe 1 — Y shift correction (3 mécaniques) ===
-    axis1_strength:
+    # axis1_power = γ : intensité totale axe 1. γ=0 → ERM baseline (pas de correction Y) ;
+    # γ=1 → correction complète (effet r^γ sur gradient). [0, 1] full spectrum.
+    axis1_power:
       type: float
-      low: 0.5
+      low: 0.0
       high: 1.0
     axis1_sampler_share:
       type: float

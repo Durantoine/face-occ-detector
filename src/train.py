@@ -147,13 +147,16 @@ class EMAWeightCallback(TrainerCallback):
 
 
 class LambdaLogCallback(TrainerCallback):
-    """Logs adaptive Lagrangian λ + err_diff_ema at each epoch end."""
+    """Logs adaptive Lagrangian λ + err_diff_ema at each epoch end. RANK 0 ONLY
+    (avoids sqlite lock contention with multiple jobs)."""
     def __init__(self, trainer_ref: List[Any], client: Optional[Any], run_id: Optional[str]) -> None:
         self._trainer_ref = trainer_ref
         self._client = client
         self._run_id = run_id
 
     def on_epoch_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        if not getattr(state, "is_world_process_zero", True):
+            return
         if not self._trainer_ref:
             return
         loss_fct = getattr(self._trainer_ref[0], "loss_fct", None)
@@ -162,7 +165,7 @@ class LambdaLogCallback(TrainerCallback):
         lam = float(loss_fct.lambda_adapt.item())
         ema = float(loss_fct.err_diff_ema.item())
         epoch = int(state.epoch or 0)
-        print(f"  Lagrangien epoch {epoch}: λ_adapt={lam:.4f}  err_diff_ema={ema:.6f}")
+        print(f"  Lagrangien epoch {epoch}: λ_adapt={lam:.4f}  err_diff_ema={ema:.6f}", flush=True)
         ml_log_metrics(self._client, self._run_id, {"lambda_adapt": lam, "err_diff_ema": ema}, step=epoch)
 
 
@@ -180,6 +183,7 @@ class WeightedMSETrainer(Trainer):
         ot_lambda: float = 0.0,
         layer_decay: float = 1.0,
         gender_sampler: Optional[Any] = None,
+        ema_eval_min_epoch_frac: float = 0.5,
         *args: Any,
         **kwargs: Any,
     ):
@@ -190,6 +194,7 @@ class WeightedMSETrainer(Trainer):
         self._ot_lambda = float(ot_lambda)
         self._layer_decay = float(layer_decay)
         self._gender_sampler = gender_sampler
+        self._ema_eval_min_epoch_frac = float(ema_eval_min_epoch_frac)
         self.loss_fct = WeightedMSELoss(
             focal_gamma=focal_gamma,
             lambda_init=lambda_init,
@@ -217,6 +222,12 @@ class WeightedMSETrainer(Trainer):
     def evaluate(self, eval_dataset: Any = None, ignore_keys: Any = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
         ema_cb = self._find_ema_cb()
         if ema_cb is None:
+            return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        current_epoch = float(self.state.epoch or 0.0)
+        total_epochs = float(self.args.num_train_epochs or 1.0)
+        min_epoch = total_epochs * self._ema_eval_min_epoch_frac
+        if current_epoch < min_epoch:
             return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
 
         metrics_raw = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -745,9 +756,12 @@ def train(
         load_best_model_at_end=True,
         metric_for_best_model=best_metric,
         greater_is_better=greater_is_better,
-        dataloader_num_workers=4,
+        dataloader_num_workers=8,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
+        # ddp_find_unused_parameters: True only when DANN active (adv_disc head exists
+        # but unused when adv_lambda=0). False elsewhere → skip costly DDP graph traversal.
+        ddp_find_unused_parameters=bool(dann_active),
         # DDP timeout bumped to 1h (default 10min trop court si NFS lent ou save MLflow long)
         ddp_timeout=3600,
         seed=seed,

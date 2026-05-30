@@ -260,6 +260,11 @@ class WeightedMSETrainer(Trainer):
         outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
         preds = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         self.loss_fct = self.loss_fct.to(preds.device)
+        # CRITICAL: HF doesn't propagate model.train/eval to loss_fct, so we sync here.
+        # Without this, loss_fct.training stays True during eval → triggers the all_reduce
+        # in WeightedMSELoss.forward() and pollutes lambda_adapt with val data. Worse: DDP
+        # collective ops during a torch.no_grad() prediction step can deadlock.
+        self.loss_fct.train(model.training)
         loss = self.loss_fct(preds, labels, sample_loss_weight=sample_loss_weight)
 
         if self._query_diversity_lambda > 0 and isinstance(outputs, dict) and "attn_weights" in outputs:

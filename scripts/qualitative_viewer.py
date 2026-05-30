@@ -390,8 +390,8 @@ def _render_trials_comparison() -> None:
         if _HAS_AUTOREFRESH:
             auto_refresh_sec = st.selectbox(
                 "Auto-refresh",
-                [0, 15, 30, 60, 120],
-                index=2,  # default 30s — non-blocking via JS timer
+                [0, 3, 5, 10, 15, 30, 60, 120],
+                index=2,  # default 5s — non-blocking via JS timer
                 format_func=lambda s: "off" if s == 0 else f"every {s}s",
             )
         else:

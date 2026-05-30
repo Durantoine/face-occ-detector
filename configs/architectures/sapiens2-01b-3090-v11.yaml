@@ -45,7 +45,7 @@ training:
   max_grad_norm: 1.0
   early_stopping_patience: 3
   seed: 42
-  logging_steps: 200   # was 50; reduce sqlite write frequency under multi-job contention
+  logging_steps: 25   # MLflow refresh granularity (was 200). Safe with try/except non-blocking writes.
   metric_for_best_model: eval_challenge_score
   greater_is_better: false
   bf16: true
@@ -53,7 +53,7 @@ training:
   gradient_checkpointing: false
   augmentation_level: light
   layer_decay: 0.85
-  ema_decay: 0.999
+  ema_decay: 0   # DEBUG: disabled temporarily to isolate hang. Reset to 0.999 once OK.
   loss_lambda_init: 1.0
   loss_lambda_lr: 0.5
   loss_lambda_max: 5.0

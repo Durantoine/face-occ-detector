@@ -26,6 +26,7 @@ cd "${PROJECT_DIR}"
 export UV_PYTHON=python3.12
 export UV_PYTHON_DOWNLOADS=automatic
 export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
+export PATH="$HOME/.local/bin:$PATH"
 uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 

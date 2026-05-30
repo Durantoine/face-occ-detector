@@ -56,6 +56,7 @@ CONFIG: Dict[str, Any] = {
 }
 
 _NON_HF_TRAIN_KEYS = {
+    "dataloader_num_workers",
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
     "augmentation_level", "ema_decay", "ema_warmup_steps",
     "sampler_strategy", "loss_type", "loss_focal_gamma", "loss_fairness_lambda",

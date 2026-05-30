@@ -8,6 +8,7 @@ from transformers import AutoModel
 from src.models.dinov3_loader import hidden_size_of, load_dinov3
 from src.models.sapiens2_loader import hidden_size_of as sapiens2_hidden_size_of
 from src.models.sapiens2_loader import is_sapiens2, load_sapiens2
+from src.models.convnext_loader import hidden_size_of as convnext_hidden_size_of, is_convnext, load_convnext
 
 
 def _is_dinov3(model_name: str) -> bool:
@@ -25,6 +26,9 @@ def _build_backbone(
     if is_sapiens2(model_name):
         backbone = load_sapiens2(model_name, drop_rate=drop_path_rate, pretrained=pretrained)
         return backbone, sapiens2_hidden_size_of(model_name)
+    if is_convnext(model_name):
+        backbone = load_convnext(model_name, drop_path_rate=drop_path_rate, pretrained=pretrained)
+        return backbone, convnext_hidden_size_of(model_name)
     if pretrained:
         backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     else:

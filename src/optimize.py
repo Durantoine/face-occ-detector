@@ -213,7 +213,7 @@ def objective(
     try:
         eval_loss, score, err_diff, _, err_F, err_M = train(
             architecture_name=arch_name,
-            output_dir=f"./results/optuna_{base_arch}_trial_{trial_data['n']}",
+            output_dir=f"{os.environ.get('TMPDIR', '/tmp')}/face_occ_results/optuna_{base_arch}_trial_{trial_data['n']}",
             mlflow_tracking_uri=tracking_uri,
             mlflow_run_id=run_id,
             seed=seed,
@@ -509,7 +509,7 @@ def optimize_hyperparameters(
             if data is None:
                 break
             try:
-                train(architecture_name=data["arch"], output_dir=f"./results/optuna_{architecture}_trial_{data['n']}",
+                train(architecture_name=data["arch"], output_dir=f"{os.environ.get('TMPDIR', '/tmp')}/face_occ_results/optuna_{architecture}_trial_{data['n']}",
                       mlflow_tracking_uri=tracking_uri, mlflow_run_id=data["run_id"],
                       seed=data["seed"], val_seed=data["val_seed"])
             except Exception:

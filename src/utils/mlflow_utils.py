@@ -33,18 +33,24 @@ def get_or_create_experiment(client: MlflowClient, name: str) -> str:
 def log_params(client: Optional[MlflowClient], run_id: Optional[str], params: Dict[str, Any]) -> None:
     if not _is_rank_zero():
         return
-    if client and run_id:
-        for k, v in params.items():
-            client.log_param(run_id, k, v)
-    elif mlflow.active_run():
-        mlflow.log_params(params)
+    try:
+        if client and run_id:
+            for k, v in params.items():
+                client.log_param(run_id, k, v)
+        elif mlflow.active_run():
+            mlflow.log_params(params)
+    except Exception as e:
+        print(f"[mlflow] WARNING: log_params failed (sqlite contention?): {e}", flush=True)
 
 
 def log_metrics(client: Optional[MlflowClient], run_id: Optional[str], metrics: Dict[str, float], step: Optional[int] = None) -> None:
     if not _is_rank_zero():
         return
-    if client and run_id:
-        for k, v in metrics.items():
-            client.log_metric(run_id, k, v, step=step) if step is not None else client.log_metric(run_id, k, v)
-    elif mlflow.active_run():
-        mlflow.log_metrics(metrics, step=step) if step is not None else mlflow.log_metrics(metrics)
+    try:
+        if client and run_id:
+            for k, v in metrics.items():
+                client.log_metric(run_id, k, v, step=step) if step is not None else client.log_metric(run_id, k, v)
+        elif mlflow.active_run():
+            mlflow.log_metrics(metrics, step=step) if step is not None else mlflow.log_metrics(metrics)
+    except Exception as e:
+        print(f"[mlflow] WARNING: log_metrics failed (sqlite contention?): {e}", flush=True)

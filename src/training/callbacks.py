@@ -19,5 +19,5 @@ class MlflowClientCallback(TrainerCallback):
             if isinstance(value, (int, float)):
                 try:
                     self.client.log_metric(self.run_id, key, value, step=state.global_step)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[mlflow] WARNING: log_metric '{key}' failed: {e}", flush=True)

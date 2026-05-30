@@ -114,8 +114,12 @@ class EMAWeightCallback(TrainerCallback):
         with torch.no_grad():
             for name, p in model.named_parameters():
                 buf = self.ema_state.get(name)
-                if buf is not None and p.requires_grad:
-                    buf.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+                if buf is None or not p.requires_grad:
+                    continue
+                if buf.device != p.device:
+                    buf = buf.to(p.device)
+                    self.ema_state[name] = buf
+                buf.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
 
     def _swap_to_ema(self, model: torch.nn.Module) -> None:
         if self.backup_state:
@@ -123,9 +127,13 @@ class EMAWeightCallback(TrainerCallback):
         with torch.no_grad():
             for name, p in model.named_parameters():
                 buf = self.ema_state.get(name)
-                if buf is not None:
-                    self.backup_state[name] = p.detach().clone()
-                    p.copy_(buf)
+                if buf is None:
+                    continue
+                if buf.device != p.device:
+                    buf = buf.to(p.device)
+                    self.ema_state[name] = buf
+                self.backup_state[name] = p.detach().clone()
+                p.copy_(buf)
 
     def _swap_to_live(self, model: torch.nn.Module) -> None:
         if not self.backup_state:
@@ -134,7 +142,7 @@ class EMAWeightCallback(TrainerCallback):
             for name, p in model.named_parameters():
                 live = self.backup_state.get(name)
                 if live is not None:
-                    p.copy_(live)
+                    p.copy_(live.to(p.device) if live.device != p.device else live)
         self.backup_state.clear()
 
 

@@ -85,3 +85,8 @@ tmp/
 .tmp/
 *.tmp
 scratch/
+
+# Cora — additions
+data/
+scripts/logs/
+*.bak

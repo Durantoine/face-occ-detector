@@ -756,7 +756,7 @@ def train(
         load_best_model_at_end=True,
         metric_for_best_model=best_metric,
         greater_is_better=greater_is_better,
-        dataloader_num_workers=8,
+        dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         # ddp_find_unused_parameters: True only when DANN active (adv_disc head exists

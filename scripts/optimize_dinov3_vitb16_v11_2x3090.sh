@@ -4,7 +4,7 @@
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=60G
 #SBATCH --time=30:00:00
 
@@ -38,7 +38,7 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=2
 export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1

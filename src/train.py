@@ -670,7 +670,7 @@ def train(
         load_best_model_at_end=load_best_at_end,
         metric_for_best_model=best_metric,
         greater_is_better=greater_is_better,
-        dataloader_num_workers=4,
+        dataloader_num_workers=int(train_cfg.get("dataloader_num_workers", 4)),
         dataloader_pin_memory=True,
         seed=seed,
         remove_unused_columns=False,

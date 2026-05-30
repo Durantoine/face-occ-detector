@@ -40,6 +40,12 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=8
+# v10 : NCCL stability fixes after observed AllReduce timeouts
+export NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# Match ddp_timeout in HF TrainingArguments (3600s = 1h)
+export NCCL_TIMEOUT=3600
 
 export FACE_OCC_ARCH=sapiens2-01b-3090-v10
 

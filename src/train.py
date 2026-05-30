@@ -22,8 +22,8 @@ from src.data.dataset import (
     DEFAULT_IMAGE_COL,
     DEFAULT_LABEL_COL,
     FaceOccDataset,
-    TargetedAugDataset,
     _load_data,
+    create_gender_balanced_sampler,
 )
 from src.data.transforms import build_train_transform
 from src.models.dinov3_loader import get_image_processor
@@ -31,7 +31,7 @@ from src.models.face_occ_regressor import FaceOccRegressor
 from src.training.callbacks import MlflowClientCallback
 from src.utils.config import load_architecture_config
 from src.utils.environment import setup_environment
-from src.utils.losses import WeightedMSELoss
+from src.utils.losses import WeightedMSELoss, compute_target_weights
 from src.utils.metrics import make_compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
 from src.utils.mlflow_utils import log_params as ml_log_params
@@ -39,7 +39,7 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v10"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v11"),
     "data_csv": "data/raw/train.csv",
     "val_data_csv": None,
     "output_dir": "./results",
@@ -48,18 +48,17 @@ CONFIG: Dict[str, Any] = {
     "resume_from": None,
 }
 
-# Keys consumed by our custom logic (not passed to HF TrainingArguments)
 _NON_HF_TRAIN_KEYS = {
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
     "augmentation_level",
-    "loss_type", "loss_focal_gamma", "loss_fairness_lambda",
-    # v10 axes (rebalancing target)
-    "axis1_power", "axis2_power", "aug_share", "aug_repli_max",
-    # v10 feature fairness (lambdas HPO, activation via feature_fairness)
-    "feature_fairness", "mmd_lambda", "adv_lambda",
-    # pool diversity penalty
+    "loss_focal_gamma",
+    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
+    "axis1_power", "axis2_power",
+    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
     "loss_query_diversity_lambda",
     "save_qualitative_k",
+    "layer_decay",
+    "ema_decay",
 }
 
 
@@ -68,7 +67,6 @@ def _unwrap(module: Any) -> Any:
 
 
 def _custom_collator(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-    """Default collator + stack loss_weight if present (from TargetedAugDataset)."""
     out: Dict[str, torch.Tensor] = {}
     for key in batch[0]:
         if key == "loss_weight":
@@ -78,20 +76,102 @@ def _custom_collator(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     return out
 
 
-class WeightedMSETrainer(Trainer):
-    """v10 — simplifie l'héritage HF Trainer.
-    Loss = WeightedMSELoss avec sample_loss_weight passé via le batch.
-    Optional extras : query_diversity, DANN adv, MMD.
-    LLRD, EMA, custom sampler, group_dro retirés.
+class EMAWeightCallback(TrainerCallback):
+    """Maintains an EMA copy of weights, updated via on_step_end.
+
+    Swap helpers `_swap_to_ema` / `_swap_to_live` are called by
+    WeightedMSETrainer.evaluate() for double-eval (raw + EMA at each epoch).
+    `on_step_begin` ensures we always train on LIVE weights even if the previous
+    epoch's save used EMA weights.
     """
 
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
+        self.decay = float(decay)
+        self.ema_state: Dict[str, torch.Tensor] = {}
+        self.backup_state: Dict[str, torch.Tensor] = {}
+        self._needs_restore = False
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.ema_state[name] = p.detach().clone()
+
+    @staticmethod
+    def _model(kwargs: Dict[str, Any]) -> Optional[torch.nn.Module]:
+        m = kwargs.get("model")
+        return _unwrap(m) if m is not None else None
+
+    def on_step_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        if not self._needs_restore:
+            return
+        model = self._model(kwargs)
+        if model is not None:
+            self._swap_to_live(model)
+        self._needs_restore = False
+
+    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        model = self._model(kwargs)
+        if model is None:
+            return
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                buf = self.ema_state.get(name)
+                if buf is not None and p.requires_grad:
+                    buf.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    def _swap_to_ema(self, model: torch.nn.Module) -> None:
+        if self.backup_state:
+            return
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                buf = self.ema_state.get(name)
+                if buf is not None:
+                    self.backup_state[name] = p.detach().clone()
+                    p.copy_(buf)
+
+    def _swap_to_live(self, model: torch.nn.Module) -> None:
+        if not self.backup_state:
+            return
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                live = self.backup_state.get(name)
+                if live is not None:
+                    p.copy_(live)
+        self.backup_state.clear()
+
+
+class LambdaLogCallback(TrainerCallback):
+    """Logs adaptive Lagrangian λ + err_diff_ema at each epoch end."""
+    def __init__(self, trainer_ref: List[Any], client: Optional[Any], run_id: Optional[str]) -> None:
+        self._trainer_ref = trainer_ref
+        self._client = client
+        self._run_id = run_id
+
+    def on_epoch_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+        if not self._trainer_ref:
+            return
+        loss_fct = getattr(self._trainer_ref[0], "loss_fct", None)
+        if loss_fct is None or not hasattr(loss_fct, "lambda_adapt"):
+            return
+        lam = float(loss_fct.lambda_adapt.item())
+        ema = float(loss_fct.err_diff_ema.item())
+        epoch = int(state.epoch or 0)
+        print(f"  Lagrangien epoch {epoch}: λ_adapt={lam:.4f}  err_diff_ema={ema:.6f}")
+        ml_log_metrics(self._client, self._run_id, {"lambda_adapt": lam, "err_diff_ema": ema}, step=epoch)
+
+
+class WeightedMSETrainer(Trainer):
     def __init__(
         self,
         focal_gamma: float = 0.0,
-        fairness_lambda: float = 1.0,
+        lambda_init: float = 1.0,
+        lambda_lr: float = 0.5,
+        lambda_max: float = 5.0,
+        lambda_ema: float = 0.9,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
+        ot_lambda: float = 0.0,
+        layer_decay: float = 1.0,
+        gender_sampler: Optional[Any] = None,
         *args: Any,
         **kwargs: Any,
     ):
@@ -99,12 +179,61 @@ class WeightedMSETrainer(Trainer):
         self._query_diversity_lambda = float(query_diversity_lambda)
         self._adv_lambda = float(adv_lambda)
         self._mmd_lambda = float(mmd_lambda)
+        self._ot_lambda = float(ot_lambda)
+        self._layer_decay = float(layer_decay)
+        self._gender_sampler = gender_sampler
         self.loss_fct = WeightedMSELoss(
             focal_gamma=focal_gamma,
-            fairness_lambda=fairness_lambda,
+            lambda_init=lambda_init,
+            lambda_lr=lambda_lr,
+            lambda_max=lambda_max,
+            lambda_ema=lambda_ema,
         )
-        print(f"WeightedMSELoss : focal_gamma={focal_gamma}, fairness_lambda={fairness_lambda}, "
-              f"query_div_lambda={query_diversity_lambda}, adv_lambda={adv_lambda}, mmd_lambda={mmd_lambda}")
+        print(f"WeightedMSETrainer: focal_gamma={focal_gamma}, "
+              f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ_max={lambda_max}, λ_ema={lambda_ema}, "
+              f"query_div={query_diversity_lambda}, adv={adv_lambda}, "
+              f"mmd={mmd_lambda}, ot={ot_lambda}, layer_decay={layer_decay}, "
+              f"gender_sampler={'ON' if gender_sampler is not None else 'off'}")
+
+    def _get_train_sampler(self, *args: Any, **kwargs: Any) -> Any:
+        if self._gender_sampler is not None:
+            return self._gender_sampler
+        return super()._get_train_sampler(*args, **kwargs)
+
+    def _find_ema_cb(self) -> Optional["EMAWeightCallback"]:
+        for cb in self.callback_handler.callbacks:
+            if isinstance(cb, EMAWeightCallback):
+                return cb
+        return None
+
+    def evaluate(self, eval_dataset: Any = None, ignore_keys: Any = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
+        ema_cb = self._find_ema_cb()
+        if ema_cb is None:
+            return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        metrics_raw = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        model_inner = _unwrap(self.model)
+        ema_cb._swap_to_ema(model_inner)
+        metrics_ema = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
+        best_key = self.args.metric_for_best_model
+        if not best_key.startswith(metric_key_prefix + "_"):
+            best_key = f"{metric_key_prefix}_{best_key}"
+        score_raw = metrics_raw.get(best_key, float("inf"))
+        score_ema = metrics_ema.get(best_key, float("inf"))
+        ema_wins = (score_ema > score_raw) if self.args.greater_is_better else (score_ema < score_raw)
+
+        if not ema_wins:
+            ema_cb._swap_to_live(model_inner)
+        else:
+            ema_cb._needs_restore = True
+
+        chosen = metrics_ema if ema_wins else metrics_raw
+        extras = {f"{k}_raw": v for k, v in metrics_raw.items()}
+        extras.update({f"{k}_ema": v for k, v in metrics_ema.items()})
+        extras[f"{metric_key_prefix}_chose_ema"] = float(ema_wins)
+        return {**chosen, **extras}
 
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:
         labels = inputs["labels"]
@@ -135,7 +264,77 @@ class WeightedMSETrainer(Trainer):
                 mmd = mmd_rbf(feats[f_mask], feats[m_mask])
                 loss = loss + self._mmd_lambda * mmd
 
+        if self._ot_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
+            if labels.dim() == 2 and labels.size(1) >= 2:
+                from src.utils.losses import sliced_wasserstein
+                feats = outputs["features"]
+                g = labels[:, 1]
+                f_mask = g < 0.5
+                m_mask = g >= 0.5
+                sw = sliced_wasserstein(feats[f_mask], feats[m_mask])
+                loss = loss + self._ot_lambda * sw
+
         return (loss, outputs) if return_outputs else loss
+
+    def create_optimizer(self) -> torch.optim.Optimizer:
+        if self.optimizer is not None:
+            return self.optimizer
+        if self._layer_decay >= 1.0:
+            return super().create_optimizer()
+
+        base_lr = self.args.learning_rate
+        wd = self.args.weight_decay
+        inner = _unwrap(self.model)
+        backbone = inner.backbone
+
+        if hasattr(backbone, "blocks"):
+            n_layers = len(backbone.blocks)
+            block_attr = "blocks"
+        elif hasattr(backbone, "encoder") and hasattr(backbone.encoder, "layer"):
+            n_layers = len(backbone.encoder.layer)
+            block_attr = "encoder.layer"
+        else:
+            print(f"WARNING: backbone has no .blocks/.encoder.layer — LLRD disabled")
+            return super().create_optimizer()
+
+        decay = self._layer_decay
+        groups: List[Dict[str, Any]] = []
+        assigned: set = set()
+
+        def _take(predicate, lr: float) -> None:
+            picked: List[torch.nn.Parameter] = []
+            for n, p in self.model.named_parameters():
+                if id(p) in assigned or not p.requires_grad:
+                    continue
+                if predicate(n):
+                    picked.append(p)
+                    assigned.add(id(p))
+            if picked:
+                groups.append({"params": picked, "lr": lr, "weight_decay": wd})
+
+        _take(
+            lambda n: "backbone" in n and any(
+                k in n for k in ("embed", "cls_token", "mask_token", "storage_tokens", "register_tokens")
+            ),
+            base_lr * decay ** (n_layers + 1),
+        )
+        for i in range(n_layers):
+            pattern = f"backbone.{block_attr}.{i}."
+            _take(lambda n, p=pattern: p in n, base_lr * decay ** (n_layers - i))
+        _take(lambda n: "backbone" in n, base_lr)
+        _take(lambda n: True, base_lr)
+
+        leftover = [n for n, p in self.model.named_parameters()
+                    if p.requires_grad and id(p) not in assigned]
+        if leftover:
+            raise RuntimeError(f"LLRD did not cover {len(leftover)} trainable params: {leftover[:5]}")
+
+        print(f"LLRD: {len(groups)} groups, LR ∈ [{groups[0]['lr']:.2e}, {base_lr:.2e}]")
+        self.optimizer = torch.optim.AdamW(
+            groups, lr=base_lr, weight_decay=wd,
+            betas=(self.args.adam_beta1, self.args.adam_beta2),
+        )
+        return self.optimizer
 
 
 def _resolve_data_path(data_cfg: Dict[str, Any], data_csv: Optional[str]) -> str:
@@ -176,31 +375,26 @@ def _build_datasets(
     augmentation_level: str,
     axis1_power: float,
     axis2_power: float,
-    aug_share: float,
-    aug_repli_max: int,
-    seed: int,
-) -> Tuple[Any, FaceOccDataset, Dict[str, float]]:
-    # v10 : base dataset SANS transform (image raw). Aug appliqué SEULEMENT sur replicas
-    # par TargetedAugDataset.get_with_transform() → originaux jamais augmentés.
+) -> Tuple[FaceOccDataset, FaceOccDataset, Dict[str, float]]:
     transform = build_train_transform(augmentation_level)
-    train_base = FaceOccDataset(
-        image_paths=train_data["image_path"].tolist(),
-        targets=train_data["FaceOcclusion"].astype(float).tolist(),
-        genders=train_data["gender"].astype(float).tolist(),
-        processor=processor,
-        image_base_dir=image_base_dir,
-        transform=None,   # ← v10 : pas d'aug sur base. Replicas only.
-    )
-    targeted = TargetedAugDataset(
-        base_dataset=train_base,
-        targets=train_data["FaceOcclusion"].astype(float).values,
-        gender=train_data["gender"].astype(float).values,
+    targets_arr = train_data["FaceOcclusion"].astype(float).values
+    gender_arr = train_data["gender"].astype(float).values
+
+    loss_weights = compute_target_weights(
+        targets=targets_arr,
+        gender=gender_arr,
         axis1_power=axis1_power,
         axis2_power=axis2_power,
-        aug_share=aug_share,
-        k_max=aug_repli_max,
-        seed=seed,
-        transform=transform,   # ← appliqué uniquement sur replicas
+    )
+
+    train_ds = FaceOccDataset(
+        image_paths=train_data["image_path"].tolist(),
+        targets=targets_arr.tolist(),
+        genders=gender_arr.tolist(),
+        processor=processor,
+        image_base_dir=image_base_dir,
+        transform=transform,
+        loss_weights=loss_weights,
     )
     val_ds = FaceOccDataset(
         image_paths=val_data["image_path"].tolist(),
@@ -210,7 +404,13 @@ def _build_datasets(
         image_base_dir=image_base_dir,
         transform=None,
     )
-    return targeted, val_ds, targeted.summary()
+    summary = {
+        "loss_weight_min": float(loss_weights.min()),
+        "loss_weight_max": float(loss_weights.max()),
+        "loss_weight_mean": float(loss_weights.mean()),
+        "loss_weight_std": float(loss_weights.std()),
+    }
+    return train_ds, val_ds, summary
 
 
 def _start_or_attach_run(
@@ -412,20 +612,20 @@ def train(
     best_metric = train_cfg.get("metric_for_best_model", "eval_challenge_score")
     greater_is_better = bool(train_cfg.get("greater_is_better", False))
     image_base_dir = data_cfg.get("image_base_dir")
-    augmentation_level = train_cfg.get("augmentation_level", "light_v10")
+    augmentation_level = train_cfg.get("augmentation_level", "light")
 
-    # v10 axes
     axis1_power = float(train_cfg.get("axis1_power", 0.0))
     axis2_power = float(train_cfg.get("axis2_power", 0.0))
-    aug_share = float(train_cfg.get("aug_share", 0.0))
-    aug_repli_max = int(train_cfg.get("aug_repli_max", 3))
+    layer_decay = float(train_cfg.get("layer_decay", 1.0))
 
-    # v10 fairness features
     feature_fairness = str(train_cfg.get("feature_fairness", "none"))
-    mmd_active = feature_fairness in ("mmd", "both")
-    dann_active = feature_fairness in ("dann", "both")
+    mmd_active = feature_fairness == "mmd"
+    dann_active = feature_fairness == "dann"
+    ot_active = feature_fairness == "ot"
     mmd_lambda = float(train_cfg.get("mmd_lambda", 0.0)) if mmd_active else 0.0
     adv_lambda = float(train_cfg.get("adv_lambda", 0.01)) if dann_active else 0.0
+    ot_lambda = float(train_cfg.get("ot_lambda", 0.0)) if ot_active else 0.0
+    use_gender_sampler = feature_fairness != "none"
 
     client, run_id, use_client = _start_or_attach_run(
         cfg, mlflow_tracking_uri, mlflow_run_id, mlflow_experiment, use_mlflow,
@@ -439,13 +639,12 @@ def train(
 
     processor = get_image_processor(model_name)
     train_data, val_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
-    train_dataset, val_dataset, aug_summary = _build_datasets(
+    train_dataset, val_dataset, weight_summary = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
-        axis1_power=axis1_power, axis2_power=axis2_power, aug_share=aug_share,
-        aug_repli_max=aug_repli_max, seed=val_seed or seed,
+        axis1_power=axis1_power, axis2_power=axis2_power,
     )
-    print(f"TargetedAugDataset summary: {aug_summary}")
-    ml_log_metrics(client, run_id, {f"aug_{k}": v for k, v in aug_summary.items() if isinstance(v, (int, float))})
+    print(f"Loss weights summary: {weight_summary}")
+    ml_log_metrics(client, run_id, weight_summary)
 
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     n_train_f = int((train_data["gender"] < 0.5).sum())
@@ -454,8 +653,7 @@ def train(
     n_val_m = int((val_data["gender"] >= 0.5).sum())
     ml_log_params(client, run_id, {
         "seed": seed,
-        "num_train_base": len(train_data),
-        "num_train_virtual": len(train_dataset),
+        "num_train": len(train_data),
         "num_val": len(val_data),
         "num_train_female": n_train_f,
         "num_train_male": n_train_m,
@@ -470,6 +668,8 @@ def train(
     })
 
     pretrained = bool(model_cfg.get("pretrained", True))
+    target_mean = float(train_data["FaceOcclusion"].mean())
+    print(f"Head bias init: target_mean={target_mean:.4f}  ->  bias=logit(mean)≈{np.log(max(target_mean,1e-6)/max(1-target_mean,1e-6)):.3f}")
     model = (
         FaceOccRegressor.load_from_mlflow(resume_from_checkpoint, output_dim=output_dim)
         if resume_from_checkpoint
@@ -493,6 +693,7 @@ def train(
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
             pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", 0.0)),
             enable_adv_disc=dann_active,
+            target_mean=target_mean,
         )
     )
 
@@ -539,6 +740,8 @@ def train(
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
+        # DDP timeout bumped to 1h (default 10min trop court si NFS lent ou save MLflow long)
+        ddp_timeout=3600,
         seed=seed,
         remove_unused_columns=False,
         prediction_loss_only=False,
@@ -553,14 +756,36 @@ def train(
     if use_client and client and run_id:
         callbacks.append(MlflowClientCallback(client, run_id))
 
-    compute_metrics = make_compute_metrics()   # v10 : pas de eval_pmf_ratio (val ≡ P_test direct)
+    compute_metrics = make_compute_metrics()
+
+    gender_sampler = None
+    if use_gender_sampler:
+        gender_sampler = create_gender_balanced_sampler(
+            gender=train_data["gender"].astype(float).values,
+            seed=val_seed or seed,
+        )
+        print(f"Gender-balanced WeightedRandomSampler enabled (feature_fairness={feature_fairness})")
+
+    ema_decay = float(train_cfg.get("ema_decay", 0.0))
+    if ema_decay > 0:
+        callbacks.append(EMAWeightCallback(model=model, decay=ema_decay))
+        print(f"EMA weights enabled with decay={ema_decay}")
+
+    trainer_ref: List[Any] = []
+    callbacks.append(LambdaLogCallback(trainer_ref, client if use_client else None, run_id if use_client else None))
 
     trainer = WeightedMSETrainer(
         focal_gamma=float(train_cfg.get("loss_focal_gamma", 0.0)),
-        fairness_lambda=float(train_cfg.get("loss_fairness_lambda", 1.0)),
+        lambda_init=float(train_cfg.get("loss_lambda_init", 1.0)),
+        lambda_lr=float(train_cfg.get("loss_lambda_lr", 0.5)),
+        lambda_max=float(train_cfg.get("loss_lambda_max", 5.0)),
+        lambda_ema=float(train_cfg.get("loss_lambda_ema", 0.9)),
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,
         mmd_lambda=mmd_lambda,
+        ot_lambda=ot_lambda,
+        layer_decay=layer_decay,
+        gender_sampler=gender_sampler,
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -569,6 +794,7 @@ def train(
         data_collator=_custom_collator,
         callbacks=callbacks or None,
     )
+    trainer_ref.append(trainer)
 
     print(f"Training {cfg['name']} (best_metric={best_metric})")
     trainer.train()
@@ -599,6 +825,22 @@ def train(
         labels = np.asarray(pred_out.label_ids).astype(np.float64)
         gt = labels[:, 0] if labels.ndim == 2 else labels.flatten()
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
+
+    if preds is not None and trainer.is_world_process_zero():
+        from src.inference.isotonic import GenderConditionalIsotonic
+        from src.utils.metrics import compute_score
+        iso = GenderConditionalIsotonic().fit(preds, gt, gender)
+        preds_iso = iso.transform(preds, gender)
+        scores_iso = compute_score(preds_iso, gt, gender)
+        score_iso = float(scores_iso["challenge_score"])
+        print(f"  Post-hoc isotonic (val): score_raw={eval_score:.5f}  score_iso={score_iso:.5f}  "
+              f"err_F_iso={scores_iso['err_F']:.5f}  err_M_iso={scores_iso['err_M']:.5f}")
+        ml_log_metrics(client, run_id, {
+            "val_score_iso": score_iso,
+            "val_err_F_iso": float(scores_iso["err_F"]),
+            "val_err_M_iso": float(scores_iso["err_M"]),
+            "val_err_diff_iso": float(scores_iso["err_diff"]),
+        })
 
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", 0))
     if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():

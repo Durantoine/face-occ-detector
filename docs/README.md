@@ -6,7 +6,8 @@ Documentation théorique du projet face-occ-detector. Pour l'utilisation pratiqu
 
 | Fichier | Contenu |
 |---|---|
-| [fairness.md](fairness.md) | Fairness, équilibrage 3 axes, shift train↔test, 3 mécanismes de compensation, méthodes détaillées (DANN, MMD, mixup, cell reweight) |
+| **[v11_theory.md](v11_theory.md)** | **v11 : référence principale.** Lagrangien adaptatif, OT, EMA double-eval, validation rigoureuse H_C via MID lookup, 6 étages d'intervention. |
+| [fairness.md](fairness.md) | Fairness, équilibrage 3 axes, shift train↔test, 3 mécanismes de compensation, méthodes détaillées (DANN, MMD, mixup, cell reweight). H1 = H_C cohérence vérifiée v11. |
 | [architecture.md](architecture.md) | Poolings (CLS, GeM, K-query attention, MHA), v2 attention pooling, backbones |
 | [metrics.md](metrics.md) | 14 métriques officielles + référence, ordres de grandeur, diagnostic charts 4-panel |
 | [data.md](data.md) | Dataset Idemia, comprendre `FaceOcclusion` (2 régimes), external data (CelebA/MAFA/etc.) |

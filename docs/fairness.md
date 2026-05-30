@@ -118,12 +118,20 @@ Idem pour $\overline{e}_M$ avec $c_M$. **Conclusion : activer ou désactiver `lo
 
 > Note importante : `loss_cell_reweight` n'a PAS cette propriété, parce que $w^{\text{cell}}[g_i, b(y_i)]$ **varie à l'intérieur d'un groupe** (en fonction du bin $Y$). Le facteur ne se simplifie pas → c'est un vrai mécanisme de reweighting joint $Y \times G$.
 
-### 4. Si on suspectait un shift sur G aussi (non couvert ici)
+### 4. Sur le shift de la marginale $P(g)$ — vérification empirique (v11)
 
-Si $P_{\text{test}}(g) \ne P_{\text{train}}(g)$, l'hypothèse $P_{\text{test}}(g \mid y) = P_{\text{train}}(g \mid y)$ tombe, et il faudrait estimer $P_{\text{test}}(g \mid y)$ via un classifieur d'attributs sur les images test, puis :
-$$w(y, g) \;=\; \frac{P_{\text{test}}(y, g)}{P_{\text{train}}(y, g)}.$$
+**Observation v11** : via MID lookup (Freebase identifiers, 93.5% coverage du test set), on a estimé $P_{\text{test}}(F) \approx 0.4766$ vs $P_{\text{train}}(F) = 0.324$. **Shift apparent de +15 points** sur la marginale gender.
 
-On n'a pas cette estimation aujourd'hui, donc on s'en tient à l'hypothèse Y-only.
+**Mais ce shift n'invalide PAS H1**. Sous H1 (covariate shift Y-only), la marginale gender test est dérivable par :
+$$
+P_{\text{test}}(F) = \sum_y P_{\text{test}}(F \mid y) \cdot P_{\text{test}}(y) = \sum_y P_{\text{train}}(F \mid y) \cdot P_{\text{test}}(y)
+$$
+
+**Calcul empirique** (15 bins) : $\sum_y P_{\text{train}}(F|y) \cdot P_{\text{test}}(y) = 0.4816$. **Écart de 0.5 pts seulement** avec l'observation MID — H1 reste cohérente.
+
+**Interprétation** : le shift apparent sur $P(g)$ est entièrement **expliqué** par le shift en $P(y)$. Le test set ayant plus de masse aux $y$ moyens-hauts où F domine ($P_{\text{train}}(F|y) \approx 0.55-0.74$ pour $y \in [0.10, 0.40]$), la marginale gender remonte automatiquement à ~48%. Pas besoin de supposer un shift indépendant sur $P(g|y)$.
+
+**Conclusion** : H1 (covariate shift Y-only) est confirmée empiriquement. Voir [v11_theory.md §3](v11_theory.md) pour les tests rigoureux des 3 hypothèses candidates (H_A indep, H_B conditional Y|G conservé, H_C = H1 conditional G|Y conservé) et leur résultat. **Le val split historique du projet reste correct.**
 
 ---
 

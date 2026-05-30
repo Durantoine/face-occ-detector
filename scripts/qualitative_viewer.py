@@ -62,21 +62,16 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # Params we show in hover tooltips on the trials comparison chart. Order matters
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
-    # v10 — unified rebalancing target
-    "axis1_power",              # α1 : tension vers P_test sur Y marginal
-    "axis2_power",              # α2 : tension vers 50/50 F/M intra-Y
-    "aug_share",                # split loss vs aug replication
-    # Feature fairness
-    "feature_fairness",         # {none, mmd, dann, both}
+    "axis1_power",
+    "axis2_power",
+    "feature_fairness",
     "mmd_lambda",
     "adv_lambda",
-    # Loss
     "loss_focal_gamma",
     "loss_fairness_lambda",
-    # Architecture
     "pretrained_source",
     "pooling_type",
-    # Hyperparams
+    "augmentation_level",
     "learning_rate",
     "weight_decay",
     "num_train_epochs",
@@ -560,7 +555,7 @@ def _render_inter_trial(
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value", "err_diff",
             # v10 — unified rebalancing
-            "axis1_power", "axis2_power", "aug_share",
+            "axis1_power", "axis2_power",
             "feature_fairness", "mmd_lambda", "adv_lambda",
             "loss_focal_gamma", "loss_fairness_lambda",
             # Architecture + hyperparams
@@ -612,7 +607,7 @@ def _render_inter_trial(
         # v8 : breakdown des continus binnés en quartiles. Permet de voir si γ haut/bas
         # marche mieux, si focal_gamma converge vers une zone, etc.
         AXIS_CONTINUOUS = [
-            "axis1_power", "axis2_power", "aug_share",
+            "axis1_power", "axis2_power",
             "mmd_lambda",
             "loss_focal_gamma",
             "learning_rate", "weight_decay",
@@ -914,7 +909,7 @@ with tab_params:
         # Highlight panel : v10 search-space params ordonnés par lisibilité.
         OPTUNA_KEYS = [
             # === v10 unified rebalancing target ===
-            "axis1_power", "axis2_power", "aug_share",
+            "axis1_power", "axis2_power",
             # === Feature fairness ===
             "feature_fairness", "mmd_lambda",
             # === Loss ===

@@ -44,8 +44,6 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.
 
 
 class CLSPooling(nn.Module):
-    """First-token pooling (DINO-native [CLS])."""
-
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
@@ -56,39 +54,6 @@ class CLSPooling(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         return x[:, 0, :], None
-
-
-class GeMPooling(nn.Module):
-    """Generalized Mean Pooling (Radenović et al. 2018). p apprenable.
-
-    pooled = (mean_n( max(x, eps)^p ))^(1/p). p=1 → mean; p→∞ → max.
-    On patches only (skip [CLS] token at index 0).
-
-    Pre-activation : GeM est défini pour features non-négatives (le paper original
-    travaille sur features CNN post-ReLU). Pour des features ViT brutes (qui peuvent
-    être négatives après le LayerNorm final du backbone), on applique softplus avant
-    le clamp pour préserver le signal des composantes négatives — sinon `clamp(min=eps)`
-    écraserait ~50% des composantes à epsilon et tuerait la moitié du gradient.
-    """
-
-    def __init__(self, dim: int, p_init: float = 3.0, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.p = nn.Parameter(torch.tensor(float(p_init)))
-
-    @property
-    def output_dim(self) -> int:
-        return self.dim
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        patches = x[:, 1:, :]
-        # softplus maps R → R_+ smoothly; preserves the ordering of negative
-        # components instead of clipping them all to a single value.
-        patches_pos = F.softplus(patches)
-        p = F.softplus(self.p) + self.eps
-        pooled = patches_pos.clamp(min=self.eps).pow(p).mean(dim=1).pow(1.0 / p)
-        return pooled, None
 
 
 class AttentionPooling(nn.Module):
@@ -227,7 +192,6 @@ class MultiHeadAttentionPooling(nn.Module):
 def build_pooling(
     pooling_type: str,
     dim: int,
-    # K-query
     n_focal: int = 2,
     n_diffuse: int = 2,
     n_free: int = 2,
@@ -235,18 +199,12 @@ def build_pooling(
     tau_diffuse_init: float = 1.5,
     tau_free_init: float = 1.0,
     learnable_tau: bool = True,
-    # Multi-head
     num_heads: int = 4,
-    # GeM
-    gem_p_init: float = 3.0,
-    # Common
     pool_attn_dropout: float = 0.0,
     pool_proj_dropout: float = 0.0,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
-    if pooling_type == "gem":
-        return GeMPooling(dim=dim, p_init=gem_p_init)
     if pooling_type == "attention_k_query":
         return AttentionPooling(
             dim=dim, n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
@@ -339,8 +297,6 @@ class FaceOccRegressor(nn.Module):
         learnable_tau: bool = True,
         # Multi-head
         num_heads: int = 4,
-        # GeM
-        gem_p_init: float = 3.0,
         # Common pool regularization
         pool_attn_dropout: float = 0.0,
         pool_proj_dropout: float = 0.0,
@@ -348,6 +304,8 @@ class FaceOccRegressor(nn.Module):
         enable_adv_disc: bool = False,
         adv_disc_hidden: int = 256,
         adv_disc_dropout: float = 0.2,
+        # Init head bias so sigmoid(bias) ≈ E[Y_train] (avoids 0.5 offset at start)
+        target_mean: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.model_name = model_name
@@ -368,7 +326,6 @@ class FaceOccRegressor(nn.Module):
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
             num_heads=num_heads,
-            gem_p_init=gem_p_init,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
         )
 
@@ -391,11 +348,18 @@ class FaceOccRegressor(nn.Module):
             if enable_adv_disc else None
         )
 
-        self._init_weights()
+        self._init_weights(target_mean=target_mean)
 
-    def _init_weights(self) -> None:
+    def _init_weights(self, target_mean: Optional[float] = None) -> None:
+        import math
         nn.init.trunc_normal_(self.head.weight, std=0.02)
-        nn.init.zeros_(self.head.bias)
+        if target_mean is not None and self.output_activation == "sigmoid":
+            eps = 1e-6
+            p = max(eps, min(1.0 - eps, float(target_mean)))
+            bias_init = math.log(p / (1.0 - p))
+        else:
+            bias_init = 0.0
+        nn.init.constant_(self.head.bias, bias_init)
         for m in self.pool.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)

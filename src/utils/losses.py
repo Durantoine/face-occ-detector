@@ -1,28 +1,29 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 
-# v10 : retour aux distributions empiriques avec 10 bins de width 0.05.
-# Grille plus large = smoothing implicite (bin 19 anomalie disparaît, ratios stables).
-# P_test extraite du PDF page 3 (29980 images), re-binnée à 10 bins.
-N_BINS = 10
-BIN_WIDTH = 0.05
+N_BINS = 15
+BIN_WIDTH = 0.5 / N_BINS
 
-# P_test 10 bins (somme des 20 bins originaux par paires) — raw extraction PDF.
 _TEST_PMF = np.array([
-    0.0967 + 0.0546,    # bin 0 : Y ∈ [0.00, 0.05)
-    0.0847 + 0.0642,    # bin 1 : Y ∈ [0.05, 0.10)
-    0.0812 + 0.0692,    # bin 2 : Y ∈ [0.10, 0.15)
-    0.0838 + 0.0677,    # bin 3 : Y ∈ [0.15, 0.20)
-    0.0790 + 0.0713,    # bin 4 : Y ∈ [0.20, 0.25)
-    0.0681 + 0.0589,    # bin 5 : Y ∈ [0.25, 0.30)
-    0.0448 + 0.0316,    # bin 6 : Y ∈ [0.30, 0.35)
-    0.0228 + 0.0118,    # bin 7 : Y ∈ [0.35, 0.40)
-    0.0056 + 0.0023,    # bin 8 : Y ∈ [0.40, 0.45)
-    0.0012 + 0.0006,    # bin 9 : Y ∈ [0.45, 0.50)
+    0.118034,
+    0.092728,
+    0.092810,
+    0.108154,
+    0.102878,
+    0.094643,
+    0.106911,
+    0.091066,
+    0.079910,
+    0.054407,
+    0.034125,
+    0.015720,
+    0.005424,
+    0.002145,
+    0.001046,
 ], dtype=np.float64)
 _TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
 
@@ -38,7 +39,6 @@ def compute_empirical_pmf_cell(
     targets: np.ndarray, gender: np.ndarray,
     n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
 ) -> np.ndarray:
-    """Empirical joint pmf P(g, y), shape (2, n_bins). Sums to 1."""
     g = (np.asarray(gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
     counts = np.zeros((2, n_bins), dtype=np.float64)
@@ -52,87 +52,58 @@ def compute_target_weights(
     axis1_power: float, axis2_power: float,
     n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
     test_pmf_y: np.ndarray = _TEST_PMF,
-    clip: float = 20.0,
+    clip: float = 10.0,
 ) -> np.ndarray:
-    """v10 — UNIFIED target weight per sample i.
-
-    P_target(g, y) = mix_y(α1) × mix_g(α2)
-      mix_y(α1) = (1-α1) × P_train_marg_y + α1 × P_test_y
-      mix_g(α2) = (1-α2) × P_train(g|y) + α2 × 0.5
-
-    Returns per-sample weight = P_target(g_i, y_i) / P_train_emp(g_i, y_i), clipped.
-    """
     g = (np.asarray(gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
-    p_joint = compute_empirical_pmf_cell(targets, gender, n_bins=n_bins, bin_width=bin_width)   # (2, n_bins)
-    p_train_y = p_joint.sum(axis=0)                                                              # (n_bins,)
+    p_joint = compute_empirical_pmf_cell(targets, gender, n_bins=n_bins, bin_width=bin_width)
+    p_train_y = p_joint.sum(axis=0)
     safe_y = np.maximum(p_train_y, 1e-9)
-    p_train_g_given_y = p_joint / safe_y[None, :]                                                # (2, n_bins)
+    p_train_g_given_y = p_joint / safe_y[None, :]
 
-    # mix targets
     p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
     uniform_g = np.full_like(p_train_g_given_y, 0.5)
     p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * uniform_g
-    p_target_joint = p_target_y[None, :] * p_target_g_given_y                                    # (2, n_bins)
+    p_target_joint = p_target_y[None, :] * p_target_g_given_y
 
-    # per-cell weight = P_target / P_train_emp
     ratio = p_target_joint / np.maximum(p_joint, 1e-9)
     ratio = np.clip(ratio, 1.0 / clip, clip)
-    return ratio[g, b]                                                                            # (N,) per-sample
-
-
-def split_loss_aug(
-    target_weight: np.ndarray, aug_share: float, k_max: int = 3, seed: int = 42,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Split unified target into loss weight + aug replication count.
-
-    loss_weight_i = target_weight_i ^ (1 - aug_share)
-    aug_repli_i  = round_bernoulli(target_weight_i ^ aug_share), clipped to [1, k_max]
-
-    En espérance : loss_weight × aug_repli = target_weight, mais aug_repli capé à k_max
-    pour éviter mémorisation sur cells rares.
-    """
-    w = np.asarray(target_weight, dtype=np.float64)
-    loss_w = np.power(w, 1.0 - aug_share)
-    aug_w = np.power(w, aug_share)
-    # Stochastic Bernoulli rounding preserves E[copies] when uncapped
-    rng = np.random.RandomState(seed)
-    floor = np.floor(aug_w).astype(int)
-    frac = aug_w - floor
-    extra = (rng.uniform(size=len(aug_w)) < frac).astype(int)
-    aug_repli = np.clip(floor + extra, 1, k_max)
-    return loss_w, aug_repli
-
-
-def importance_weight_of(
-    targets: torch.Tensor, sample_weights: torch.Tensor,
-) -> torch.Tensor:
-    """Index per-sample weights by sample id (not bin) — assumes weights aligned with batch."""
-    return sample_weights
+    sample_w = ratio[g, b]
+    sample_w = sample_w / max(float(sample_w.mean()), 1e-9)
+    return sample_w.astype(np.float32)
 
 
 class WeightedMSELoss(nn.Module):
-    """v10 — challenge metric formula + optional regularizers.
+    """Challenge metric formula with adaptive Lagrangian λ on the fairness gap.
 
-    Base (= métrique officielle PDF page 4) :
-        Err_g = Σ w_i·(p-y)² / Σ w_i   avec w_i = 1/30 + y_i
-        Score = (Err_F + Err_M)/2 + λ·|Err_F - Err_M|
+    Per-group weighted MSE:
+        Err_g = Σ w_i·(p-y)² / Σ w_i   with w_i = 1/30 + y_i  (+ optional sample reweight)
 
-    Optional :
-      * sample_loss_weight : per-sample multiplier (axe 1+2 unified target)
-      * focal_gamma > 0   : multiplier (err + 0.05)^γ (auto hard-example focus)
+    Training loss (Lagrangian, λ_adapt updated via gradient ascent on the constraint):
+        L = (Err_F + Err_M)/2 + λ_adapt · |Err_F - Err_M|
+        λ_adapt ← clip(λ_adapt + η · EMA(|Err_F - Err_M|),  0,  λ_max)
+
+    The challenge metric (logged separately by metrics.compute_score) always uses
+    λ_metric = 1.0 — only the TRAINING loss has an adaptive λ.
     """
 
     def __init__(
         self,
         weight_offset: float = 1.0 / 30.0,
         focal_gamma: float = 0.0,
-        fairness_lambda: float = 1.0,
+        lambda_init: float = 1.0,
+        lambda_lr: float = 0.5,
+        lambda_max: float = 5.0,
+        lambda_ema: float = 0.9,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset
         self.focal_gamma = focal_gamma
-        self.fairness_lambda = fairness_lambda
+        self.lambda_lr = float(lambda_lr)
+        self.lambda_max = float(lambda_max)
+        self.lambda_ema = float(lambda_ema)
+        self.register_buffer("lambda_adapt", torch.tensor(float(lambda_init)))
+        self.register_buffer("err_diff_ema", torch.tensor(0.0))
 
     def forward(
         self,
@@ -168,19 +139,51 @@ class WeightedMSELoss(nn.Module):
 
         err_f = (w[mask_f] * err[mask_f]).sum() / w[mask_f].sum().clamp(min=1e-8)
         err_m = (w[mask_m] * err[mask_m]).sum() / w[mask_m].sum().clamp(min=1e-8)
+        err_diff = (err_f - err_m).abs()
 
-        return (err_f + err_m) / 2.0 + self.fairness_lambda * (err_f - err_m).abs()
+        if self.training:
+            lam = self.lambda_adapt
+            with torch.no_grad():
+                err_diff_sync = err_diff.detach().clone()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(err_diff_sync, op=torch.distributed.ReduceOp.AVG)
+                self.err_diff_ema.mul_(self.lambda_ema).add_(err_diff_sync * (1.0 - self.lambda_ema))
+                self.lambda_adapt.add_(self.lambda_lr * self.err_diff_ema)
+                self.lambda_adapt.clamp_(0.0, self.lambda_max)
+        else:
+            lam = torch.tensor(1.0, device=err_diff.device, dtype=err_diff.dtype)
+
+        return (err_f + err_m) / 2.0 + lam * err_diff
+
+
+def sliced_wasserstein(x: torch.Tensor, y: torch.Tensor, n_projections: int = 50) -> torch.Tensor:
+    """Sliced Wasserstein-2 distance between two feature sets.
+
+    Projects x, y onto random 1D directions, computes 1D OT (= sorted L2) per
+    projection, averages. Differentiable, batch-size-agnostic (handles unequal
+    sizes via linear interpolation on the empirical CDFs).
+    """
+    if x.shape[0] < 2 or y.shape[0] < 2:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+
+    d = x.shape[-1]
+    proj = torch.randn(d, n_projections, device=x.device, dtype=x.dtype)
+    proj = proj / proj.norm(dim=0, keepdim=True).clamp(min=1e-9)
+
+    x_proj = (x @ proj).t()
+    y_proj = (y @ proj).t()
+    x_sorted, _ = x_proj.sort(dim=-1)
+    y_sorted, _ = y_proj.sort(dim=-1)
+
+    if x.shape[0] != y.shape[0]:
+        n = max(x.shape[0], y.shape[0])
+        x_sorted = torch.nn.functional.interpolate(x_sorted.unsqueeze(1), size=n, mode="linear", align_corners=True).squeeze(1)
+        y_sorted = torch.nn.functional.interpolate(y_sorted.unsqueeze(1), size=n, mode="linear", align_corners=True).squeeze(1)
+
+    return ((x_sorted - y_sorted) ** 2).mean()
 
 
 def mmd_rbf(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """RBF MMD² avec median heuristic (bandwidth auto adapté à l'échelle des features).
-
-    v10 fix : σ² = median(||x-y||²) au lieu de sigmas fixes (1, 5, 10) qui saturaient
-    à 0 pour features ViT-B 768-dim (pairwise distances ~1500).
-
-    Robuste aux mini-batches : retourne 0 si moins de 2 samples par groupe (median
-    indéfini sur 1 sample, MMD non-significatif sur singletons).
-    """
     if x.shape[0] < 2 or y.shape[0] < 2:
         return torch.zeros((), device=x.device, dtype=x.dtype)
 

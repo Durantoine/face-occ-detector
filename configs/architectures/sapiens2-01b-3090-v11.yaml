@@ -1,0 +1,160 @@
+name: sapiens2-01b-3090-v11
+description: |
+  Sapiens2-0.1B v11 — mirror of dinov3-vitb16 v11.
+  See dinov3-vitb16-3090-v11.yaml for rationale.
+
+model:
+  model_name: sapiens2_0.1b
+  output_dim: 1
+  head_dropout: 0.1
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  num_heads: 4
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+
+training:
+  per_device_train_batch_size: 128
+  per_device_eval_batch_size: 256
+  gradient_accumulation_steps: 1
+  num_train_epochs: 8
+  learning_rate: 5.0e-05
+  weight_decay: 0.10
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine_with_min_lr
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.1
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: light
+  layer_decay: 0.85
+  ema_decay: 0.999
+  loss_lambda_init: 1.0
+  loss_lambda_lr: 0.5
+  loss_lambda_max: 5.0
+  loss_lambda_ema: 0.9
+  adv_lambda: 0.01
+  ot_lambda: 0.1
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 100
+  objective_mode: score
+  rotate_val_seed: true
+  keep_top_n: 3
+  search_space:
+    pretrained_source:
+      type: categorical
+      choices:
+        - "sapiens_default"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_50000"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000"
+        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
+    pooling_type:
+      type: categorical
+      choices: [cls, attention_k_query, multihead_attention]
+
+    axis1_power: {type: float, low: 0.0, high: 1.0}
+    axis2_power: {type: float, low: 0.0, high: 1.0}
+
+    feature_fairness:
+      type: categorical
+      choices: [none, ot]
+    ot_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: ot
+
+    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+
+    learning_rate: {type: float, low: 1.5e-05, high: 4.0e-04, log: true}
+    num_train_epochs: {type: int, low: 6, high: 12}
+    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    head_dropout:  {type: float, low: 0.0, high: 0.4}
+    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
+    layer_decay:   {type: float, low: 0.65, high: 1.0}
+
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.5
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.5
+      conditional_on:
+        pooling_type: [attention_k_query, multihead_attention]
+
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_focal_init:
+      type: float
+      low: 0.08
+      high: 0.3
+      log: true
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_diffuse_init:
+      type: float
+      low: 1.0
+      high: 4.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 3
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      low: 1
+      high: 3
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      low: 0
+      high: 2
+      conditional_on:
+        pooling_type: attention_k_query
+
+    num_heads:
+      type: categorical
+      choices: [2, 4, 8, 16]
+      conditional_on:
+        pooling_type: multihead_attention

@@ -30,9 +30,9 @@ def log_params(client: Optional[MlflowClient], run_id: Optional[str], params: Di
         mlflow.log_params(params)
 
 
-def log_metrics(client: Optional[MlflowClient], run_id: Optional[str], metrics: Dict[str, float]) -> None:
+def log_metrics(client: Optional[MlflowClient], run_id: Optional[str], metrics: Dict[str, float], step: Optional[int] = None) -> None:
     if client and run_id:
         for k, v in metrics.items():
-            client.log_metric(run_id, k, v)
+            client.log_metric(run_id, k, v, step=step) if step is not None else client.log_metric(run_id, k, v)
     elif mlflow.active_run():
-        mlflow.log_metrics(metrics)
+        mlflow.log_metrics(metrics, step=step) if step is not None else mlflow.log_metrics(metrics)

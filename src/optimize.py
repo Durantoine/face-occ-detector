@@ -27,7 +27,7 @@ from src.utils.mlflow_utils import get_or_create_experiment
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v10"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v11"),
     "n_trials": 100,
     "study_name": None,
     "tracking_uri": "sqlite:///mlflow.db",
@@ -40,32 +40,32 @@ CONFIG: Dict[str, Any] = {
 }
 
 _TRAINING_KEYS = {
-    # Optim / Reg
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
-    # v10 design
     "augmentation_level",
-    "axis1_power", "axis2_power", "aug_share",
-    "feature_fairness", "mmd_lambda", "adv_lambda",
-    "loss_focal_gamma", "loss_fairness_lambda",
+    "axis1_power", "axis2_power",
+    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
+    "loss_focal_gamma",
+    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
     "loss_query_diversity_lambda",
+    "layer_decay",
+    "ema_decay",
 }
 
 _MODEL_KEYS = {
-    "hidden_dropout_prob", "head_dropout", "projection_size", "output_activation",
+    "head_dropout", "projection_size", "output_activation",
     "backbone_drop_path_rate",
     "pretrained", "pretrained_source", "pooling_type",
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
-    "num_heads", "gem_p_init",
+    "num_heads",
     "pool_attn_dropout", "pool_proj_dropout",
 }
 
-_FEATURE_FAIRNESS_CHOICES = ("none", "mmd", "dann", "both")
+_FEATURE_FAIRNESS_CHOICES = ("none", "mmd", "dann", "ot")
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
-    """v10 — no stick-breaking or derived params. Direct assignment from TPE knobs."""
     if name == "pretrained_source":
         s = str(value)
         cfg["model"]["pretrained"] = True
@@ -379,16 +379,17 @@ def _validate_search_space(base_config: Dict[str, Any]) -> None:
         "loss_importance_reweight": "v3-v7",
         "loss_cell_reweight": "v3-v7",
         "ema_decay": "v4-v9 (EMA retiré v10)",
-        "layer_decay": "v6-v9 (LLRD retiré v10)",
         "group_dro_alpha": "v6 (GroupDRO retiré v10)",
         "val_split_strategy": "v6-v9 (pinned test_pmf v10)",
+        "aug_share": "v10 (replication retiré v11)",
+        "aug_repli_max": "v10 (replication retiré v11)",
+        "loss_fairness_lambda": "v3-v10 (remplacé par Lagrangien adaptatif v11)",
     }
     bad = [k for k in LEGACY if k in ss]
     if bad:
-        msg = "Legacy search_space params detected (v10 cleanup) :\n"
+        msg = "Legacy search_space params detected:\n"
         for k in bad:
             msg += f"  - {k} : {LEGACY[k]}\n"
-        msg += "Migrate the yaml to v10 axis1/axis2/aug_share design."
         raise ValueError(msg)
 
 

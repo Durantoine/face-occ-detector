@@ -291,8 +291,13 @@ class WeightedMSETrainer(Trainer):
             ema_cb._needs_restore = True
 
         chosen = metrics_ema if ema_wins else metrics_raw
-        extras = {f"{k}_raw": v for k, v in metrics_raw.items()}
-        extras.update({f"{k}_ema": v for k, v in metrics_ema.items()})
+        # Use distinct TOP-LEVEL prefixes (raw_*, ema_*) so MLflow UI groups them
+        # in separate sections instead of overlaying eval_score / eval_score_raw / eval_score_ema.
+        prefix = f"{metric_key_prefix}_"
+        extras = {f"raw_{k[len(prefix):]}" if k.startswith(prefix) else f"raw_{k}": v
+                  for k, v in metrics_raw.items()}
+        extras.update({f"ema_{k[len(prefix):]}" if k.startswith(prefix) else f"ema_{k}": v
+                       for k, v in metrics_ema.items()})
         extras[f"{metric_key_prefix}_chose_ema"] = float(ema_wins)
         return {**chosen, **extras}
 

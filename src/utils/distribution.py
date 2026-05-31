@@ -50,6 +50,11 @@ _TEST_PMF: np.ndarray = np.array([
 ], dtype=np.float64)
 _TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
 
+# P_test marginal gender estimated via MID lookup on test_students.csv (93.5% coverage).
+# Source: scripts/estimate_test_gender.py — 47.66% F, 52.34% M.
+# Used by compute_target_weights as the axis2 target (was uniform 0.5/0.5).
+_TEST_P_GENDER = np.array([0.4766, 0.5234], dtype=np.float64)  # [F, M]
+
 
 # ============================================================================
 # Empirical distributions on a labeled set (train or val)
@@ -124,16 +129,21 @@ def compute_target_weights(
     axis1_power: float, axis2_power: float,
     n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
     test_pmf_y: np.ndarray = _TEST_PMF,
+    test_p_gender: np.ndarray = _TEST_P_GENDER,
     clip: float = 10.0,
 ) -> np.ndarray:
     """Per-sample loss weight for the unified rebalancing target.
 
         P_target(g, y) = mix_y(α1) × mix_g(α2)
-            mix_y(α1) = (1-α1)·P_train(y) + α1·P_test(y)        ← axe 1
-            mix_g(α2) = (1-α2)·P_train(g|y) + α2·0.5             ← axe 2
+            mix_y(α1) = (1-α1)·P_train(y) + α1·P_test(y)              ← axe 1
+            mix_g(α2) = (1-α2)·P_train(g|y) + α2·P_test(g)            ← axe 2 (v13)
 
         sample_weight_i = clip(P_target(g_i, y_i) / P_train(g_i, y_i), 1/clip, clip)
-        sample_weight  ← sample_weight / mean(sample_weight)     ← v3 hygiene trick
+        sample_weight  ← sample_weight / mean(sample_weight)          ← v3 hygiene trick
+
+    v13 change: axe 2 target = P_test(g) ≈ (0.48, 0.52) from MID lookup, instead of
+    uniform (0.5, 0.5). Aligned with empirical P_test(g) — marginal 2% correction
+    but theoretically clean (uniform was a proxy when P_test(g) was unknown).
 
     Returns per-sample float32 array of same length as `targets`.
     """
@@ -145,8 +155,9 @@ def compute_target_weights(
     p_train_g_given_y = p_joint / safe_y[None, :]
 
     p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
-    uniform_g = np.full_like(p_train_g_given_y, 0.5)
-    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * uniform_g
+    # axe 2 target = P_test(g) repeated across y bins (g-only, not depending on y bin)
+    test_p_g_broadcast = np.asarray(test_p_gender, dtype=np.float64)[:, None] * np.ones((1, n_bins))
+    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * test_p_g_broadcast
     p_target_joint = p_target_y[None, :] * p_target_g_given_y
 
     ratio = p_target_joint / np.maximum(p_joint, 1e-9)

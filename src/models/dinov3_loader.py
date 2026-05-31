@@ -111,4 +111,12 @@ def get_image_processor(model_name: str) -> Any:
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
         return proc
+    # timm CNN backbones (efficientnet*, resnet*, convnext*, etc.) — use ImageNet stats
+    # via a generic ViT processor (just rescale + normalize, resize handled to 224x224)
+    timm_prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv", "tf_efficientnet")
+    if any(model_name.startswith(p) for p in timm_prefixes):
+        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+        proc.image_mean = list(IMAGENET_MEAN)
+        proc.image_std = list(IMAGENET_STD)
+        return proc
     return AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)

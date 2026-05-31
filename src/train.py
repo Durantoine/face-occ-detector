@@ -157,6 +157,37 @@ class EMAWeightCallback(TrainerCallback):
         self.backup_state.clear()
 
 
+class OptunaPruningCallback(TrainerCallback):
+    """Report eval_challenge_score to Optuna trial + check should_prune at each eval.
+
+    Saves compute by stopping clearly-mediocre trials early (~30% gain on full sweep).
+    Triggered after each epoch eval via on_evaluate hook.
+    """
+    def __init__(self, trial: Any, metric_key: str = "eval_challenge_score") -> None:
+        self.trial = trial
+        self.metric_key = metric_key
+
+    def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
+        if not getattr(state, "is_world_process_zero", True):
+            return
+        if metrics is None:
+            return
+        value = metrics.get(self.metric_key)
+        if value is None or not isinstance(value, (int, float)):
+            return
+        try:
+            self.trial.report(float(value), int(state.epoch or 0))
+            if self.trial.should_prune():
+                import optuna
+                raise optuna.exceptions.TrialPruned()
+        except Exception as e:
+            # Re-raise TrialPruned, swallow others (Optuna unavailable, etc.)
+            from optuna.exceptions import TrialPruned as _TP
+            if isinstance(e, _TP):
+                raise
+            print(f"[OptunaPruningCallback] WARNING: {e}", flush=True)
+
+
 class LambdaLogCallback(TrainerCallback):
     """Logs adaptive Lagrangian λ + err_diff_ema at each epoch end. RANK 0 ONLY
     (avoids sqlite lock contention with multiple jobs)."""
@@ -231,6 +262,11 @@ class WeightedMSETrainer(Trainer):
         return None
 
     def evaluate(self, eval_dataset: Any = None, ignore_keys: Any = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
+        # Flag to skip double-eval (used for the final post-training evaluate where model
+        # has best weights already loaded — EMA buffer is from training end, not best epoch).
+        if getattr(self, "_skip_ema_double_eval", False):
+            return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+
         ema_cb = self._find_ema_cb()
         if ema_cb is None:
             return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -649,6 +685,7 @@ def train(
     mlflow_run_id: Optional[str] = None,
     test_data_csv: Optional[str] = None,
     min_score_to_save: Optional[float] = None,
+    optuna_trial: Any = None,
 ) -> Tuple[float, float, float, str, float, float]:
     cfg = load_architecture_config(architecture_name).to_dict()
     train_cfg = cfg.get("training", {})
@@ -752,6 +789,9 @@ def train(
             tau_free_init=float(model_cfg.get("tau_free_init", 1.0)),
             learnable_tau=bool(model_cfg.get("learnable_tau", True)),
             num_heads=int(model_cfg.get("num_heads", 4)),
+            mil_agg=str(model_cfg.get("mil_agg", "topk_mean")),
+            mil_hidden=int(model_cfg.get("mil_hidden", 128)),
+            mil_k_top=int(model_cfg.get("mil_k_top", 30)),
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
             pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", 0.0)),
             enable_adv_disc=dann_active,
@@ -857,6 +897,10 @@ def train(
     trainer_ref: List[Any] = []
     callbacks.append(LambdaLogCallback(trainer_ref, client if use_client else None, run_id if use_client else None))
 
+    # Optuna pruning: report intermediate score + check should_prune after each eval
+    if optuna_trial is not None:
+        callbacks.append(OptunaPruningCallback(optuna_trial, metric_key="eval_challenge_score"))
+
     trainer = WeightedMSETrainer(
         focal_gamma=float(train_cfg.get("loss_focal_gamma", 0.0)),
         lambda_init=float(train_cfg.get("loss_lambda_init", 1.0)),
@@ -882,7 +926,11 @@ def train(
     print(f"Training {cfg['name']} (best_metric={best_metric})")
     trainer.train()
 
+    # CRITICAL: post-training evaluate must use the LOADED best weights, not re-compare
+    # raw vs EMA. EMA buffer at this point holds end-of-training state, not best-epoch state.
+    trainer._skip_ema_double_eval = True
     eval_results = trainer.evaluate()
+    trainer._skip_ema_double_eval = False
     eval_loss = eval_results.get("eval_loss", float("inf"))
     eval_score = eval_results.get("eval_challenge_score", 0.0)
     err_diff = eval_results.get("eval_err_diff", 0.0)
@@ -920,21 +968,37 @@ def train(
 
     if preds is not None and trainer.is_world_process_zero():
         from src.inference.calibrators import fit_all_calibrators
-        from src.utils.metrics import compute_score
+        from src.utils.metrics import compute_score, compute_score_stratified_is
+        from src.utils.distribution import N_BINS, BIN_WIDTH
 
         # Fit 3 calibrators on val (per-gender, IS-weighted):
         #   isotonic (PAV), linear (Platt-like), pchip (monotone cubic spline)
         cals = fit_all_calibrators(preds, gt, gender, use_is_weight=True)
 
-        # Always log val-side self-eval for diagnostic (BIASED upward — fit+eval same val).
+        # SELECTION via IS-stratified eval on val (estimates P_test perf, unbiased target).
+        # Bonus: we also log the raw self-eval (P_train dist) for diagnostic.
+        val_is_eval_scores = {}
         for cal_name, cal in cals.items():
             preds_cal = cal.transform(preds, gender)
-            scores_cal = compute_score(preds_cal, gt, gender)
+            scores_cal_raw = compute_score(preds_cal, gt, gender)  # P_train dist (biased)
+            if test_pmf_joint_val is not None:
+                scores_cal_is = compute_score_stratified_is(
+                    preds_cal, gt, gender, test_pmf_joint_val, BIN_WIDTH, N_BINS,
+                )
+            else:
+                scores_cal_is = scores_cal_raw
+            val_is_eval_scores[cal_name] = scores_cal_is["challenge_score"]
             ml_log_metrics(client, run_id, {
-                f"val_score_{cal_name}_self_eval": float(scores_cal["challenge_score"]),
-                f"val_err_F_{cal_name}_self_eval": float(scores_cal["err_F"]),
-                f"val_err_M_{cal_name}_self_eval": float(scores_cal["err_M"]),
+                f"val_score_{cal_name}_is_eval": float(scores_cal_is["challenge_score"]),
+                f"val_err_F_{cal_name}_is_eval": float(scores_cal_is["err_F"]),
+                f"val_err_M_{cal_name}_is_eval": float(scores_cal_is["err_M"]),
+                f"val_score_{cal_name}_raw_eval": float(scores_cal_raw["challenge_score"]),
             })
+        # Submission calibrator = min IS-stratified val (unbiased estimate of P_test perf)
+        best_cal_for_submission = min(val_is_eval_scores, key=val_is_eval_scores.get)
+        ml_log_params(client, run_id, {"best_cal_for_submission": best_cal_for_submission})
+        print(f"  Best calibrator (val IS-stratified): {best_cal_for_submission}  "
+              f"(scores: " + ", ".join(f"{k}={v:.5f}" for k, v in val_is_eval_scores.items()) + ")")
 
         # === True post-hoc validation on test holdout (predict already done above) ===
         if test_pred_out is not None:
@@ -958,11 +1022,16 @@ def train(
                     test_scores_per_cal[cal_name] = compute_score(test_preds_cal, test_gt, test_gender)
                     test_preds_per_cal[cal_name] = test_preds_cal
 
-                # Identify the winner among the 3 calibrators (lowest challenge_score)
-                best_cal_name = min(test_scores_per_cal,
-                                     key=lambda k: test_scores_per_cal[k]["challenge_score"])
-                best_scores = test_scores_per_cal[best_cal_name]
+                # Use the calibrator SELECTED on val self-eval (not test holdout, to avoid
+                # selection leakage). Test holdout is the unbiased evaluator.
+                best_cal_name = best_cal_for_submission
+                best_scores = test_scores_per_cal.get(best_cal_name, test_scores_raw)
                 best_gain = test_scores_raw["challenge_score"] - best_scores["challenge_score"]
+                # Also log the "oracle" best (= post-hoc selection on test holdout, biased
+                # upward — diagnostic only, NOT what we'd submit).
+                oracle_cal_name = min(test_scores_per_cal,
+                                       key=lambda k: test_scores_per_cal[k]["challenge_score"])
+                oracle_scores = test_scores_per_cal[oracle_cal_name]
 
                 print(f"  Test holdout (n={len(test_preds)}, P_test dist):")
                 print(f"    raw            : score={test_scores_raw['challenge_score']:.5f}  "
@@ -973,10 +1042,14 @@ def train(
                         continue
                     s = test_scores_per_cal[cal_name]
                     gain_s = test_scores_raw["challenge_score"] - s["challenge_score"]
-                    marker = " ← BEST" if cal_name == best_cal_name else ""
+                    markers = ""
+                    if cal_name == best_cal_name:
+                        markers += " ← SELECTED (val)"
+                    if cal_name == oracle_cal_name and oracle_cal_name != best_cal_name:
+                        markers += " ← ORACLE (test, biased)"
                     print(f"    {cal_name:14s}: score={s['challenge_score']:.5f}  "
                           f"err_F={s['err_F']:.5f}  err_M={s['err_M']:.5f}  "
-                          f"diff={s['err_diff']:.5f}  (gain {gain_s:+.5f}){marker}")
+                          f"diff={s['err_diff']:.5f}  (gain {gain_s:+.5f}){markers}")
 
                 # Log all per-calibrator metrics + best
                 log_metrics = {
@@ -987,10 +1060,14 @@ def train(
                     "test_holdout_err_diff_raw": float(test_scores_raw["err_diff"]),
                     "test_holdout_mae_pct_raw": float(test_scores_raw["mae_pct"]),
                     "test_holdout_r2_raw": float(test_scores_raw["r2"]),
-                    "test_holdout_score_best_cal": float(best_scores["challenge_score"]),
-                    "test_holdout_err_F_best_cal": float(best_scores["err_F"]),
-                    "test_holdout_err_M_best_cal": float(best_scores["err_M"]),
-                    "test_holdout_best_cal_gain": float(best_gain),
+                    # SELECTED = method chosen on val (what we'd submit) — unbiased
+                    "test_holdout_score_selected_cal": float(best_scores["challenge_score"]),
+                    "test_holdout_err_F_selected_cal": float(best_scores["err_F"]),
+                    "test_holdout_err_M_selected_cal": float(best_scores["err_M"]),
+                    "test_holdout_selected_cal_gain": float(best_gain),
+                    # ORACLE = method picked POST-HOC on test holdout (biased, upper bound)
+                    "test_holdout_score_oracle_cal": float(oracle_scores["challenge_score"]),
+                    "test_holdout_oracle_cal_gain": float(test_scores_raw["challenge_score"] - oracle_scores["challenge_score"]),
                 }
                 for cal_name, s in test_scores_per_cal.items():
                     log_metrics[f"test_holdout_score_{cal_name}"] = float(s["challenge_score"])

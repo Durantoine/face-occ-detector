@@ -14,6 +14,12 @@ def _is_dinov3(model_name: str) -> bool:
     return model_name.startswith("dinov3_")
 
 
+def _is_timm_cnn(model_name: str) -> bool:
+    """Detect timm CNN models (efficientnet*, resnet*, convnext*, etc.)."""
+    prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv", "tf_efficientnet")
+    return any(model_name.startswith(p) for p in prefixes)
+
+
 def _build_backbone(
     model_name: str,
     drop_path_rate: float = 0.0,
@@ -25,6 +31,17 @@ def _build_backbone(
     if is_sapiens2(model_name):
         backbone = load_sapiens2(model_name, drop_rate=drop_path_rate, pretrained=pretrained)
         return backbone, sapiens2_hidden_size_of(model_name)
+    if _is_timm_cnn(model_name):
+        import timm
+        # num_classes=0 + global_pool="" : keep conv_head (which projects last-stage
+        # 512ch → 2048ch for EfficientNet-B5) and the spatial map, but skip the global
+        # average pool + classifier. Result: backbone(x) → (B, num_features, H, W).
+        # num_features=2048 for EfficientNet-B5 (vs 512 with features_only).
+        backbone = timm.create_model(model_name, pretrained=pretrained,
+                                       num_classes=0, global_pool="",
+                                       drop_path_rate=drop_path_rate)
+        hidden = backbone.num_features
+        return backbone, hidden
     if pretrained:
         backbone = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     else:
@@ -35,12 +52,25 @@ def _build_backbone(
 
 
 def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
+    """Return (B, N, D) — sequence of token/spatial features compatible with all pools.
+
+    For ViT-like backbones: native (B, N, D) where N = num_patches + (CLS).
+    For timm CNN (features_only): (B, C, H, W) → reshaped to (B, H·W, C). No CLS token,
+    so CLSPooling won't work — use K-query, MHA, MIL or mean_var.
+    """
     if hasattr(backbone, "get_intermediate_layers"):
         return backbone.get_intermediate_layers(pixel_values, n=1)[0]
     out = backbone(pixel_values)
     if isinstance(out, (tuple, list)):
-        return out[0]
-    return out.last_hidden_state if hasattr(out, "last_hidden_state") else out
+        out = out[0]
+    if hasattr(out, "last_hidden_state"):
+        return out.last_hidden_state
+    # timm CNN features_only returns list of (B, C, H, W); we already selected out_indices=(-1,)
+    if isinstance(out, torch.Tensor) and out.dim() == 4:
+        # (B, C, H, W) → (B, H·W, C)
+        b, c, h, w = out.shape
+        return out.permute(0, 2, 3, 1).reshape(b, h * w, c)
+    return out
 
 
 class CLSPooling(nn.Module):
@@ -54,6 +84,80 @@ class CLSPooling(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         return x[:, 0, :], None
+
+
+class MeanVarPooling(nn.Module):
+    """Global stats: concat(mean, std) over patches. No learned params.
+
+    Captures global distribution of features → useful for blur / global degradation
+    (high σ ≈ noisy/diverse features ≈ occlusion). Loses spatial localization.
+    """
+    def __init__(self, dim: int, skip_cls: bool = True) -> None:
+        super().__init__()
+        self.dim = dim
+        self.skip_cls = skip_cls
+
+    @property
+    def output_dim(self) -> int:
+        return 2 * self.dim
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        patches = x[:, 1:, :] if self.skip_cls else x
+        mu = patches.mean(dim=1)
+        sigma = patches.std(dim=1)
+        return torch.cat([mu, sigma], dim=-1), None
+
+
+class MILPooling(nn.Module):
+    """Multi-Instance Learning: per-patch occlusion score + aggregation.
+
+      f(h_i)  →  o_i ∈ R         (raw scalar score per patch via 2-layer MLP)
+      ŷ_raw  =  g(o_1, ..., o_N)  aggregation: mean | max | topk_mean | attention
+
+    Returns (B, 1) — head then applies Linear(1, 1) + sigmoid for final calibration.
+
+    Conceptually aligned with face occlusion (sparse, localized) but also captures
+    blur (uniform high scores) depending on aggregation:
+      - mean       : OK for blur, dilutes sparse
+      - max        : OK for sparse, saturates on blur
+      - topk_mean  : compromise (good for both with k tuned)
+      - attention  : softmax(logits) weights — flexible
+    """
+    def __init__(self, dim: int, hidden: int = 128, agg: str = "topk_mean",
+                  k_top: int = 30, skip_cls: bool = True) -> None:
+        super().__init__()
+        if agg not in ("mean", "max", "topk_mean", "attention"):
+            raise ValueError(f"Unknown MIL agg: {agg}")
+        self.dim = dim
+        self.hidden = hidden
+        self.agg = agg
+        self.k_top = k_top
+        self.skip_cls = skip_cls
+        self.scorer = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+
+    @property
+    def output_dim(self) -> int:
+        return 1
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        patches = x[:, 1:, :] if self.skip_cls else x
+        logits = self.scorer(patches).squeeze(-1)  # (B, N)
+        if self.agg == "mean":
+            pooled = logits.mean(dim=1, keepdim=True)
+        elif self.agg == "max":
+            pooled = logits.max(dim=1, keepdim=True).values
+        elif self.agg == "topk_mean":
+            k = min(self.k_top, logits.size(1))
+            top, _ = logits.topk(k, dim=1)
+            pooled = top.mean(dim=1, keepdim=True)
+        else:  # attention
+            attn = F.softmax(logits, dim=1)
+            pooled = (attn * logits).sum(dim=1, keepdim=True)
+        return pooled, logits  # (B, 1), (B, N)
 
 
 class AttentionPooling(nn.Module):
@@ -202,9 +306,16 @@ def build_pooling(
     num_heads: int = 4,
     pool_attn_dropout: float = 0.0,
     pool_proj_dropout: float = 0.0,
+    mil_agg: str = "topk_mean",
+    mil_hidden: int = 128,
+    mil_k_top: int = 30,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
+    if pooling_type == "mean_var":
+        return MeanVarPooling(dim=dim)
+    if pooling_type == "mil":
+        return MILPooling(dim=dim, hidden=mil_hidden, agg=mil_agg, k_top=mil_k_top)
     if pooling_type == "attention_k_query":
         return AttentionPooling(
             dim=dim, n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
@@ -297,6 +408,10 @@ class FaceOccRegressor(nn.Module):
         learnable_tau: bool = True,
         # Multi-head
         num_heads: int = 4,
+        # MIL
+        mil_agg: str = "topk_mean",
+        mil_hidden: int = 128,
+        mil_k_top: int = 30,
         # Common pool regularization
         pool_attn_dropout: float = 0.0,
         pool_proj_dropout: float = 0.0,
@@ -326,6 +441,7 @@ class FaceOccRegressor(nn.Module):
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
             num_heads=num_heads,
+            mil_agg=mil_agg, mil_hidden=mil_hidden, mil_k_top=mil_k_top,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
         )
 

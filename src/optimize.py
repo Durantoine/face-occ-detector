@@ -61,6 +61,7 @@ _MODEL_KEYS = {
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
     "num_heads",
+    "mil_agg", "mil_hidden", "mil_k_top",   # v13: MIL pooling
     "pool_attn_dropout", "pool_proj_dropout",
 }
 
@@ -222,7 +223,11 @@ def objective(
             val_seed=val_seed,
             test_data_csv=test_data_csv,
             min_score_to_save=min_score_to_save,
+            optuna_trial=trial,
         )
+    except optuna.exceptions.TrialPruned:
+        print(f"Trial {trial.number}: pruned by MedianPruner (intermediate score too high)")
+        raise
     except Exception as exc:
         eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
         if is_main():

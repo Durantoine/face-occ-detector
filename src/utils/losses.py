@@ -43,6 +43,7 @@ class WeightedMSELoss(nn.Module):
         lambda_lr: float = 0.5,
         lambda_max: float = 5.0,
         lambda_ema: float = 0.9,
+        lambda_threshold: float = 0.0005,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset
@@ -50,6 +51,7 @@ class WeightedMSELoss(nn.Module):
         self.lambda_lr = float(lambda_lr)
         self.lambda_max = float(lambda_max)
         self.lambda_ema = float(lambda_ema)
+        self.lambda_threshold = float(lambda_threshold)
         self.register_buffer("lambda_adapt", torch.tensor(float(lambda_init)))
         self.register_buffer("err_diff_ema", torch.tensor(0.0))
 
@@ -96,7 +98,12 @@ class WeightedMSELoss(nn.Module):
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     torch.distributed.all_reduce(err_diff_sync, op=torch.distributed.ReduceOp.AVG)
                 self.err_diff_ema.mul_(self.lambda_ema).add_(err_diff_sync * (1.0 - self.lambda_ema))
-                self.lambda_adapt.add_(self.lambda_lr * self.err_diff_ema)
+                # PROPER Lagrangian update with constraint threshold ε:
+                #   constraint:  |err_F - err_M| ≤ ε
+                #   λ_t+1 = clip(λ_t + η · (err_diff_ema - ε), 0, λ_max)
+                # If err_diff > ε (violated) → λ goes up. If < ε (satisfied) → λ goes down.
+                # Without -ε, λ would only go up (since err_diff_ema ≥ 0) → saturates at cap.
+                self.lambda_adapt.add_(self.lambda_lr * (self.err_diff_ema - self.lambda_threshold))
                 self.lambda_adapt.clamp_(0.0, self.lambda_max)
         else:
             lam = torch.tensor(1.0, device=err_diff.device, dtype=err_diff.dtype)

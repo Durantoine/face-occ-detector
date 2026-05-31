@@ -1,4 +1,4 @@
-name: dinov3-vitb16-3090-v13
+name: dinov3-vitb16-3090-v14
 description: |
   DINOv3 ViT-B/16 (86M) v12 — refinements on top of v11.
 
@@ -47,7 +47,7 @@ training:
   per_device_train_batch_size: 128
   per_device_eval_batch_size: 256
   gradient_accumulation_steps: 1
-  num_train_epochs: 13   # PINNED v13 (was HPO [7,13]). Rationale: decouple from LR shape;
+  num_train_epochs: 13   # PINNED v14 (was HPO [7,13]). Rationale: decouple from LR shape;
                           # rely on early_stopping_patience=3 for actual duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
@@ -78,7 +78,7 @@ training:
 optuna:
   n_trials: 100
   objective_mode: score
-  rotate_val_seed: false   # v13 (was true): fix seed so all trials see SAME val split.
+  rotate_val_seed: false   # v14 (was true): fix seed so all trials see SAME val split.
                             # Enables ensemble + isotonic on common val without retraining.
                             # Variance protection via large val (15k) + stratified IS + test holdout.
   keep_top_n: 3

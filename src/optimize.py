@@ -385,7 +385,6 @@ def _validate_search_space(base_config: Dict[str, Any]) -> None:
         "loss_adv_debiasing": "v8 (remplacé par feature_fairness=dann)",
         "loss_importance_reweight": "v3-v7",
         "loss_cell_reweight": "v3-v7",
-        "ema_decay": "v4-v9 (EMA retiré v10)",
         "group_dro_alpha": "v6 (GroupDRO retiré v10)",
         "val_split_strategy": "v6-v9 (pinned test_pmf v10)",
         "aug_share": "v10 (replication retiré v11)",

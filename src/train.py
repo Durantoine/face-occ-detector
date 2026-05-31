@@ -63,6 +63,7 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
+    "loss_lambda_threshold",
     "axis1_power", "axis2_power",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
     "loss_query_diversity_lambda",
@@ -219,13 +220,13 @@ class WeightedMSETrainer(Trainer):
         lambda_lr: float = 0.5,
         lambda_max: float = 5.0,
         lambda_ema: float = 0.9,
+        lambda_threshold: float = 0.0005,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
         ot_lambda: float = 0.0,
         layer_decay: float = 1.0,
         gender_sampler: Optional[Any] = None,
-        ema_eval_min_epoch_frac: float = 0.5,
         *args: Any,
         **kwargs: Any,
     ):
@@ -236,13 +237,13 @@ class WeightedMSETrainer(Trainer):
         self._ot_lambda = float(ot_lambda)
         self._layer_decay = float(layer_decay)
         self._gender_sampler = gender_sampler
-        self._ema_eval_min_epoch_frac = float(ema_eval_min_epoch_frac)
         self.loss_fct = WeightedMSELoss(
             focal_gamma=focal_gamma,
             lambda_init=lambda_init,
             lambda_lr=lambda_lr,
             lambda_max=lambda_max,
             lambda_ema=lambda_ema,
+            lambda_threshold=lambda_threshold,
         )
         print(f"WeightedMSETrainer: focal_gamma={focal_gamma}, "
               f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ_max={lambda_max}, λ_ema={lambda_ema}, "
@@ -269,12 +270,6 @@ class WeightedMSETrainer(Trainer):
 
         ema_cb = self._find_ema_cb()
         if ema_cb is None:
-            return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-
-        current_epoch = float(self.state.epoch or 0.0)
-        total_epochs = float(self.args.num_train_epochs or 1.0)
-        min_epoch = total_epochs * self._ema_eval_min_epoch_frac
-        if current_epoch < min_epoch:
             return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
 
         metrics_raw = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
@@ -718,7 +713,13 @@ def train(
     model_name = model_cfg.get("model_name", "dinov3_vits16")
     ml_log_params(client, run_id, {"architecture": cfg["name"]})
     ml_log_params(client, run_id, dict(model_cfg))
-    ml_log_params(client, run_id, dict(train_cfg))
+    # Log RESOLVED values for conditional knobs so MLflow doesn't show stale yaml defaults
+    # (e.g. adv_lambda=0.01 from yaml when feature_fairness=none → actual adv_lambda=0).
+    train_cfg_logged = dict(train_cfg)
+    train_cfg_logged["adv_lambda"] = adv_lambda
+    train_cfg_logged["mmd_lambda"] = mmd_lambda
+    train_cfg_logged["ot_lambda"] = ot_lambda
+    ml_log_params(client, run_id, train_cfg_logged)
     ml_log_params(client, run_id, dict(data_cfg))
 
     processor = get_image_processor(model_name)
@@ -907,6 +908,7 @@ def train(
         lambda_lr=float(train_cfg.get("loss_lambda_lr", 0.5)),
         lambda_max=float(train_cfg.get("loss_lambda_max", 5.0)),
         lambda_ema=float(train_cfg.get("loss_lambda_ema", 0.9)),
+        lambda_threshold=float(train_cfg.get("loss_lambda_threshold", 0.0005)),
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,
         mmd_lambda=mmd_lambda,
@@ -976,11 +978,15 @@ def train(
         cals = fit_all_calibrators(preds, gt, gender, use_is_weight=True)
 
         # SELECTION via IS-stratified eval on val (estimates P_test perf, unbiased target).
-        # Bonus: we also log the raw self-eval (P_train dist) for diagnostic.
-        val_is_eval_scores = {}
+        # Also scan α ∈ [0, 1] for each calibrator: pred_blend = α · cal(pred) + (1-α) · pred
+        # → atténue la correction si cal overfit val (α=1 = correction max, α=0 = raw).
+        # Best combo (cal_name, α) selected on val IS-stratified (NOT test holdout).
+        alphas = np.linspace(0.0, 1.0, 11)  # 0.0, 0.1, ..., 1.0
+        val_is_eval_scores: Dict[str, float] = {}
+        val_combo_scores: Dict[Tuple[str, float], float] = {}
         for cal_name, cal in cals.items():
             preds_cal = cal.transform(preds, gender)
-            scores_cal_raw = compute_score(preds_cal, gt, gender)  # P_train dist (biased)
+            scores_cal_raw = compute_score(preds_cal, gt, gender)
             if test_pmf_joint_val is not None:
                 scores_cal_is = compute_score_stratified_is(
                     preds_cal, gt, gender, test_pmf_joint_val, BIN_WIDTH, N_BINS,
@@ -994,11 +1000,29 @@ def train(
                 f"val_err_M_{cal_name}_is_eval": float(scores_cal_is["err_M"]),
                 f"val_score_{cal_name}_raw_eval": float(scores_cal_raw["challenge_score"]),
             })
-        # Submission calibrator = min IS-stratified val (unbiased estimate of P_test perf)
-        best_cal_for_submission = min(val_is_eval_scores, key=val_is_eval_scores.get)
-        ml_log_params(client, run_id, {"best_cal_for_submission": best_cal_for_submission})
-        print(f"  Best calibrator (val IS-stratified): {best_cal_for_submission}  "
-              f"(scores: " + ", ".join(f"{k}={v:.5f}" for k, v in val_is_eval_scores.items()) + ")")
+            # Alpha-blend scan
+            for alpha in alphas:
+                preds_blend = alpha * preds_cal + (1.0 - alpha) * preds
+                preds_blend = np.clip(preds_blend, 0.0, 1.0)
+                if test_pmf_joint_val is not None:
+                    s = compute_score_stratified_is(preds_blend, gt, gender, test_pmf_joint_val, BIN_WIDTH, N_BINS)
+                else:
+                    s = compute_score(preds_blend, gt, gender)
+                val_combo_scores[(cal_name, round(float(alpha), 2))] = s["challenge_score"]
+
+        # Best combo = argmin over (cal_name, alpha)
+        best_combo = min(val_combo_scores, key=val_combo_scores.get)
+        best_cal_for_submission, best_alpha_for_submission = best_combo
+        ml_log_params(client, run_id, {
+            "best_cal_for_submission": best_cal_for_submission,
+            "best_alpha_for_submission": str(best_alpha_for_submission),
+        })
+        ml_log_metrics(client, run_id, {
+            "val_score_best_combo_is_eval": float(val_combo_scores[best_combo]),
+            "best_alpha_for_submission_value": float(best_alpha_for_submission),
+        })
+        print(f"  Best (cal, α) (val IS-strat): {best_cal_for_submission}, α={best_alpha_for_submission}  "
+              f"→ val_score={val_combo_scores[best_combo]:.5f}")
 
         # === True post-hoc validation on test holdout (predict already done above) ===
         if test_pred_out is not None:
@@ -1014,7 +1038,7 @@ def train(
                 # Test holdout already matches P_test (H_C) → use standard compute_score
                 test_scores_raw = compute_score(test_preds, test_gt, test_gender)
 
-                # Apply EACH calibrator and find the best on test holdout
+                # Apply EACH calibrator (α=1 pure) on test holdout
                 test_scores_per_cal: Dict[str, Dict[str, float]] = {}
                 test_preds_per_cal: Dict[str, np.ndarray] = {}
                 for cal_name, cal in cals.items():
@@ -1022,16 +1046,17 @@ def train(
                     test_scores_per_cal[cal_name] = compute_score(test_preds_cal, test_gt, test_gender)
                     test_preds_per_cal[cal_name] = test_preds_cal
 
-                # Use the calibrator SELECTED on val self-eval (not test holdout, to avoid
-                # selection leakage). Test holdout is the unbiased evaluator.
-                best_cal_name = best_cal_for_submission
-                best_scores = test_scores_per_cal.get(best_cal_name, test_scores_raw)
+                # Apply best (cal, α) blend selected on val IS-stratified → submission proxy
+                test_cal_best = cals[best_cal_for_submission].transform(test_preds, test_gender)
+                test_preds_blend = best_alpha_for_submission * test_cal_best + (1.0 - best_alpha_for_submission) * test_preds
+                test_preds_blend = np.clip(test_preds_blend, 0.0, 1.0)
+                best_scores = compute_score(test_preds_blend, test_gt, test_gender)
                 best_gain = test_scores_raw["challenge_score"] - best_scores["challenge_score"]
-                # Also log the "oracle" best (= post-hoc selection on test holdout, biased
-                # upward — diagnostic only, NOT what we'd submit).
+                # Oracle = post-hoc selection on test holdout (biased, diagnostic only)
                 oracle_cal_name = min(test_scores_per_cal,
                                        key=lambda k: test_scores_per_cal[k]["challenge_score"])
                 oracle_scores = test_scores_per_cal[oracle_cal_name]
+                best_cal_name = best_cal_for_submission
 
                 print(f"  Test holdout (n={len(test_preds)}, P_test dist):")
                 print(f"    raw            : score={test_scores_raw['challenge_score']:.5f}  "

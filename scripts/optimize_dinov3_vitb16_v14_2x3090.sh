@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-vitb16-v10-optuna
+#SBATCH --job-name=face-occ-vitb16-v14-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,18 +11,15 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v10 - Back to basics (2x 3090, BF16)"
-echo "  ▶ Unified target : P_target(g,y) = mix_y(α1) × mix_g(α2)"
-echo "  ▶ Axe 1 : axis1_power ∈ [0, 1] — tension vers P_test sur Y marginal"
-echo "  ▶ Axe 2 : axis2_power ∈ [0, 1] — tension vers 50/50 F/M intra-Y"
-echo "  ▶ aug_share ∈ [0, 0.5] — split loss vs aug replication (K_max=3)"
-echo "  ▶ Axe 3 : feature_fairness {none, mmd, dann, both} + mmd_lambda (DANN adv=0.01 fixé)"
-echo "  ▶ Focal γ ∈ [0, 2.5]  |  fairness_λ pinned à 1.0"
-echo "  ▶ RETIRÉ : LLRD, EMA, sampler, val_split_alpha, MixSpikeBeta, GroupDRO, mixup"
-echo "  ▶ FIX : MMD median heuristic, LR/WD ranges historiques, 10 bins × 0.05"
+echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v14 - v11 refinements (2x 3090, BF16)"
+echo "  ▶ Refinements vs v11:"
+echo "    - K-query HPO ranges restored to v4 (more exploration)"
+echo "    - DANN re-added to feature_fairness {none, ot, dann}"
+echo "    - min_lr_rate 0.1 -> 0.3 (gentler cosine decay)"
+echo "    - logging_steps 200 -> 25 (faster MLflow refresh)"
 echo "================================================================================"
-echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
-echo "Started: $(date)"
+echo "Node: \$(hostname) | Job ID: \$SLURM_JOB_ID | GPUs: \$CUDA_VISIBLE_DEVICES"
+echo "Started: \$(date)"
 echo "================================================================================"
 
 PROJECT_DIR="${HOME}/face-occ-detector"
@@ -38,16 +35,21 @@ uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
+export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+# Raise file descriptor limit — PyTorch DataLoader workers accumulate shared-memory
+# handles across trials. Default ~1024-4096 exhausted after ~10 trials → "Too many
+# open files" hang. Use 65536 (max often allowed without root).
+ulimit -n 65536 || ulimit -n 8192   # fallback if 65536 forbidden
 export NCCL_IB_DISABLE=1
-export OMP_NUM_THREADS=8
-# v10 : NCCL stability fixes after observed AllReduce timeouts
+export OMP_NUM_THREADS=2
 export NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=3600
 
-export FACE_OCC_ARCH=dinov3-vitb16-3090-v10
+export FACE_OCC_ARCH=dinov3-vitb16-3090-v14
 
 mkdir -p scripts/logs
 

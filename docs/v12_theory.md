@@ -379,6 +379,38 @@ Compromis entre :
 
 Aucun bin n'atteint le clip=10 sur le train réel → le clip est juste un safety net. Voir §6.1 "Bin vs continue" pour les alternatives (KDE, etc.) et pourquoi 15 bins est suffisant.
 
+## 4.8 Post-hoc calibration : sélection (cal, α) sur val IS-stratifié
+
+Pour chaque trial, on évalue 3 × 11 = 33 combinaisons (cal_name × α ∈ [0, 1] step 0.1) :
+
+```
+pred_blend = α · cal(pred) + (1-α) · pred_raw
+  α = 0    → pas de correction (raw seul)
+  α = 1    → correction max (cal pur)
+  α ∈ ]0,1[ → correction atténuée (utile si cal overfit val)
+```
+
+**Choix méthodologique** : le best `(cal, α)` est sélectionné sur **val IS-stratifié**
+(`compute_score_stratified_is(pred_blend, gt_val, gender_val, test_pmf_joint_val)`),
+PAS sur le test holdout.
+
+**Pourquoi val IS-strat plutôt que test holdout** :
+- Tuner sur test holdout maximiserait le score test holdout, mais **biaiserait** l'évaluation
+  finale : on ne saurait plus si l'amélioration vient du model ou du tuning post-hoc
+- Val IS-strat est une estimation unbiased de la perf P_test → pousse le model dans la
+  bonne direction sans contaminer l'oracle de validation
+- Trade-off accepté : possiblement sub-optimal pour ce trial spécifique, mais
+  méthodologiquement propre. Le test holdout RESTE une mesure indépendante.
+
+Logs MLflow par trial :
+- `best_cal_for_submission` (param, str)
+- `best_alpha_for_submission_value` (metric, float)
+- `val_score_best_combo_is_eval` (metric, le score val IS du best combo)
+- `test_holdout_score_selected_cal` (metric, score test holdout du best combo SELECTED)
+- `test_holdout_score_oracle_cal` (metric, score test holdout post-hoc oracle, biased)
+
+Gap `selected - oracle` ≈ coût méthodologique d'avoir choisi sur val plutôt que test.
+
 ## 5. Audit implémentations (récap validations)
 
 | Composant | Statut | Notes |

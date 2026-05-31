@@ -50,10 +50,14 @@ _TEST_PMF: np.ndarray = np.array([
 ], dtype=np.float64)
 _TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
 
-# P_test marginal gender estimated via MID lookup on test_students.csv (93.5% coverage).
-# Source: scripts/estimate_test_gender.py — 47.66% F, 52.34% M.
-# Used by compute_target_weights as the axis2 target (was uniform 0.5/0.5).
-_TEST_P_GENDER = np.array([0.4766, 0.5234], dtype=np.float64)  # [F, M]
+# P_test marginal gender estimated via hybrid MID lookup + DINOv3 linear probe gender
+# classifier, 100% coverage on test_students.csv (29980 samples):
+#   - MID lookup (93.5%): deterministic gender from train.csv MID→gender mapping
+#   - DINOv3 probe (6.5%): logistic regression on DINOv3 ViT-B features, trained on
+#     3000 train samples with known gender (train acc 1.0 — easy task)
+# Result: P_test(F) = 0.4879, P_test(M) = 0.5121 (vs MID-only: 0.4766, 0.5234)
+# Build script: src.inference.gender_classifier.GenderClassifier.fit_or_load
+_TEST_P_GENDER = np.array([0.4879, 0.5121], dtype=np.float64)  # [F, M]
 
 
 # ============================================================================

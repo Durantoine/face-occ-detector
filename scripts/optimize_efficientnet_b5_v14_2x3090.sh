@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-efficientnet-b5-v13-optuna
+#SBATCH --job-name=face-occ-efficientnet-b5-v14-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,10 +11,10 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - EfficientNet-B5 (CNN ~30M) v13 - Baseline CNN (2x 3090, BF16)"
+echo "OPTUNA HPO - EfficientNet-B5 (CNN ~30M) v14 - Baseline CNN (2x 3090, BF16)"
 echo "  Backbone: timm tf_efficientnet_b5 (ImageNet pretrained)"
 echo "  Pools: attention_k_query + mil (no CLS, no MHA)"
-echo "  All v13 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
+echo "  All v14 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
 echo "================================================================================"
 echo "Node: \$(hostname) | Job ID: \$SLURM_JOB_ID | GPUs: \$CUDA_VISIBLE_DEVICES"
 echo "Started: \$(date)"
@@ -47,7 +47,7 @@ export NCCL_TIMEOUT=3600
 
 ulimit -n 65536 || ulimit -n 8192
 
-export FACE_OCC_ARCH=efficientnet-b5-3090-v13
+export FACE_OCC_ARCH=efficientnet-b5-3090-v14
 
 mkdir -p scripts/logs
 

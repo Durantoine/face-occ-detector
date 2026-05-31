@@ -313,18 +313,15 @@ class WeightedMSETrainer(Trainer):
         model_inner = _unwrap(self.model)
         ema_cb._swap_to_ema(model_inner)
         try:
-            metrics_ema_raw = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+            # CRITICAL: HF Trainer.evaluate() calls self.log(metrics) INTERNALLY before
+            # returning. If we reuse metric_key_prefix="eval", both the live and EMA evals
+            # get logged under eval_* (last write wins per step in some MLflow backends,
+            # but otherwise two values per step → zigzag). Use prefix "ema" so HF logs the
+            # second call's metrics directly under ema_* — clean separate MLflow chart.
+            metrics_ema = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix="ema")
         finally:
             ema_cb._swap_to_live(model_inner)
 
-        # Two clean top-level namespaces → MLflow plots them as 2 separate charts:
-        #   eval_* (= live, HF tracks this for best model + early stopping)
-        #   ema_*  (= EMA shadow, EMABestTracker tracks this independently)
-        prefix = f"{metric_key_prefix}_"
-        metrics_ema = {
-            f"ema_{k[len(prefix):]}" if k.startswith(prefix) else f"ema_{k}": v
-            for k, v in metrics_ema_raw.items()
-        }
         return {**metrics_live, **metrics_ema}
 
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:

@@ -411,6 +411,73 @@ Logs MLflow par trial :
 
 Gap `selected - oracle` ≈ coût méthodologique d'avoir choisi sur val plutôt que test.
 
+### Update v14 — α ∈ [0, 1.5]
+
+Étendu à 16 valeurs sur [0, 1.5]. `α > 1` permet d'**overshooter** la calibration :
+```
+pred_blend = α · cal + (1-α) · raw = raw + α · (cal - raw)
+```
+Utile quand isotonic est **conservateur sur les bins hauts** (y > 0.3) : le PAV peut
+shrinker vers l'identité à cause du peu de support en val sur la queue, alors que le
+test a plus de masse là où le modèle sous-prédit. α=1.2-1.4 stretche davantage. Sélection
+sur val IS-strat protège contre l'over-shoot — si α>1 dégrade le score IS, le scan ne le
+choisira pas.
+
+### Update v14 — 4ème calibrator : `IsotonicRegimeCalibrator`
+
+Isotonic par `(gender × régime y)` avec blend smooth au boundary, dans
+[`src/inference/calibrators.py`](../src/inference/calibrators.py).
+
+```
+Fit:  partitionne par gt en low (y < 0.20) / high (y ≥ 0.20), fit 1 isotonic par cellule
+Transform: utilise la prédiction (pas le gt) pour choisir le régime ; blend linéaire
+           dans [0.18, 0.22] pour éviter une discontinuité au seuil
+Fallback:  global isotonic si une cellule a < 50 samples
+```
+
+**Motivation** : le tail haut y (y > 0.20, ~15% de la masse P_test) est sparse en val,
+donc le global isotonic n'a pas assez de support pour vraiment stretcher. Un isotonic
+dédié à ce régime fitte une mapping plus aggressive sur la zone où le modèle sous-prédit.
+
+## 4.9 Ensemble + calibration : ordre des opérations
+
+Pour un ensemble de K modèles (top-K trials Optuna ou multi-backbone), deux choix :
+
+| Option | Pipeline |
+|---|---|
+| **A** : calibre puis ensemble | `final = mean( cal_i(pred_i) )` — 1 cal fit par modèle |
+| **B** : ensemble puis calibre | `final = cal( mean(pred_i) )` — 1 cal fit sur l'ensemble |
+
+**Décision : B (ensemble first, calibration after).** Raisons :
+
+1. **Cible directement optimale** : B fitte `E[y | mean_pred]`, qui est exactement la
+   fonction à corriger sur la prédiction finale. A fitte K corrections individuelles puis
+   en moyenne — moyenne de corrections ≠ correction de la moyenne.
+
+2. **Variance réduite pour le calibrator** : l'ensemble a une variance ~1/√K → input plus
+   propre au calibrator → isotonic et PCHIP overfittent moins.
+
+3. **Le biais systémique de sous-prédiction sur hauts y N'EST PAS corrigé par l'ensemble**
+   (tous les modèles sous-prédisent dans le même sens, la moyenne reste sous-prédite).
+   Seule la calibration post-ensemble peut stretcher le tail.
+
+4. **Simplicité** : B = 1 cal × 1 α-scan. A = K cals + (K α-scans indépendants ou 1 α
+   partagé). B est aussi plus facile à appliquer à l'inférence.
+
+**Exception** (non applicable ici) : si les K modèles ont des plages de sortie très
+différentes (ex: un sortant en [0, 1] et un autre en [0.2, 0.4]), calibrer chacun
+d'abord normaliserait les échelles. Tous nos modèles utilisent sigmoid → range identique
+[0, 1] → B sans risque.
+
+**Pipeline final** (post-sweep) :
+```
+1. K modèles → preds val + preds test
+2. ens_val = mean(preds_val_i)
+3. cals = fit_all_calibrators(ens_val, gt_val, gender_val)  # 4 cals per-gender, IS-weighted
+4. (best_cal, best_α) = argmin val_IS_strat( blend(α, cal(ens_val)) )
+5. submit = clip( best_α · best_cal(mean(preds_test_i)) + (1-best_α) · mean(preds_test_i) )
+```
+
 ## 5. Audit implémentations (récap validations)
 
 | Composant | Statut | Notes |

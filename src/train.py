@@ -1081,6 +1081,12 @@ def train(
         # Best combo = argmin over (cal_name, alpha)
         best_combo = min(val_combo_scores, key=val_combo_scores.get)
         best_cal_for_submission, best_alpha_for_submission = best_combo
+        # Also compute best α PER calibrator (for UI viz: show each cal at its own optimal α)
+        best_alpha_per_cal: Dict[str, float] = {}
+        for cal_name in cals:
+            alphas_for_cal = [(a, s) for (cn, a), s in val_combo_scores.items() if cn == cal_name]
+            if alphas_for_cal:
+                best_alpha_per_cal[cal_name] = float(min(alphas_for_cal, key=lambda x: x[1])[0])
         ml_log_params(client, run_id, {
             "best_cal_for_submission": best_cal_for_submission,
             "best_alpha_for_submission": str(best_alpha_for_submission),
@@ -1088,9 +1094,11 @@ def train(
         ml_log_metrics(client, run_id, {
             "val_score_best_combo_is_eval": float(val_combo_scores[best_combo]),
             "best_alpha_for_submission_value": float(best_alpha_for_submission),
+            **{f"best_alpha_{cn}": a for cn, a in best_alpha_per_cal.items()},
         })
         print(f"  Best (cal, α) (val IS-strat): {best_cal_for_submission}, α={best_alpha_for_submission}  "
               f"→ val_score={val_combo_scores[best_combo]:.5f}")
+        print(f"  Best α per cal: {', '.join(f'{c}=α{a:.1f}' for c, a in best_alpha_per_cal.items())}")
 
         # === True post-hoc validation on test holdout (predict already done above) ===
         if test_pred_out is not None:

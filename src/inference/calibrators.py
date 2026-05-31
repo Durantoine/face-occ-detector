@@ -262,7 +262,7 @@ class IsotonicRegimeCalibrator(PerGenderCalibratorBase):
     """
     name = "isotonic_regime"
 
-    def __init__(self, y_threshold: float = 0.20, blend_halfwidth: float = 0.02,
+    def __init__(self, y_threshold: float = 0.20, blend_halfwidth: float = 0.05,
                  min_samples_per_regime: int = 50, **kwargs) -> None:
         super().__init__(**kwargs)
         self.y_threshold = float(y_threshold)

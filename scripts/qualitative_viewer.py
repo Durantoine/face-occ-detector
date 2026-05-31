@@ -878,10 +878,11 @@ def _render_isotonic_effect() -> None:
     st.caption("Delta négatif (vert) = amélioration. Test holdout = ~4985 samples, distribution P_test.")
 
     try:
+        import numpy as np
         import plotly.express as px
         import plotly.graph_objects as go
     except ImportError:
-        st.error("plotly required for these plots — pip install plotly")
+        st.error("numpy + plotly required for these plots — pip install numpy plotly")
         return
 
     # === 1. Calibration mapping curves (3 methods) ===
@@ -928,70 +929,79 @@ def _render_isotonic_effect() -> None:
                                 height=400, hovermode="x")
         st.plotly_chart(fig_iso, use_container_width=True)
 
-    # === 2. Distributions pred RAW + chaque cal + GT vs P_test ref, par gender ===
-    st.markdown("### 2. Distribution prédictions vs GT vs P_test (réf PDF), par gender")
-    st.caption("`P_test PDF` (noir pointillé) = distribution Y du test challenge extraite du PDF. "
-                "Cible vers laquelle preds doivent converger.")
+    # === 2. Déformation des distributions par calibrator (small multiples) ===
+    st.markdown("### 2. Déformation par calibrator (au best α de chacun)")
+    st.caption("Pour chaque méthode : histogram du blend `α·cal + (1-α)·raw` à son α optimal (val IS-strat) + GT + P_test cible.")
 
-    # P_test reference (marginal Y) — same overlay on F and M panels
     try:
         from src.utils.distribution import _TEST_PMF, N_BINS as _NB, BIN_WIDTH as _BW
         ref_x = np.array([(b + 0.5) * _BW for b in range(_NB)])
         ref_density = np.asarray(_TEST_PMF) / _BW
     except ImportError:
         ref_x = ref_density = None
+        _NB = 15
 
-    method_color_F = {"raw": "#d62728", "isotonic": "#ff7f0e", "linear": "#2ca02c", "pchip": "#9467bd", "iso": "#ff7f0e"}
-    method_color_M = {"raw": "#1f77b4", "isotonic": "#17becf", "linear": "#2ca02c", "pchip": "#9467bd", "iso": "#17becf"}
+    # Fetch best alpha per cal from MLflow metrics
+    best_alpha = {}
+    for m in cal_methods:
+        a = _final_metric_value(TRACKING_URI, selected_run, f"best_alpha_{m}")
+        if a is not None:
+            best_alpha[m] = float(a)
+    # raw is always α=0 (no correction)
+    best_alpha["raw"] = 0.0
 
     g_F = df_pred[df_pred["gender"] < 0.5]
     g_M = df_pred[df_pred["gender"] >= 0.5]
-    c1, c2 = st.columns(2)
-    with c1:
-        fig_F = go.Figure()
-        fig_F.add_trace(go.Histogram(x=g_F["pred_raw"], name="pred RAW", opacity=0.45, nbinsx=40,
-                                       marker_color=method_color_F["raw"], histnorm="probability density"))
-        for m in cal_methods:
-            col = f"pred_{m}"
-            if col in g_F.columns:
-                fig_F.add_trace(go.Histogram(x=g_F[col], name=f"pred {m}", opacity=0.45, nbinsx=40,
-                                               marker_color=method_color_F.get(m, "#888"),
-                                               histnorm="probability density"))
-        fig_F.add_trace(go.Histogram(x=g_F["gt"], name="GT (holdout F)", opacity=0.30, nbinsx=40,
-                                       marker_color="gray", histnorm="probability density"))
-        if ref_x is not None:
-            fig_F.add_trace(go.Scatter(x=ref_x, y=ref_density, mode="lines+markers",
-                                         name="P_test PDF (réf)", line=dict(color="black", width=3, dash="dot"),
-                                         marker=dict(size=8, symbol="diamond")))
-        fig_F.update_layout(barmode="overlay", title=f"Female (n={len(g_F)})",
-                              xaxis_title="Y", yaxis_title="density", height=400,
-                              legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig_F, use_container_width=True)
-    with c2:
-        fig_M = go.Figure()
-        fig_M.add_trace(go.Histogram(x=g_M["pred_raw"], name="pred RAW", opacity=0.45, nbinsx=40,
-                                       marker_color=method_color_M["raw"], histnorm="probability density"))
-        for m in cal_methods:
-            col = f"pred_{m}"
-            if col in g_M.columns:
-                fig_M.add_trace(go.Histogram(x=g_M[col], name=f"pred {m}", opacity=0.45, nbinsx=40,
-                                               marker_color=method_color_M.get(m, "#888"),
-                                               histnorm="probability density"))
-        fig_M.add_trace(go.Histogram(x=g_M["gt"], name="GT (holdout M)", opacity=0.30, nbinsx=40,
-                                       marker_color="gray", histnorm="probability density"))
-        if ref_x is not None:
-            fig_M.add_trace(go.Scatter(x=ref_x, y=ref_density, mode="lines+markers",
-                                         name="P_test PDF (réf)", line=dict(color="black", width=3, dash="dot"),
-                                         marker=dict(size=8, symbol="diamond")))
-        fig_M.update_layout(barmode="overlay", title=f"Male (n={len(g_M)})",
-                              xaxis_title="Y", yaxis_title="density", height=400,
-                              legend=dict(orientation="h", y=-0.2))
-        st.plotly_chart(fig_M, use_container_width=True)
+    methods_show = ["raw"] + cal_methods
+    # Dark-theme friendly palette (bright, distinct on dark background)
+    bar_color = {"raw": "#9ca3af", "isotonic": "#f87171", "isotonic_regime": "#f472b6",
+                  "linear": "#34d399", "pchip": "#a78bfa", "iso": "#f87171"}
+    gt_color = "#fbbf24"        # amber — pops on dark, distinct from cal colors
+    target_color = "#ffffff"    # white — max contrast on dark
 
-    st.caption("Comment lire : si `pred ISO` (orange/cyan) suit mieux `P_test PDF` (noir pointillé) "
-                "que `pred RAW` (rouge/bleu), l'isotonic a rapproché la distribution prédite de la "
-                "référence test. `GT (holdout)` doit être cohérent avec `P_test PDF` (puisqu'on a "
-                "stratifié le holdout via H_C) — sert de sanity check du holdout.")
+    def _density(values, bins):
+        h, _ = np.histogram(values, bins=bins)
+        w = bins[1] - bins[0]
+        s = h.sum()
+        return (h / (s * w)) if s > 0 else h.astype(float)
+
+    bin_edges = np.linspace(0.0, 0.5, _NB + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    bin_w = bin_edges[1] - bin_edges[0]
+
+    for gname, gdf in [("Female", g_F), ("Male", g_M)]:
+        st.markdown(f"**{gname}** (n={len(gdf)})")
+        cols = st.columns(len(methods_show))
+        gt_density = _density(gdf["gt"].values, bin_edges)
+        for i, m in enumerate(methods_show):
+            col = "pred_raw" if m == "raw" else f"pred_{m}"
+            if col not in gdf.columns:
+                continue
+            alpha = best_alpha.get(m, 1.0)
+            # Blend: α·cal + (1-α)·raw
+            if m == "raw":
+                pred_vals = gdf["pred_raw"].values
+            else:
+                pred_vals = np.clip(alpha * gdf[col].values + (1.0 - alpha) * gdf["pred_raw"].values, 0.0, 1.0)
+            pred_density = _density(pred_vals, bin_edges)
+            title = f"{m.upper()} (α={alpha:.1f})" if m != "raw" else "RAW"
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=bin_centers, y=pred_density, name="pred",
+                                  marker_color=bar_color.get(m, "#9ca3af"), opacity=0.9,
+                                  width=bin_w * 0.95))
+            fig.add_trace(go.Scatter(x=bin_centers, y=gt_density, name="GT",
+                                      mode="lines+markers", line=dict(color=gt_color, width=2.5),
+                                      marker=dict(size=6, color=gt_color)))
+            if ref_x is not None:
+                fig.add_trace(go.Scatter(x=ref_x, y=ref_density, name="P_test cible",
+                                          mode="lines", line=dict(color=target_color, width=2.5, dash="dot")))
+            fig.update_layout(title=title, height=280,
+                                xaxis=dict(title="Y", range=[0, 0.5]),
+                                yaxis=dict(title="density"),
+                                margin=dict(l=30, r=10, t=35, b=30),
+                                showlegend=(i == 0),
+                                legend=dict(orientation="h", y=-0.25, x=0))
+            cols[i].plotly_chart(fig, use_container_width=True)
 
     # === 3. Calibration plot: pred vs gt for RAW + each calibrator (small multiples) ===
     st.markdown("### 3. Calibration (pred vs gt), par méthode")

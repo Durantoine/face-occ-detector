@@ -291,14 +291,19 @@ class WeightedMSETrainer(Trainer):
             ema_cb._needs_restore = True
 
         chosen = metrics_ema if ema_wins else metrics_raw
-        # Use distinct TOP-LEVEL prefixes (raw_*, ema_*) so MLflow UI groups them
-        # in separate sections instead of overlaying eval_score / eval_score_raw / eval_score_ema.
+        # Deux namespaces top-level distincts → MLflow UI affiche 2 graphes séparés:
+        #   ema_*    : courbe EMA seule
+        #   noema_*  : courbe live seule
+        # eval_* (chosen min) reste retourné pour que HF Trainer pickup eval_challenge_score
+        # pour le best model tracking, mais on demande à MlflowClientCallback de skip eval_*
+        # quand le marker est présent (sinon il superpose un 3ème plot zigzag).
         prefix = f"{metric_key_prefix}_"
-        extras = {f"raw_{k[len(prefix):]}" if k.startswith(prefix) else f"raw_{k}": v
+        extras = {f"noema_{k[len(prefix):]}" if k.startswith(prefix) else f"noema_{k}": v
                   for k, v in metrics_raw.items()}
         extras.update({f"ema_{k[len(prefix):]}" if k.startswith(prefix) else f"ema_{k}": v
                        for k, v in metrics_ema.items()})
         extras[f"{metric_key_prefix}_chose_ema"] = float(ema_wins)
+        extras["_double_eval_marker"] = 1.0
         return {**chosen, **extras}
 
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:

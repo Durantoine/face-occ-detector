@@ -1,0 +1,200 @@
+models:
+- name: qwen3-4b-thinking-2507
+  provider: lmstudio
+ model: qwen/qwen3-4b-thinking-2507
+ context_window: 8196
+ streaming: true
+- name: qwen/qwen3-8b
+ provider: lmstudio
+ model: qwen/qwen3-8b
+ context_window: 8196
+ streaming: true
+ - name: qwen/qwen3-4b-2507
+ provider: lmstudio
+ model: qwen/qwen3-4b-2507
+ context_window: 8196
+ streaming: true
+ - name: salv-qwen2.5-coder-7b-instruct
+ provider: lmstudio
+ model: salv-qwen2.5-coder-7b-instruct
+ context_window: 8196
+ streaming: true
+
+
+
+capabilities:
+ - tool_use
+
+
+roles:
+ - chat
+ - edit
+ - apply
+ - autocomplete
+ - embed
+
+
+context:
+ - provider: code
+ - provider: docs
+ - provider: diff
+ - provider: terminal
+ - provider: problems
+ - provider: folder
+ - provider: codebase
+
+
+backend:
+ type: api
+ url: http://127.0.0.1:1234/v1/chat/completions
+ temperature: 0.7
+ max_tokens: 8196
+ stream: true
+ continue_token: "continue"
+
+
+actions:
+ - name: EXECUTE
+ description: Simulate terminal command execution.
+ usage: |
+  ```EXECUTE
+  command here
+  ```
+
+
+ - name: REFATOR
+ description: Propose code changes/refactoring.
+ usage: |
+  ```REFATOR
+  changed code here
+  ```
+
+
+ - name: ANALYZE
+ description: Analyze code, diffs, or performance.
+ usage: |
+  ```ANALYZE
+  analysis here
+  ```
+
+
+ - name: DEBUG
+ description: Help debug errors or exceptions.
+ usage: |
+  ```DEBUG
+  error message, stacktrace or code snippet
+  ```
+
+
+ - name: DOC
+ description: Generate or review code documentation.
+ usage: |
+  ```DOC
+  code or function that needs documentation
+  ```
+
+
+ - name: TEST
+ description: Create or review unit and integration tests.
+ usage: |
+  ```TEST
+  target code to generate tests
+  ```
+
+
+ - name: REVIEW
+ description: Do code review and suggest improvements.
+ usage: |
+  ```REVIEW
+  code snippet or PR
+  ```
+
+
+ - name: PLAN
+ description: Create an implementation plan or task list.
+ usage: |
+  ```PLAN
+  resource objective
+  ```
+
+
+ - name: RESEARCH
+ description: Explain concepts, libraries, or related technologies.
+ usage: |
+  ```RESEARCH
+  topic or technical question
+  ```
+
+
+ - name: OPTIMIZE
+ description: Suggest performance, memory, or readability improvements.
+ usage: |
+  ```OPTIMIZE
+  code snippet
+  ```
+
+
+ - name: TRANSLATE
+ description: Translate messages, comments, or technical documentation.
+ usage: |
+  ```TRANSLATE
+  text here
+  ```
+
+
+ - name: COMMENT
+ description: Add explanatory comments to the code.
+ usage: |
+  ```COMMENT
+  code snippet
+  ```
+
+
+ - name: GENERATE
+ description: Create new files, classes, functions, or scripts.
+ usage: |
+  ```GENERATE
+  description of what to generate
+  ```
+
+
+chat:
+ system_prompt: |
+  You are an intelligent assistant who acts as an advanced development agent.
+  You can analyze files, propose changes, simulate command execution, refactor code, and create embeddings.
+  
+  ## Security Rules:
+  1. Never delete files or data without user confirmation.
+  2. Always validate commands before suggesting execution.
+  3. Explicitly warn if a command has a critical impact.
+  4. Use code blocks to simulate scripts, commands, or changes.
+  5. If you are not sure, ask questions to get more context.
+  
+  
+  ## Compatibilities:
+  - Can analyze code files, diffs, and documentation.
+  - Can suggest simulated terminal commands.
+  - Can propose code changes using provider code/diff.
+  - Can organize files and folders in a simulated way.
+  - Can create embeddings and auto-complete code snippets.
+  
+  
+  ## Simulated Action Macros:
+  - EXECUTE: to simulate terminal command execution.
+   Example:
+   ```EXECUTE
+   ls -la /home/user
+   ```
+  - REFATOR: to propose changes or code refactoring.
+   Example:
+   ```REFATOR
+   # Change function to optimize loop
+   ```
+  - ANALYZE: to generate code analysis reports or diffs.
+   Example:
+   ```ANALYZE
+   # Check for code duplication in the src/ folder
+   ```
+  
+  
+  Always ask before applying critical changes or executing macros that affect files.

@@ -314,7 +314,7 @@ def _render_trials_comparison() -> None:
         return
 
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v14$")
+    _CURRENT_VERSION_RE = re.compile(r"-v15$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:
@@ -805,7 +805,7 @@ def _render_isotonic_effect() -> None:
     exp_labels = list(exp_label_to_id.keys())
     default_idx = 0
     for i, label in enumerate(exp_labels):
-        if "v14" in label.lower():
+        if "v15" in label.lower():
             default_idx = i
             break
     selected_exp_label = st.sidebar.selectbox("Experiment", exp_labels, index=default_idx, key="pp_exp")

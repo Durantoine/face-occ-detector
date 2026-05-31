@@ -105,18 +105,27 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def get_image_processor(model_name: str) -> Any:
+def get_image_processor(model_name: str, image_size: Optional[int] = None) -> Any:
+    """Return an HF image processor for the given model.
+
+    image_size: override the default 224×224. Critical for EfficientNet (B5 designed
+    for 456×456 — using 224 cuts pixel count by 4×, severely underutilising the model).
+    """
     if model_name.startswith("dinov3_") or "sapiens" in model_name.lower():
         proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
+        if image_size is not None:
+            proc.size = {"height": int(image_size), "width": int(image_size)}
+            proc.do_resize = True
         return proc
-    # timm CNN backbones (efficientnet*, resnet*, convnext*, etc.) — use ImageNet stats
-    # via a generic ViT processor (just rescale + normalize, resize handled to 224x224)
     timm_prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv", "tf_efficientnet")
     if any(model_name.startswith(p) for p in timm_prefixes):
         proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
+        if image_size is not None:
+            proc.size = {"height": int(image_size), "width": int(image_size)}
+            proc.do_resize = True
         return proc
     return AutoImageProcessor.from_pretrained(model_name, trust_remote_code=True)

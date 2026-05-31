@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-vitb16-v14-optuna
+#SBATCH --job-name=face-occ-sapiens2-01b-v15-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=60G
+#SBATCH --mem=100G
 #SBATCH --time=30:00:00
 
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - DINOv3 ViT-B/16 (86M) v14 - v11 refinements (2x 3090, BF16)"
+echo "OPTUNA HPO - Sapiens2-0.1B (114M) v15 - v11 refinements (2x 3090, BF16)"
 echo "  ▶ Refinements vs v11:"
 echo "    - K-query HPO ranges restored to v4 (more exploration)"
 echo "    - DANN re-added to feature_fairness {none, ot, dann}"
@@ -49,7 +49,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=3600
 
-export FACE_OCC_ARCH=dinov3-vitb16-3090-v14
+export FACE_OCC_ARCH=sapiens2-01b-3090-v15
 
 mkdir -p scripts/logs
 

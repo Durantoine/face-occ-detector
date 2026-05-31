@@ -302,6 +302,48 @@ class IsotonicRegimeCalibrator(PerGenderCalibratorBase):
 
 
 # ============================================================================
+# 5. Isotonic with tail-boost weights — single fit, no regime boundary
+# ============================================================================
+
+class IsotonicTailBoostCalibrator(PerGenderCalibratorBase):
+    """Single per-gender isotonic with weights boosted on high-y samples.
+
+    Same one-shot PAV as IsotonicCalibrator but the sample weights are:
+        w_i = (1/30 + y_i) × IS_ratio_i × (1 + boost · max(0, y_i - y_pivot))
+
+    The (1 + boost · (y - y_pivot)+) term amplifies the influence of samples with
+    y > y_pivot during the fit, pushing the isotonic mapping to better match the
+    sparse high-y tail (where the model typically under-predicts and standard
+    isotonic shrinks toward identity due to few support points).
+
+    No regime boundary, no blend zone, smooth monotonic mapping (no artefact step).
+    Cleaner alternative to IsotonicRegimeCalibrator.
+
+    Defaults: y_pivot=0.20 (start boosting), boost=5.0 (samples at y=0.5 get ~2.5×
+    extra weight on top of standard weights).
+    """
+    name = "isotonic_tailboost"
+
+    def __init__(self, y_pivot: float = 0.20, boost: float = 5.0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.y_pivot = float(y_pivot)
+        self.boost = float(boost)
+
+    def _sample_weights(self, gt: np.ndarray) -> np.ndarray:
+        w = super()._sample_weights(gt)
+        tail = np.maximum(gt - self.y_pivot, 0.0)
+        return w * (1.0 + self.boost * tail)
+
+    def _fit_one(self, preds: np.ndarray, gt: np.ndarray, w: np.ndarray) -> object:
+        iso = IsotonicRegression(y_min=self.out_min, y_max=self.out_max, out_of_bounds="clip")
+        iso.fit(preds, gt, sample_weight=w)
+        return iso
+
+    def _transform_one(self, model: object, preds: np.ndarray) -> np.ndarray:
+        return model.transform(preds)
+
+
+# ============================================================================
 # Convenience: fit all calibrators (with IS-weighting)
 # ============================================================================
 
@@ -313,7 +355,8 @@ def fit_all_calibrators(
     Returns dict keyed by calibrator name. All use IS-weighting by default.
     """
     out: Dict[str, PerGenderCalibratorBase] = {}
-    for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator, IsotonicRegimeCalibrator]:
+    for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator,
+                IsotonicRegimeCalibrator, IsotonicTailBoostCalibrator]:
         try:
             cal = cls(use_is_weight=use_is_weight).fit(preds, gt, gender)
             out[cal.name] = cal

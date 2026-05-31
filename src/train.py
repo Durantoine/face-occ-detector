@@ -165,26 +165,31 @@ class EMABestTracker(TrainerCallback):
     """Track the best EMA epoch independently of HF Trainer's best-model logic.
 
     HF tracks the best `eval_*` epoch (= live model). We mirror that on `ema_*`,
-    keeping an in-memory snapshot of the EMA state at the best EMA epoch. After
-    training, the caller compares best_live vs best_ema scores and loads the winner.
+    saving the EMA state to local disk (TMPDIR) at the best EMA epoch — keeping
+    it in CPU RAM would cost ~ model_size × num_ranks (≈ 1GB for sapiens × 2 ranks)
+    on top of dataloader buffers, which OOM'd 60G allocations. Disk is local SSD,
+    cost is one write per "new best" event.
+
+    After training, the caller compares best_live vs best_ema and loads from disk.
     """
-    def __init__(self, ema_cb: "EMAWeightCallback", metric_key: str, greater_is_better: bool) -> None:
+    def __init__(self, ema_cb: "EMAWeightCallback", metric_key: str, greater_is_better: bool,
+                 snapshot_dir: str) -> None:
         self.ema_cb = ema_cb
         self.metric_key = metric_key
         self.greater_is_better = greater_is_better
+        self.snapshot_path = Path(snapshot_dir) / f"ema_best_rank{os.environ.get('LOCAL_RANK', '0')}.pt"
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         self.best_score: float = float("-inf") if greater_is_better else float("inf")
         self.best_epoch: Optional[float] = None
-        self.best_snapshot: Optional[Dict[str, torch.Tensor]] = None
+        self._snapshot_saved: bool = False
 
     def _improved(self, score: float) -> bool:
         return score > self.best_score if self.greater_is_better else score < self.best_score
 
     def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
-        # IMPORTANT: run on ALL ranks (not just rank 0). Metrics are gathered across ranks
-        # by HF Trainer so all ranks see the same score; EMA weights are synchronised by
-        # DDP so each rank's snapshot is identical. If we gated on rank 0, only rank 0 would
-        # have the snapshot and the post-train swap would desync the model across ranks,
-        # corrupting the subsequent collective predict() call.
+        # All ranks update — metrics are collective-gathered, EMA weights are DDP-synced,
+        # so each rank's snapshot is identical. Gating on rank 0 would desync the model
+        # in the post-train swap and corrupt the next predict() collective call.
         if metrics is None:
             return
         score = metrics.get(self.metric_key)
@@ -193,7 +198,15 @@ class EMABestTracker(TrainerCallback):
         if self._improved(float(score)):
             self.best_score = float(score)
             self.best_epoch = float(state.epoch or 0.0)
-            self.best_snapshot = self.ema_cb.snapshot()
+            torch.save(self.ema_cb.snapshot(), self.snapshot_path)
+            self._snapshot_saved = True
+
+    def load_best_into(self, model: torch.nn.Module) -> bool:
+        if not self._snapshot_saved or not self.snapshot_path.exists():
+            return False
+        state = torch.load(self.snapshot_path, map_location="cpu")
+        self.ema_cb.load_snapshot(state, model)
+        return True
 
 
 class OptunaPruningCallback(TrainerCallback):
@@ -750,7 +763,8 @@ def train(
     ml_log_params(client, run_id, train_cfg_logged)
     ml_log_params(client, run_id, dict(data_cfg))
 
-    processor = get_image_processor(model_name)
+    image_size = model_cfg.get("image_size")
+    processor = get_image_processor(model_name, image_size=image_size)
     train_data, val_data, test_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
     train_dataset, val_dataset, weight_summary = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
@@ -817,8 +831,7 @@ def train(
             tau_diffuse_init=float(model_cfg.get("tau_diffuse_init", 1.5)),
             tau_free_init=float(model_cfg.get("tau_free_init", 1.0)),
             learnable_tau=bool(model_cfg.get("learnable_tau", True)),
-            num_heads=int(model_cfg.get("num_heads", 4)),
-            mil_agg=str(model_cfg.get("mil_agg", "topk_mean")),
+            mil_agg=str(model_cfg.get("mil_agg", "multi")),
             mil_hidden=int(model_cfg.get("mil_hidden", 128)),
             mil_k_top=int(model_cfg.get("mil_k_top", 30)),
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
@@ -933,6 +946,7 @@ def train(
             ema_cb=ema_cb,
             metric_key=ema_metric_key,
             greater_is_better=bool(train_cfg.get("greater_is_better", False)),
+            snapshot_dir=output_dir,
         )
         callbacks.append(ema_best_tracker)
         print(f"EMA weights enabled with decay={ema_decay}, tracking best on {ema_metric_key}")
@@ -970,10 +984,11 @@ def train(
     trainer.train()
 
     # HF has loaded the best-live epoch (via load_best_model_at_end). If the EMA shadow
-    # reached a better score at some epoch, swap those EMA weights into the model.
+    # reached a better score at some epoch, swap those EMA weights (loaded from disk
+    # snapshot) into the model.
     best_live_score = float(getattr(trainer.state, "best_metric", float("inf")) or float("inf"))
     used_ema = False
-    if ema_best_tracker is not None and ema_best_tracker.best_snapshot is not None:
+    if ema_best_tracker is not None and ema_best_tracker._snapshot_saved:
         better = (
             ema_best_tracker.best_score > best_live_score
             if bool(train_cfg.get("greater_is_better", False))
@@ -983,10 +998,7 @@ def train(
               f"best_ema_score={ema_best_tracker.best_score:.5f} (epoch {ema_best_tracker.best_epoch})  "
               f"→ {'EMA WINS, swapping weights' if better else 'LIVE wins, keeping weights'}")
         if better:
-            ema_cb_after = trainer._find_ema_cb()
-            if ema_cb_after is not None:
-                ema_cb_after.load_snapshot(ema_best_tracker.best_snapshot, _unwrap(trainer.model))
-                used_ema = True
+            used_ema = ema_best_tracker.load_best_into(_unwrap(trainer.model))
         if use_client and client and run_id:
             ml_log_metrics(client, run_id, {
                 "best_live_score": best_live_score,

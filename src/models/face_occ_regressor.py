@@ -86,6 +86,27 @@ class CLSPooling(nn.Module):
         return x[:, 0, :], None
 
 
+class GAPPooling(nn.Module):
+    """Global Average Pool over patch dim → (B, D).
+
+    Mirrors the native CNN pretrained head (classifier was GAP + Linear). For
+    EfficientNet / ResNet etc, this preserves the pretrained representation
+    alignment instead of replacing GAP with K-query/MIL learned from scratch.
+    """
+    def __init__(self, dim: int, skip_cls: bool = False) -> None:
+        super().__init__()
+        self.dim = dim
+        self.skip_cls = skip_cls
+
+    @property
+    def output_dim(self) -> int:
+        return self.dim
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        patches = x[:, 1:, :] if self.skip_cls else x
+        return patches.mean(dim=1), None
+
+
 class MeanVarPooling(nn.Module):
     """Global stats: concat(mean, std) over patches. No learned params.
 
@@ -109,24 +130,30 @@ class MeanVarPooling(nn.Module):
 
 
 class MILPooling(nn.Module):
-    """Multi-Instance Learning: per-patch occlusion score + aggregation.
+    """Multi-Instance Learning pooling — multi-aggregation by default.
 
-      f(h_i)  →  o_i ∈ R         (raw scalar score per patch via 2-layer MLP)
-      ŷ_raw  =  g(o_1, ..., o_N)  aggregation: mean | max | topk_mean | attention
+    Per-patch scoring head produces `score_i ∈ R` for each patch. We compute ALL
+    four aggregations and concatenate them so the downstream head learns the right
+    combination for each input. This solves the "either/or" problem of choosing
+    one agg per trial: faces with sparse occlusions and faces with global blur both
+    get their natural signal extracted.
 
-    Returns (B, 1) — head then applies Linear(1, 1) + sigmoid for final calibration.
+      - mean(scores)        — captures global / diffuse degradation (blur, stylization)
+      - max(scores)         — captures the strongest local occlusion (sparse)
+      - topk_mean(scores)   — robust max: avoids single-patch noise
+      - gated_attn          — Ilse et al. 2018 gated attention with a SEPARATE
+                              attention head: α_i = softmax(w·(tanh(V·h_i) ⊙ σ(U·h_i)))
+                              → learnable, decoupled from the scorer
 
-    Conceptually aligned with face occlusion (sparse, localized) but also captures
-    blur (uniform high scores) depending on aggregation:
-      - mean       : OK for blur, dilutes sparse
-      - max        : OK for sparse, saturates on blur
-      - topk_mean  : compromise (good for both with k tuned)
-      - attention  : softmax(logits) weights — flexible
+    Output shape (B, 4) — head then has Linear(4, output_dim) to learn the mix.
+
+    `agg` kwarg is kept for backward compat but defaults to "multi" (recommended).
+    Other values keep the single-agg behaviour for ablations.
     """
-    def __init__(self, dim: int, hidden: int = 128, agg: str = "topk_mean",
+    def __init__(self, dim: int, hidden: int = 128, agg: str = "multi",
                   k_top: int = 30, skip_cls: bool = True) -> None:
         super().__init__()
-        if agg not in ("mean", "max", "topk_mean", "attention"):
+        if agg not in ("multi", "mean", "max", "topk_mean", "attention"):
             raise ValueError(f"Unknown MIL agg: {agg}")
         self.dim = dim
         self.hidden = hidden
@@ -138,26 +165,44 @@ class MILPooling(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+        needs_attn = agg in ("attention", "multi")
+        if needs_attn:
+            self.attn_V = nn.Linear(dim, hidden)
+            self.attn_U = nn.Linear(dim, hidden)
+            self.attn_w = nn.Linear(hidden, 1)
+        else:
+            self.attn_V = self.attn_U = self.attn_w = None
 
     @property
     def output_dim(self) -> int:
-        return 1
+        return 4 if self.agg == "multi" else 1
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         patches = x[:, 1:, :] if self.skip_cls else x
-        logits = self.scorer(patches).squeeze(-1)  # (B, N)
-        if self.agg == "mean":
-            pooled = logits.mean(dim=1, keepdim=True)
+        scores = self.scorer(patches).squeeze(-1)  # (B, N)
+        k = min(self.k_top, scores.size(1))
+
+        if self.agg == "multi":
+            mean_p = scores.mean(dim=1, keepdim=True)
+            max_p = scores.max(dim=1, keepdim=True).values
+            topk_p = scores.topk(k, dim=1).values.mean(dim=1, keepdim=True)
+            gated = torch.tanh(self.attn_V(patches)) * torch.sigmoid(self.attn_U(patches))
+            attn_logits = self.attn_w(gated).squeeze(-1)
+            attn = F.softmax(attn_logits, dim=1)
+            attn_p = (attn * scores).sum(dim=1, keepdim=True)
+            pooled = torch.cat([mean_p, max_p, topk_p, attn_p], dim=-1)  # (B, 4)
+        elif self.agg == "mean":
+            pooled = scores.mean(dim=1, keepdim=True)
         elif self.agg == "max":
-            pooled = logits.max(dim=1, keepdim=True).values
+            pooled = scores.max(dim=1, keepdim=True).values
         elif self.agg == "topk_mean":
-            k = min(self.k_top, logits.size(1))
-            top, _ = logits.topk(k, dim=1)
-            pooled = top.mean(dim=1, keepdim=True)
-        else:  # attention
-            attn = F.softmax(logits, dim=1)
-            pooled = (attn * logits).sum(dim=1, keepdim=True)
-        return pooled, logits  # (B, 1), (B, N)
+            pooled = scores.topk(k, dim=1).values.mean(dim=1, keepdim=True)
+        else:  # gated attention
+            gated = torch.tanh(self.attn_V(patches)) * torch.sigmoid(self.attn_U(patches))
+            attn_logits = self.attn_w(gated).squeeze(-1)
+            attn = F.softmax(attn_logits, dim=1)
+            pooled = (attn * scores).sum(dim=1, keepdim=True)
+        return pooled, scores  # (B, output_dim), (B, N)
 
 
 class AttentionPooling(nn.Module):
@@ -240,59 +285,6 @@ class AttentionPooling(nn.Module):
         return flat, weights
 
 
-class MultiHeadAttentionPooling(nn.Module):
-    """Standard multi-head attention pooling with a single learnable query.
-
-    1 query ∈ ℝᴰ, split across H heads (each ∈ ℝ^(D/H)). No per-head τ. Diversity
-    emerges from random init of W_q^h, W_k^h, W_v^h per head. Output: ℝᴰ.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 4,
-        attn_dropout: float = 0.0,
-        proj_dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, f"MultiHeadAttentionPooling: dim={dim} not divisible by num_heads={num_heads}"
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.query = nn.Parameter(torch.randn(dim) * 0.02)
-        self.proj_q = nn.Linear(dim, dim)
-        self.proj_k = nn.Linear(dim, dim)
-        self.proj_v = nn.Linear(dim, dim)
-        self.proj_out = nn.Linear(dim, dim)
-        self.attn_dropout = nn.Dropout(attn_dropout)
-        self.norm = nn.LayerNorm(dim)
-        self.proj_dropout = nn.Dropout(proj_dropout)
-
-    @property
-    def output_dim(self) -> int:
-        return self.dim
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x: (B, N, D)  →  pooled: (B, D), attn_weights: (B, H, N)"""
-        B, N, D = x.shape
-        H, Hd = self.num_heads, self.head_dim
-
-        q = self.proj_q(self.query).view(H, Hd)
-        k = self.proj_k(x).view(B, N, H, Hd).transpose(1, 2)
-        v = self.proj_v(x).view(B, N, H, Hd).transpose(1, 2)
-
-        scores = torch.einsum("hd,bhnd->bhn", q, k) / (Hd ** 0.5)
-        weights = F.softmax(scores, dim=-1)
-        weights = self.attn_dropout(weights)
-
-        pooled = torch.einsum("bhn,bhnd->bhd", weights, v).reshape(B, D)
-        pooled = self.proj_out(pooled)
-        pooled = self.norm(pooled)
-        pooled = self.proj_dropout(pooled)
-        return pooled, weights
-
-
 def build_pooling(
     pooling_type: str,
     dim: int,
@@ -303,15 +295,17 @@ def build_pooling(
     tau_diffuse_init: float = 1.5,
     tau_free_init: float = 1.0,
     learnable_tau: bool = True,
-    num_heads: int = 4,
     pool_attn_dropout: float = 0.0,
     pool_proj_dropout: float = 0.0,
-    mil_agg: str = "topk_mean",
+    mil_agg: str = "multi",
     mil_hidden: int = 128,
     mil_k_top: int = 30,
+    gap_skip_cls: bool = False,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
+    if pooling_type == "gap":
+        return GAPPooling(dim=dim, skip_cls=gap_skip_cls)
     if pooling_type == "mean_var":
         return MeanVarPooling(dim=dim)
     if pooling_type == "mil":
@@ -321,11 +315,6 @@ def build_pooling(
             dim=dim, n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
-            attn_dropout=pool_attn_dropout, proj_dropout=pool_proj_dropout,
-        )
-    if pooling_type == "multihead_attention":
-        return MultiHeadAttentionPooling(
-            dim=dim, num_heads=num_heads,
             attn_dropout=pool_attn_dropout, proj_dropout=pool_proj_dropout,
         )
     raise ValueError(f"Unknown pooling_type: {pooling_type}")
@@ -406,10 +395,8 @@ class FaceOccRegressor(nn.Module):
         tau_diffuse_init: float = 1.5,
         tau_free_init: float = 1.0,
         learnable_tau: bool = True,
-        # Multi-head
-        num_heads: int = 4,
         # MIL
-        mil_agg: str = "topk_mean",
+        mil_agg: str = "multi",
         mil_hidden: int = 128,
         mil_k_top: int = 30,
         # Common pool regularization
@@ -440,7 +427,6 @@ class FaceOccRegressor(nn.Module):
             n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
-            num_heads=num_heads,
             mil_agg=mil_agg, mil_hidden=mil_hidden, mil_k_top=mil_k_top,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
         )

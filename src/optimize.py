@@ -60,7 +60,6 @@ _MODEL_KEYS = {
     "pretrained", "pretrained_source", "pooling_type",
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
-    "num_heads",
     "mil_agg", "mil_hidden", "mil_k_top",   # v13: MIL pooling
     "pool_attn_dropout", "pool_proj_dropout",
 }

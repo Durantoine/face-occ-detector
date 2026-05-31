@@ -313,11 +313,8 @@ def _render_trials_comparison() -> None:
         st.error("No MLflow experiments found.")
         return
 
-    # Default selection: v9 only (current sweep version on this branch).
-    # Fallback ladders: optuna-*-v9 → all optuna-* → all experiments. v6/v7/v8 et antérieurs
-    # restent sélectionnables manuellement via le multiselect.
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v10$")
+    _CURRENT_VERSION_RE = re.compile(r"-v14$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:
@@ -807,10 +804,9 @@ def _render_isotonic_effect() -> None:
         return
     exp_label_to_id = {f"{name} ({eid})": eid for eid, name in experiments}
     exp_labels = list(exp_label_to_id.keys())
-    # Default to v12 experiment if present
     default_idx = 0
     for i, label in enumerate(exp_labels):
-        if "v12" in label.lower():
+        if "v14" in label.lower():
             default_idx = i
             break
     selected_exp_label = st.sidebar.selectbox("Experiment", exp_labels, index=default_idx, key="pp_exp")

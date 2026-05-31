@@ -776,13 +776,211 @@ def _render_intra_trial(
 with st.sidebar:
     mode = st.radio(
         "Mode",
-        ["Trials comparison (live)", "Qualitative viewer (per-run)"],
+        ["Trials comparison (live)", "Qualitative viewer (per-run)", "Isotonic effect (test holdout)"],
         index=0,
     )
     st.divider()
 
 if mode == "Trials comparison (live)":
     _render_trials_comparison()
+    st.stop()
+
+
+def _render_isotonic_effect() -> None:
+    """Visualize the effect of post-hoc isotonic calibration on the test holdout (v12+).
+
+    Requires the run to have logged artifacts qualitative/test_holdout_predictions.csv
+    and qualitative/isotonic_mapping.csv.
+    """
+    st.title("Isotonic calibration — effect on test holdout (5%)")
+    st.caption(
+        "Test holdout = ~5% des samples re-sampled to match P_test via H_C. "
+        "Post-hoc isotonic est fit sur val (iid P_train) puis applied au test holdout. "
+        "Cette vue compare pred RAW vs pred CORRIGÉE par isotonic."
+    )
+
+    experiments = _list_experiments(TRACKING_URI)
+    if not experiments:
+        st.error("No MLflow experiments found.")
+        return
+    exp_label_to_id = {f"{name} ({eid})": eid for eid, name in experiments}
+    selected_exp_label = st.sidebar.selectbox("Experiment", list(exp_label_to_id.keys()), key="iso_exp")
+    selected_exp_id = exp_label_to_id[selected_exp_label]
+
+    runs = _list_runs(TRACKING_URI, selected_exp_id)
+    if not runs:
+        st.warning("No runs in this experiment.")
+        return
+    runs = sorted(runs, key=lambda r: float(r.get("challenge_score") or float("inf")))
+
+    def _fmt(r: Dict[str, Any]) -> str:
+        s = r["challenge_score"]
+        score_str = f"{s:.5f}" if isinstance(s, (int, float)) else "n/a"
+        return f"{r['name']}  ·  score={score_str}"
+    selected_run = st.sidebar.selectbox("Run", runs, format_func=_fmt, key="iso_run")
+
+    folder_str = _download_qualitative(TRACKING_URI, selected_run["run_id"])
+    if not folder_str:
+        st.error("Pas d'artifact `qualitative/` dans ce run — test holdout pas activé "
+                 "(ajouter `test_split_ratio: 0.05` dans le yaml data).")
+        return
+    folder = Path(folder_str)
+    pred_csv = folder / "test_holdout_predictions.csv"
+    iso_csv = folder / "isotonic_mapping.csv"
+    if not pred_csv.exists():
+        st.error(f"Pas de `test_holdout_predictions.csv` dans {folder} — v11 ou avant probablement.")
+        return
+
+    df_pred = pd.read_csv(pred_csv)
+    df_iso = pd.read_csv(iso_csv) if iso_csv.exists() else None
+
+    # === Metrics summary ===
+    st.markdown("### Métriques test holdout")
+    cols = st.columns(4)
+    raw_score = _final_metric_value(TRACKING_URI, selected_run["run_id"], "test_holdout_score_raw")
+    iso_score = _final_metric_value(TRACKING_URI, selected_run["run_id"], "test_holdout_score_iso")
+    raw_diff = _final_metric_value(TRACKING_URI, selected_run["run_id"], "test_holdout_err_diff_raw")
+    iso_diff = _final_metric_value(TRACKING_URI, selected_run["run_id"], "test_holdout_err_diff_iso")
+    cols[0].metric("Score RAW", f"{raw_score:.5f}" if raw_score is not None else "n/a")
+    cols[1].metric("Score ISO", f"{iso_score:.5f}" if iso_score is not None else "n/a",
+                    delta=f"{(iso_score - raw_score):+.5f}" if (raw_score and iso_score) else None,
+                    delta_color="inverse")
+    cols[2].metric("err_diff RAW", f"{raw_diff:.5f}" if raw_diff is not None else "n/a")
+    cols[3].metric("err_diff ISO", f"{iso_diff:.5f}" if iso_diff is not None else "n/a",
+                    delta=f"{(iso_diff - raw_diff):+.5f}" if (raw_diff and iso_diff) else None,
+                    delta_color="inverse")
+    st.caption("Delta négatif (vert) = amélioration. Test holdout = ~4985 samples, distribution P_test.")
+
+    try:
+        import plotly.express as px
+        import plotly.graph_objects as go
+    except ImportError:
+        st.error("plotly required for these plots — pip install plotly")
+        return
+
+    # === 1. Isotonic mapping curves ===
+    if df_iso is not None and len(df_iso) > 0:
+        st.markdown("### 1. Courbe isotonic apprise (par gender)")
+        st.caption("Mapping pred_raw → pred_corrigé. Diagonale = pas de correction. F=Female, M=Male.")
+        fig_iso = go.Figure()
+        fig_iso.add_trace(go.Scatter(x=df_iso["x"], y=df_iso["x"], mode="lines",
+                                       name="Identity (y=x)", line=dict(color="gray", dash="dash")))
+        fig_iso.add_trace(go.Scatter(x=df_iso["x"], y=df_iso["iso_F"], mode="lines",
+                                       name="F isotonic", line=dict(color="tab:red", width=3)))
+        fig_iso.add_trace(go.Scatter(x=df_iso["x"], y=df_iso["iso_M"], mode="lines",
+                                       name="M isotonic", line=dict(color="tab:blue", width=3)))
+        fig_iso.update_layout(xaxis_title="pred_raw", yaxis_title="pred_corrigé (isotonic)",
+                                height=400, hovermode="x")
+        st.plotly_chart(fig_iso, use_container_width=True)
+
+    # === 2. Distributions pred RAW vs pred ISO vs GT vs P_test ref, par gender ===
+    st.markdown("### 2. Distribution des prédictions vs GT vs P_test (réf PDF), par gender")
+    st.caption("`P_test PDF` = distribution Y du test challenge extraite du PDF (15 bins). "
+                "C'est la cible vers laquelle on veut que les preds (et GT du holdout) convergent.")
+
+    # P_test reference (marginal Y) — same overlay on F and M panels
+    try:
+        from src.utils.distribution import _TEST_PMF, N_BINS as _NB, BIN_WIDTH as _BW
+        # Build a "density" version: density = mass / bin_width to overlay over histograms normalized as density
+        ref_x = np.array([(b + 0.5) * _BW for b in range(_NB)])
+        ref_density = np.asarray(_TEST_PMF) / _BW
+    except ImportError:
+        ref_x = ref_density = None
+
+    g_F = df_pred[df_pred["gender"] < 0.5]
+    g_M = df_pred[df_pred["gender"] >= 0.5]
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_F = go.Figure()
+        fig_F.add_trace(go.Histogram(x=g_F["pred_raw"], name="pred RAW", opacity=0.55, nbinsx=40,
+                                       marker_color="#d62728", histnorm="probability density"))
+        fig_F.add_trace(go.Histogram(x=g_F["pred_iso"], name="pred ISO", opacity=0.55, nbinsx=40,
+                                       marker_color="#ff7f0e", histnorm="probability density"))
+        fig_F.add_trace(go.Histogram(x=g_F["gt"], name="GT (holdout F)", opacity=0.35, nbinsx=40,
+                                       marker_color="gray", histnorm="probability density"))
+        if ref_x is not None:
+            fig_F.add_trace(go.Scatter(x=ref_x, y=ref_density, mode="lines+markers",
+                                         name="P_test PDF (réf marginal Y)",
+                                         line=dict(color="black", width=3, dash="dot"),
+                                         marker=dict(size=8, symbol="diamond")))
+        fig_F.update_layout(barmode="overlay", title=f"Female (n={len(g_F)})",
+                              xaxis_title="Y", yaxis_title="density", height=400,
+                              legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_F, use_container_width=True)
+    with c2:
+        fig_M = go.Figure()
+        fig_M.add_trace(go.Histogram(x=g_M["pred_raw"], name="pred RAW", opacity=0.55, nbinsx=40,
+                                       marker_color="#1f77b4", histnorm="probability density"))
+        fig_M.add_trace(go.Histogram(x=g_M["pred_iso"], name="pred ISO", opacity=0.55, nbinsx=40,
+                                       marker_color="#17becf", histnorm="probability density"))
+        fig_M.add_trace(go.Histogram(x=g_M["gt"], name="GT (holdout M)", opacity=0.35, nbinsx=40,
+                                       marker_color="gray", histnorm="probability density"))
+        if ref_x is not None:
+            fig_M.add_trace(go.Scatter(x=ref_x, y=ref_density, mode="lines+markers",
+                                         name="P_test PDF (réf marginal Y)",
+                                         line=dict(color="black", width=3, dash="dot"),
+                                         marker=dict(size=8, symbol="diamond")))
+        fig_M.update_layout(barmode="overlay", title=f"Male (n={len(g_M)})",
+                              xaxis_title="Y", yaxis_title="density", height=400,
+                              legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig_M, use_container_width=True)
+
+    st.caption("Comment lire : si `pred ISO` (orange/cyan) suit mieux `P_test PDF` (noir pointillé) "
+                "que `pred RAW` (rouge/bleu), l'isotonic a rapproché la distribution prédite de la "
+                "référence test. `GT (holdout)` doit être cohérent avec `P_test PDF` (puisqu'on a "
+                "stratifié le holdout via H_C) — sert de sanity check du holdout.")
+
+    # === 3. Calibration plots: pred vs gt, before & after ===
+    st.markdown("### 3. Calibration (pred vs gt), avant/après isotonic")
+    st.caption("Points proches de y=x = bien calibré. Points au-dessus = sur-estimation, en-dessous = sous-estimation.")
+    c1, c2 = st.columns(2)
+    line_diag = go.Scatter(x=[0, 0.5], y=[0, 0.5], mode="lines", name="y=x",
+                              line=dict(color="black", dash="dash"))
+    with c1:
+        fig_raw = go.Figure()
+        fig_raw.add_trace(line_diag)
+        fig_raw.add_trace(go.Scatter(x=g_F["gt"], y=g_F["pred_raw"], mode="markers", name="F",
+                                       marker=dict(color="tab:red", size=4, opacity=0.4)))
+        fig_raw.add_trace(go.Scatter(x=g_M["gt"], y=g_M["pred_raw"], mode="markers", name="M",
+                                       marker=dict(color="tab:blue", size=4, opacity=0.4)))
+        fig_raw.update_layout(title="RAW: pred vs gt", xaxis_title="gt", yaxis_title="pred", height=400)
+        st.plotly_chart(fig_raw, use_container_width=True)
+    with c2:
+        fig_iso2 = go.Figure()
+        fig_iso2.add_trace(line_diag)
+        fig_iso2.add_trace(go.Scatter(x=g_F["gt"], y=g_F["pred_iso"], mode="markers", name="F",
+                                        marker=dict(color="tab:red", size=4, opacity=0.4)))
+        fig_iso2.add_trace(go.Scatter(x=g_M["gt"], y=g_M["pred_iso"], mode="markers", name="M",
+                                        marker=dict(color="tab:blue", size=4, opacity=0.4)))
+        fig_iso2.update_layout(title="ISO: pred vs gt", xaxis_title="gt", yaxis_title="pred", height=400)
+        st.plotly_chart(fig_iso2, use_container_width=True)
+
+    # === 4. Erreur per bin Y, before/after ===
+    st.markdown("### 4. MAE par bin Y, avant/après isotonic")
+    n_bins = 15
+    bin_w = 0.5 / n_bins
+    df_pred["bin"] = (df_pred["gt"] / bin_w).clip(0, n_bins - 1).astype(int)
+    df_pred["err_raw"] = (df_pred["pred_raw"] - df_pred["gt"]).abs()
+    df_pred["err_iso"] = (df_pred["pred_iso"] - df_pred["gt"]).abs()
+    grp = df_pred.groupby(["bin", df_pred["gender"] < 0.5]).agg(
+        mae_raw=("err_raw", "mean"), mae_iso=("err_iso", "mean"), n=("err_raw", "count")
+    ).reset_index()
+    grp["gender_label"] = grp["gender"].map({True: "F", False: "M"})
+    grp["bin_center"] = grp["bin"] * bin_w + bin_w / 2
+    grp["mae_delta"] = grp["mae_iso"] - grp["mae_raw"]
+    fig_mae = px.bar(grp, x="bin_center", y="mae_delta", color="gender_label",
+                       title="MAE_iso - MAE_raw par bin (négatif = amélioration)",
+                       labels={"mae_delta": "Δ MAE", "bin_center": "Y bin center", "gender_label": "Gender"},
+                       barmode="group", height=400)
+    fig_mae.add_hline(y=0, line_dash="dash", line_color="black")
+    st.plotly_chart(fig_mae, use_container_width=True)
+
+    with st.expander("Raw data (preview)"):
+        st.dataframe(df_pred.head(50), use_container_width=True)
+
+
+if mode == "Isotonic effect (test holdout)":
+    _render_isotonic_effect()
     st.stop()
 
 # === Qualitative viewer (legacy) ===

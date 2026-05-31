@@ -1,10 +1,19 @@
-name: sapiens2-01b-3090-v11
+name: dinov3-vitb16-3090-v12
 description: |
-  Sapiens2-0.1B v11 — mirror of dinov3-vitb16 v11.
-  See dinov3-vitb16-3090-v11.yaml for rationale.
+  DINOv3 ViT-B/16 (86M) v12 — refinements on top of v11.
+
+  Changes vs v11:
+    - K-query HPO ranges RESTORED to v4 (n_focal/n_diffuse [1,4], n_free [0,3],
+      dropouts [0, 0.3], tau_focal [0.05, 0.3], tau_diffuse [1, 3]) — v11 had tightened
+      these which reduced exploration of configs that produced v4's best (0.0012).
+    - DANN re-added to feature_fairness choices ({none, ot, dann}); MMD stays removed.
+      adv_lambda back in HPO conditional.
+    - min_lr_rate: 0.1 -> 0.3 (gentler cosine decay; v11 decayed too aggressively).
+    - logging_steps: 200 -> 25 (faster MLflow refresh; safe with non-blocking writes).
+    - ema_decay: 0.999 (restored; was temporarily disabled in v11 for debug).
 
 model:
-  model_name: sapiens2_0.1b
+  model_name: dinov3_vitb16
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
@@ -29,23 +38,27 @@ data:
   image_base_dir: data/raw
   data_csv: data/raw/train.csv
   extra_train_csv: null
+  # Tri-split v12: train iid 80% / val iid 15% (stratified IS metric) / test holdout 5%
+  # (match P_test via H_C) — see docs/v12_theory.md §3 for rationale.
   val_split_ratio: 0.15
+  test_split_ratio: 0.05
 
 training:
   per_device_train_batch_size: 128
   per_device_eval_batch_size: 256
   gradient_accumulation_steps: 1
-  num_train_epochs: 8
+  num_train_epochs: 13   # PINNED v12 (was HPO [7,13]). Rationale: decouple from LR shape;
+                          # rely on early_stopping_patience=3 for actual duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
   warmup_ratio: 0.1
   lr_scheduler_type: cosine_with_min_lr
   lr_scheduler_kwargs:
-    min_lr_rate: 0.1
+    min_lr_rate: 0.3   # HPO override via top-level `min_lr_rate` in training section (see below)
   max_grad_norm: 1.0
   early_stopping_patience: 3
   seed: 42
-  logging_steps: 25   # MLflow refresh granularity (was 200). Safe with try/except non-blocking writes.
+  logging_steps: 25
   metric_for_best_model: eval_challenge_score
   greater_is_better: false
   bf16: true
@@ -65,16 +78,16 @@ training:
 optuna:
   n_trials: 100
   objective_mode: score
-  rotate_val_seed: true
+  rotate_val_seed: false   # v12 (was true): fix seed so all trials see SAME val split.
+                            # Enables ensemble + isotonic on common val without retraining.
+                            # Variance protection via large val (15k) + stratified IS + test holdout.
   keep_top_n: 3
   search_space:
     pretrained_source:
       type: categorical
       choices:
-        - "sapiens_default"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_50000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
+        - "lvd"
+        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder"
     pooling_type:
       type: categorical
       choices: [cls, attention_k_query, multihead_attention]
@@ -84,7 +97,7 @@ optuna:
 
     feature_fairness:
       type: categorical
-      choices: [none, ot]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
       low: 0.01
@@ -92,26 +105,39 @@ optuna:
       log: true
       conditional_on:
         feature_fairness: ot
+    adv_lambda:
+      type: float
+      low: 0.001
+      high: 0.05
+      log: true
+      conditional_on:
+        feature_fairness: dann
 
     loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
 
-    learning_rate: {type: float, low: 1.5e-05, high: 4.0e-04, log: true}
-    num_train_epochs: {type: int, low: 6, high: 12}
+    # LR + LLRD ranges informed by v11 trials analysis:
+    # - LR > 2e-4 with layer_decay > 0.9 causes divergence (loss > 0.03)
+    # - Sweet spot: LR ∈ [1e-4, 2.1e-4] with layer_decay ∈ [0.75, 0.87]
+    # - Hence: cap LR at 2e-4 AND layer_decay at 0.9 (was 1.0)
+    learning_rate: {type: float, low: 1.0e-05, high: 2.0e-04, log: true}
+    # num_train_epochs PINNED at 13 (max), early_stopping_patience=3 decides real duration.
+    # LR scheduler shape decoupled via min_lr_rate HPO.
+    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
     weight_decay:  {type: float, low: 0.05, high: 0.50}
     head_dropout:  {type: float, low: 0.0, high: 0.4}
     backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
-    layer_decay:   {type: float, low: 0.65, high: 1.0}
+    layer_decay:   {type: float, low: 0.65, high: 0.9}
 
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.5
+      high: 0.3
       conditional_on:
         pooling_type: [attention_k_query, multihead_attention]
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.5
+      high: 0.3
       conditional_on:
         pooling_type: [attention_k_query, multihead_attention]
 
@@ -123,38 +149,38 @@ optuna:
         pooling_type: attention_k_query
     tau_focal_init:
       type: float
-      low: 0.08
+      low: 0.03   # was 0.05; allow sharper attention (1-2 patches). bf16 safe limit
       high: 0.3
       log: true
       conditional_on:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 1.0
-      high: 4.0
+      low: 0.5   # was 1.0; allow transition focal↔diffuse
+      high: 3.0
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
       type: int
       low: 1
-      high: 3
+      high: 4
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
-      low: 1
-      high: 3
+      low: 0   # was 1; allow no diffuse queries (pure focal+free config)
+      high: 4
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 2
+      high: 3
       conditional_on:
         pooling_type: attention_k_query
 
     num_heads:
       type: categorical
-      choices: [2, 4, 8, 16]
+      choices: [2, 4, 8, 12]   # 12 = match ViT-B native heads (head_dim=64)
       conditional_on:
         pooling_type: multihead_attention

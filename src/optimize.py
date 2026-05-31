@@ -50,6 +50,8 @@ _TRAINING_KEYS = {
     "loss_query_diversity_lambda",
     "layer_decay",
     "ema_decay",
+    "min_lr_rate",   # v12: HPO override of lr_scheduler_kwargs.min_lr_rate
+    "early_stopping_patience",
 }
 
 _MODEL_KEYS = {

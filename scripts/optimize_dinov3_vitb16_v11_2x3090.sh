@@ -37,6 +37,10 @@ source "${VENV_DIR}/bin/activate"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+# Raise file descriptor limit — DataLoader workers accumulate shared-memory handles
+# across trials. Default ~1024 exhausted after ~10 trials → "Too many open files" hang.
+ulimit -n 65536 || ulimit -n 8192
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=2
 export NCCL_ASYNC_ERROR_HANDLING=1

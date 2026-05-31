@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-sapiens2-01b-v11-optuna
+#SBATCH --job-name=face-occ-sapiens2-01b-v12-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,15 +11,15 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - Sapiens2-0.1B (114M) v11 - Back to v3 fundamentals (2x 3090, BF16)"
-echo "  ▶ 15 bins x 0.0333 (re-extracted from PDF via pixel reading)"
-echo "  ▶ sample_weight normalized to mean=1 (v3 trick)"
-echo "  ▶ aug_share / replication REMOVED (v3/v4 winning recipe used none)"
-echo "  ▶ LLRD restored (layer_decay HPO in [0.65, 0.95])"
-echo "  ▶ clip lowered 20 -> 10, focal range [0, 1.5]"
+echo "OPTUNA HPO - Sapiens2-0.1B (114M) v12 - v11 refinements (2x 3090, BF16)"
+echo "  ▶ Refinements vs v11:"
+echo "    - K-query HPO ranges restored to v4 (more exploration)"
+echo "    - DANN re-added to feature_fairness {none, ot, dann}"
+echo "    - min_lr_rate 0.1 -> 0.3 (gentler cosine decay)"
+echo "    - logging_steps 200 -> 25 (faster MLflow refresh)"
 echo "================================================================================"
-echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
-echo "Started: $(date)"
+echo "Node: \$(hostname) | Job ID: \$SLURM_JOB_ID | GPUs: \$CUDA_VISIBLE_DEVICES"
+echo "Started: \$(date)"
 echo "================================================================================"
 
 PROJECT_DIR="${HOME}/face-occ-detector"
@@ -38,9 +38,10 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
-# Raise file descriptor limit — DataLoader workers accumulate shared-memory handles
-# across trials. Default ~1024 exhausted after ~10 trials → "Too many open files" hang.
-ulimit -n 65536 || ulimit -n 8192
+# Raise file descriptor limit — PyTorch DataLoader workers accumulate shared-memory
+# handles across trials. Default ~1024-4096 exhausted after ~10 trials → "Too many
+# open files" hang. Use 65536 (max often allowed without root).
+ulimit -n 65536 || ulimit -n 8192   # fallback if 65536 forbidden
 export NCCL_IB_DISABLE=1
 export OMP_NUM_THREADS=2
 export NCCL_ASYNC_ERROR_HANDLING=1
@@ -48,7 +49,7 @@ export TORCH_NCCL_BLOCKING_WAIT=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=3600
 
-export FACE_OCC_ARCH=sapiens2-01b-3090-v11
+export FACE_OCC_ARCH=sapiens2-01b-3090-v12
 
 mkdir -p scripts/logs
 

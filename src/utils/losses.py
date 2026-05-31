@@ -1,76 +1,24 @@
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+# v12: distribution utilities centralized in src.utils.distribution. Re-export here
+# for backward compat with code that does `from src.utils.losses import N_BINS, ...`.
+from src.utils.distribution import (  # noqa: F401
+    N_BINS,
+    BIN_WIDTH,
+    _TEST_PMF,
+    compute_target_weights,
+    empirical_pmf_y as compute_empirical_pmf,
+    empirical_pmf_joint as compute_empirical_pmf_cell,
+)
 
-N_BINS = 15
-BIN_WIDTH = 0.5 / N_BINS
-
-_TEST_PMF = np.array([
-    0.118034,
-    0.092728,
-    0.092810,
-    0.108154,
-    0.102878,
-    0.094643,
-    0.106911,
-    0.091066,
-    0.079910,
-    0.054407,
-    0.034125,
-    0.015720,
-    0.005424,
-    0.002145,
-    0.001046,
-], dtype=np.float64)
-_TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
-
-
-def compute_empirical_pmf(targets: np.ndarray, n_bins: int = N_BINS, bin_width: float = BIN_WIDTH) -> np.ndarray:
-    edges = np.linspace(0.0, n_bins * bin_width, n_bins + 1)
-    y = np.clip(np.asarray(targets, dtype=np.float64), 0.0, edges[-1] - 1e-9)
-    hist, _ = np.histogram(y, bins=edges)
-    return hist.astype(np.float64) / max(hist.sum(), 1)
-
-
-def compute_empirical_pmf_cell(
-    targets: np.ndarray, gender: np.ndarray,
-    n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
-) -> np.ndarray:
-    g = (np.asarray(gender) >= 0.5).astype(int)
-    b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
-    counts = np.zeros((2, n_bins), dtype=np.float64)
-    for gi, bi in zip(g, b):
-        counts[gi, bi] += 1
-    return counts / max(counts.sum(), 1)
-
-
-def compute_target_weights(
-    targets: np.ndarray, gender: np.ndarray,
-    axis1_power: float, axis2_power: float,
-    n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
-    test_pmf_y: np.ndarray = _TEST_PMF,
-    clip: float = 10.0,
-) -> np.ndarray:
-    g = (np.asarray(gender) >= 0.5).astype(int)
-    b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
-    p_joint = compute_empirical_pmf_cell(targets, gender, n_bins=n_bins, bin_width=bin_width)
-    p_train_y = p_joint.sum(axis=0)
-    safe_y = np.maximum(p_train_y, 1e-9)
-    p_train_g_given_y = p_joint / safe_y[None, :]
-
-    p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
-    uniform_g = np.full_like(p_train_g_given_y, 0.5)
-    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * uniform_g
-    p_target_joint = p_target_y[None, :] * p_target_g_given_y
-
-    ratio = p_target_joint / np.maximum(p_joint, 1e-9)
-    ratio = np.clip(ratio, 1.0 / clip, clip)
-    sample_w = ratio[g, b]
-    sample_w = sample_w / max(float(sample_w.mean()), 1e-9)
-    return sample_w.astype(np.float32)
+__all__ = [
+    "N_BINS", "BIN_WIDTH", "_TEST_PMF",
+    "compute_target_weights", "compute_empirical_pmf", "compute_empirical_pmf_cell",
+    "WeightedMSELoss", "mmd_rbf", "sliced_wasserstein",
+]
 
 
 class WeightedMSELoss(nn.Module):

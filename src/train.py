@@ -9,7 +9,17 @@ import mlflow
 import numpy as np
 import pandas as pd
 import torch
+import torch.multiprocessing as torch_mp
 from mlflow.tracking import MlflowClient
+
+# Use file_system sharing instead of file_descriptor. Across Optuna trials, DataLoader
+# workers spawn shared-memory handles that don't get cleaned up properly between
+# trials → exhausts FD limit after ~10 trials → "Too many open files" hang.
+# file_system uses named files (unbounded), bypassing FD limit entirely.
+try:
+    torch_mp.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 from transformers import (
     EarlyStoppingCallback,
     Trainer,
@@ -59,6 +69,7 @@ _NON_HF_TRAIN_KEYS = {
     "save_qualitative_k",
     "layer_decay",
     "ema_decay",
+    "min_lr_rate",   # v12: top-level HPO param injected into lr_scheduler_kwargs below
 }
 
 
@@ -370,12 +381,16 @@ def _load_train_val(
     data_csv: Optional[str],
     val_data_csv: Optional[str],
     seed: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Returns (train, val, test_holdout). test_holdout is empty unless
+    test_split_ratio > 0 in the data yaml section.
+    """
     image_col = data_cfg.get("image_col", DEFAULT_IMAGE_COL)
     label_col = data_cfg.get("label_col", DEFAULT_LABEL_COL)
     gender_col = data_cfg.get("gender_col", DEFAULT_GENDER_COL)
     extra_train = data_cfg.get("extra_train_csv")
-    val_split_ratio = float(data_cfg.get("val_split_ratio", 0.12))
+    val_split_ratio = float(data_cfg.get("val_split_ratio", 0.15))
+    test_split_ratio = float(data_cfg.get("test_split_ratio", 0.0))
 
     train_path = _resolve_data_path(data_cfg, data_csv)
     if not train_path:
@@ -383,12 +398,13 @@ def _load_train_val(
 
     common = dict(image_col=image_col, label_col=label_col, gender_col=gender_col)
     if val_data_csv:
-        train_df, _ = _load_data(train_path, **common, extra_train_csv=extra_train, split_ratio=0)
-        val_df, _ = _load_data(val_data_csv, **common, split_ratio=0)
+        train_df, _, _ = _load_data(train_path, **common, extra_train_csv=extra_train, split_ratio=0)
+        val_df, _, _ = _load_data(val_data_csv, **common, split_ratio=0)
         print(f"Pre-split: train={len(train_df):,} val={len(val_df):,}")
-        return train_df, val_df
+        return train_df, val_df, pd.DataFrame()
 
-    return _load_data(train_path, **common, extra_train_csv=extra_train, seed=seed, split_ratio=val_split_ratio)
+    return _load_data(train_path, **common, extra_train_csv=extra_train, seed=seed,
+                       split_ratio=val_split_ratio, test_split_ratio=test_split_ratio)
 
 
 def _build_datasets(
@@ -428,11 +444,18 @@ def _build_datasets(
         image_base_dir=image_base_dir,
         transform=None,
     )
+    # Target mean weighted by sample_weights — used to init head bias optimally for the
+    # TARGET distribution of this trial (depends on axis1_power, axis2_power, not just train).
+    # axis1=0 → equals E[Y_train]; axis1=1 → equals E[Y_test] ≈ 2 × E[Y_train] for our task.
+    target_mean_weighted = float((targets_arr * loss_weights).sum() / max(loss_weights.sum(), 1e-9))
+
     summary = {
         "loss_weight_min": float(loss_weights.min()),
         "loss_weight_max": float(loss_weights.max()),
         "loss_weight_mean": float(loss_weights.mean()),
         "loss_weight_std": float(loss_weights.std()),
+        "target_mean_weighted": target_mean_weighted,
+        "target_mean_unweighted": float(targets_arr.mean()),
     }
     return train_ds, val_ds, summary
 
@@ -662,11 +685,21 @@ def train(
     ml_log_params(client, run_id, dict(data_cfg))
 
     processor = get_image_processor(model_name)
-    train_data, val_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
+    train_data, val_data, test_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
     train_dataset, val_dataset, weight_summary = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
         axis1_power=axis1_power, axis2_power=axis2_power,
     )
+    test_holdout_dataset = None
+    if not test_data.empty:
+        test_holdout_dataset = FaceOccDataset(
+            image_paths=test_data["image_path"].tolist(),
+            targets=test_data["FaceOcclusion"].astype(float).tolist(),
+            genders=test_data["gender"].astype(float).tolist(),
+            processor=processor,
+            image_base_dir=image_base_dir,
+            transform=None,
+        )
     print(f"Loss weights summary: {weight_summary}")
     ml_log_metrics(client, run_id, weight_summary)
 
@@ -692,8 +725,13 @@ def train(
     })
 
     pretrained = bool(model_cfg.get("pretrained", True))
-    target_mean = float(train_data["FaceOcclusion"].mean())
-    print(f"Head bias init: target_mean={target_mean:.4f}  ->  bias=logit(mean)≈{np.log(max(target_mean,1e-6)/max(1-target_mean,1e-6)):.3f}")
+    # v12: head bias init via WEIGHTED target mean (adapts to axis1/axis2 of this trial).
+    # axis1=0 → E[Y_train]≈0.085 (init bias≈-2.40). axis1=1 → E[Y_test]≈0.165 (init bias≈-1.62).
+    # ~2× difference → init was previously biased toward train, gaspillait 1-2 epochs.
+    target_mean = float(weight_summary["target_mean_weighted"])
+    print(f"Head bias init: target_mean_weighted={target_mean:.4f}  "
+          f"(unweighted={weight_summary['target_mean_unweighted']:.4f})  ->  "
+          f"bias=logit(mean)≈{np.log(max(target_mean,1e-6)/max(1-target_mean,1e-6)):.3f}")
     model = (
         FaceOccRegressor.load_from_mlflow(resume_from_checkpoint, output_dim=output_dim)
         if resume_from_checkpoint
@@ -747,6 +785,13 @@ def train(
 
     forwarded = {k: v for k, v in train_cfg.items() if k not in _NON_HF_TRAIN_KEYS}
     forwarded.setdefault("fp16", False)
+
+    # v12: inject HPO-tuned min_lr_rate into lr_scheduler_kwargs (yaml is nested,
+    # HPO param is top-level, so we merge here).
+    if "min_lr_rate" in train_cfg:
+        existing_kwargs = dict(forwarded.get("lr_scheduler_kwargs") or {})
+        existing_kwargs["min_lr_rate"] = float(train_cfg["min_lr_rate"])
+        forwarded["lr_scheduler_kwargs"] = existing_kwargs
     if not torch.cuda.is_available():
         if forwarded.get("bf16") or forwarded.get("fp16"):
             print(f"WARNING: non-CUDA — disabling bf16/fp16")
@@ -783,7 +828,18 @@ def train(
     if use_client and client and run_id:
         callbacks.append(MlflowClientCallback(client, run_id))
 
-    compute_metrics = make_compute_metrics()
+    test_pmf_joint_val = None
+    if not test_data.empty:
+        from src.utils.distribution import estimate_test_pmf_joint, N_BINS, BIN_WIDTH
+        test_pmf_joint_val = estimate_test_pmf_joint(
+            targets=val_data["FaceOcclusion"].astype(float).values,
+            gender=val_data["gender"].astype(float).values,
+        )
+        print(f"Val: iid P_train. Metric uses stratified IS with test_pmf_joint built via H_C "
+              f"(see docs/v12_theory.md §3 — estimate_test_pmf_joint).")
+        compute_metrics = make_compute_metrics(test_pmf_joint=test_pmf_joint_val, bin_width=BIN_WIDTH, n_bins=N_BINS)
+    else:
+        compute_metrics = make_compute_metrics()
 
     gender_sampler = None
     if use_gender_sampler:
@@ -854,20 +910,134 @@ def train(
         gender = labels[:, 1] if (labels.ndim == 2 and labels.shape[1] >= 2) else np.zeros_like(gt)
 
     if preds is not None and trainer.is_world_process_zero():
-        from src.inference.isotonic import GenderConditionalIsotonic
+        from src.inference.calibrators import fit_all_calibrators
         from src.utils.metrics import compute_score
-        iso = GenderConditionalIsotonic().fit(preds, gt, gender)
-        preds_iso = iso.transform(preds, gender)
-        scores_iso = compute_score(preds_iso, gt, gender)
-        score_iso = float(scores_iso["challenge_score"])
-        print(f"  Post-hoc isotonic (val): score_raw={eval_score:.5f}  score_iso={score_iso:.5f}  "
-              f"err_F_iso={scores_iso['err_F']:.5f}  err_M_iso={scores_iso['err_M']:.5f}")
-        ml_log_metrics(client, run_id, {
-            "val_score_iso": score_iso,
-            "val_err_F_iso": float(scores_iso["err_F"]),
-            "val_err_M_iso": float(scores_iso["err_M"]),
-            "val_err_diff_iso": float(scores_iso["err_diff"]),
-        })
+
+        # Fit 3 calibrators on val (per-gender, IS-weighted):
+        #   isotonic (PAV), linear (Platt-like), pchip (monotone cubic spline)
+        cals = fit_all_calibrators(preds, gt, gender, use_is_weight=True)
+
+        # Always log val-side self-eval for diagnostic (BIASED upward — fit+eval same val).
+        for cal_name, cal in cals.items():
+            preds_cal = cal.transform(preds, gender)
+            scores_cal = compute_score(preds_cal, gt, gender)
+            ml_log_metrics(client, run_id, {
+                f"val_score_{cal_name}_self_eval": float(scores_cal["challenge_score"]),
+                f"val_err_F_{cal_name}_self_eval": float(scores_cal["err_F"]),
+                f"val_err_M_{cal_name}_self_eval": float(scores_cal["err_M"]),
+            })
+
+        # === True post-hoc validation on test holdout (if available) ===
+        if test_holdout_dataset is not None:
+            try:
+                test_pred_out = trainer.predict(test_holdout_dataset)
+                test_preds_raw = test_pred_out.predictions
+                if isinstance(test_preds_raw, (tuple, list)):
+                    test_preds_raw = test_preds_raw[0]
+                test_preds = np.asarray(test_preds_raw).astype(np.float64).flatten()
+                test_labels = np.asarray(test_pred_out.label_ids).astype(np.float64)
+                test_gt = test_labels[:, 0] if test_labels.ndim == 2 else test_labels.flatten()
+                test_gender = test_labels[:, 1] if (test_labels.ndim == 2 and test_labels.shape[1] >= 2) else np.zeros_like(test_gt)
+
+                # Test holdout already matches P_test (H_C) → use standard compute_score
+                test_scores_raw = compute_score(test_preds, test_gt, test_gender)
+
+                # Apply EACH calibrator and find the best on test holdout
+                test_scores_per_cal: Dict[str, Dict[str, float]] = {}
+                test_preds_per_cal: Dict[str, np.ndarray] = {}
+                for cal_name, cal in cals.items():
+                    test_preds_cal = cal.transform(test_preds, test_gender)
+                    test_scores_per_cal[cal_name] = compute_score(test_preds_cal, test_gt, test_gender)
+                    test_preds_per_cal[cal_name] = test_preds_cal
+
+                # Identify the winner among the 3 calibrators (lowest challenge_score)
+                best_cal_name = min(test_scores_per_cal,
+                                     key=lambda k: test_scores_per_cal[k]["challenge_score"])
+                best_scores = test_scores_per_cal[best_cal_name]
+                best_gain = test_scores_raw["challenge_score"] - best_scores["challenge_score"]
+
+                print(f"  Test holdout (n={len(test_preds)}, P_test dist):")
+                print(f"    raw            : score={test_scores_raw['challenge_score']:.5f}  "
+                      f"err_F={test_scores_raw['err_F']:.5f}  err_M={test_scores_raw['err_M']:.5f}  "
+                      f"diff={test_scores_raw['err_diff']:.5f}")
+                for cal_name in ("isotonic", "linear", "pchip"):
+                    if cal_name not in test_scores_per_cal:
+                        continue
+                    s = test_scores_per_cal[cal_name]
+                    gain_s = test_scores_raw["challenge_score"] - s["challenge_score"]
+                    marker = " ← BEST" if cal_name == best_cal_name else ""
+                    print(f"    {cal_name:14s}: score={s['challenge_score']:.5f}  "
+                          f"err_F={s['err_F']:.5f}  err_M={s['err_M']:.5f}  "
+                          f"diff={s['err_diff']:.5f}  (gain {gain_s:+.5f}){marker}")
+
+                # Log all per-calibrator metrics + best
+                log_metrics = {
+                    "test_holdout_n": float(len(test_preds)),
+                    "test_holdout_score_raw": float(test_scores_raw["challenge_score"]),
+                    "test_holdout_err_F_raw": float(test_scores_raw["err_F"]),
+                    "test_holdout_err_M_raw": float(test_scores_raw["err_M"]),
+                    "test_holdout_err_diff_raw": float(test_scores_raw["err_diff"]),
+                    "test_holdout_mae_pct_raw": float(test_scores_raw["mae_pct"]),
+                    "test_holdout_r2_raw": float(test_scores_raw["r2"]),
+                    "test_holdout_score_best_cal": float(best_scores["challenge_score"]),
+                    "test_holdout_err_F_best_cal": float(best_scores["err_F"]),
+                    "test_holdout_err_M_best_cal": float(best_scores["err_M"]),
+                    "test_holdout_best_cal_gain": float(best_gain),
+                }
+                for cal_name, s in test_scores_per_cal.items():
+                    log_metrics[f"test_holdout_score_{cal_name}"] = float(s["challenge_score"])
+                    log_metrics[f"test_holdout_err_F_{cal_name}"] = float(s["err_F"])
+                    log_metrics[f"test_holdout_err_M_{cal_name}"] = float(s["err_M"])
+                    log_metrics[f"test_holdout_err_diff_{cal_name}"] = float(s["err_diff"])
+                ml_log_metrics(client, run_id, log_metrics)
+
+                # Save per-sample predictions + calibrator mappings for UI viz
+                try:
+                    qual_root = Path(output_dir) / "qualitative"
+                    qual_root.mkdir(parents=True, exist_ok=True)
+
+                    # Per-sample preds (all calibrators)
+                    test_df_dict = {"gt": test_gt, "pred_raw": test_preds, "gender": test_gender}
+                    for cal_name, p_cal in test_preds_per_cal.items():
+                        test_df_dict[f"pred_{cal_name}"] = p_cal
+                    test_df_dict["best_cal"] = [best_cal_name] * len(test_preds)
+                    test_csv = qual_root / "test_holdout_predictions.csv"
+                    pd.DataFrame(test_df_dict).to_csv(test_csv, index=False)
+
+                    # Calibrator mappings (apply each to a grid for plotting)
+                    grid = np.linspace(0.0, 1.0, 200)
+                    grid_gender_F = np.zeros_like(grid)
+                    grid_gender_M = np.ones_like(grid)
+                    mapping_df = {"x": grid}
+                    for cal_name, cal in cals.items():
+                        mapping_df[f"{cal_name}_F"] = cal.transform(grid, grid_gender_F)
+                        mapping_df[f"{cal_name}_M"] = cal.transform(grid, grid_gender_M)
+                    cal_curve_csv = qual_root / "calibrator_mappings.csv"
+                    pd.DataFrame(mapping_df).to_csv(cal_curve_csv, index=False)
+
+                    # Legacy isotonic_mapping.csv kept for UI backward-compat
+                    iso_curve_csv = qual_root / "isotonic_mapping.csv"
+                    if "isotonic" in cals:
+                        pd.DataFrame({"x": grid,
+                                       "iso_F": mapping_df["isotonic_F"],
+                                       "iso_M": mapping_df["isotonic_M"]}).to_csv(iso_curve_csv, index=False)
+
+                    if use_mlflow:
+                        if use_client and client and run_id:
+                            client.log_artifact(run_id, str(test_csv), "qualitative")
+                            client.log_artifact(run_id, str(cal_curve_csv), "qualitative")
+                            if iso_curve_csv.exists():
+                                client.log_artifact(run_id, str(iso_curve_csv), "qualitative")
+                        elif mlflow.active_run():
+                            mlflow.log_artifact(str(test_csv), "qualitative")
+                            mlflow.log_artifact(str(cal_curve_csv), "qualitative")
+                            if iso_curve_csv.exists():
+                                mlflow.log_artifact(str(iso_curve_csv), "qualitative")
+                    print(f"  Saved test holdout preds ({len(test_preds)} rows, {len(cals)} calibrators) + mappings to MLflow artifact")
+                except Exception as e_save:
+                    print(f"  WARNING: could not save test holdout artifacts: {e_save}")
+            except Exception as e_test:
+                print(f"WARNING: test holdout eval failed: {e_test}")
 
     save_qualitative_k = int(train_cfg.get("save_qualitative_k", 0))
     if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():

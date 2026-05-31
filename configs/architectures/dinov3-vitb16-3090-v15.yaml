@@ -101,6 +101,9 @@ optuna:
 
     axis1_power: {type: float, low: 0.0, high: 1.0}
     axis2_power: {type: float, low: 0.0, high: 1.0}
+    # Fraction of the axis1+axis2 correction carried by the sampler (vs loss IS weights).
+    # 0 = loss does all, 1 = sampler does all, in-between = split.
+    sampler_participation: {type: float, low: 0.0, high: 1.0}
 
     feature_fairness:
       type: categorical

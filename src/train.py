@@ -33,7 +33,6 @@ from src.data.dataset import (
     DEFAULT_LABEL_COL,
     FaceOccDataset,
     _load_data,
-    create_gender_balanced_sampler,
 )
 from src.data.transforms import build_train_transform
 from src.models.dinov3_loader import get_image_processor
@@ -41,7 +40,7 @@ from src.models.face_occ_regressor import FaceOccRegressor
 from src.training.callbacks import MlflowClientCallback
 from src.utils.config import load_architecture_config
 from src.utils.environment import setup_environment
-from src.utils.losses import WeightedMSELoss, compute_target_weights
+from src.utils.losses import WeightedMSELoss
 from src.utils.metrics import make_compute_metrics
 from src.utils.mlflow_utils import log_metrics as ml_log_metrics
 from src.utils.mlflow_utils import log_params as ml_log_params
@@ -64,7 +63,7 @@ _NON_HF_TRAIN_KEYS = {
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
     "loss_lambda_threshold",
-    "axis1_power", "axis2_power",
+    "axis1_power", "axis2_power", "sampler_participation",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
     "loss_query_diversity_lambda",
     "save_qualitative_k",
@@ -487,16 +486,19 @@ def _build_datasets(
     augmentation_level: str,
     axis1_power: float,
     axis2_power: float,
-) -> Tuple[FaceOccDataset, FaceOccDataset, Dict[str, float]]:
+    sampler_participation: float = 0.0,
+) -> Tuple[FaceOccDataset, FaceOccDataset, Dict[str, float], np.ndarray]:
     transform = build_train_transform(augmentation_level)
     targets_arr = train_data["FaceOcclusion"].astype(float).values
     gender_arr = train_data["gender"].astype(float).values
 
-    loss_weights = compute_target_weights(
+    from src.utils.distribution import compute_balancing_weights
+    sampler_weights, loss_weights = compute_balancing_weights(
         targets=targets_arr,
         gender=gender_arr,
         axis1_power=axis1_power,
         axis2_power=axis2_power,
+        sampler_participation=sampler_participation,
     )
 
     train_ds = FaceOccDataset(
@@ -526,10 +528,13 @@ def _build_datasets(
         "loss_weight_max": float(loss_weights.max()),
         "loss_weight_mean": float(loss_weights.mean()),
         "loss_weight_std": float(loss_weights.std()),
+        "sampler_weight_min": float(sampler_weights.min()),
+        "sampler_weight_max": float(sampler_weights.max()),
+        "sampler_weight_std": float(sampler_weights.std()),
         "target_mean_weighted": target_mean_weighted,
         "target_mean_unweighted": float(targets_arr.mean()),
     }
-    return train_ds, val_ds, summary
+    return train_ds, val_ds, summary, sampler_weights
 
 
 def _start_or_attach_run(
@@ -736,6 +741,7 @@ def train(
 
     axis1_power = float(train_cfg.get("axis1_power", 0.0))
     axis2_power = float(train_cfg.get("axis2_power", 0.0))
+    sampler_participation = float(train_cfg.get("sampler_participation", 0.0))
     layer_decay = float(train_cfg.get("layer_decay", 1.0))
 
     feature_fairness = str(train_cfg.get("feature_fairness", "none"))
@@ -745,7 +751,6 @@ def train(
     mmd_lambda = float(train_cfg.get("mmd_lambda", 0.0)) if mmd_active else 0.0
     adv_lambda = float(train_cfg.get("adv_lambda", 0.01)) if dann_active else 0.0
     ot_lambda = float(train_cfg.get("ot_lambda", 0.0)) if ot_active else 0.0
-    use_gender_sampler = feature_fairness != "none"
 
     client, run_id, use_client = _start_or_attach_run(
         cfg, mlflow_tracking_uri, mlflow_run_id, mlflow_experiment, use_mlflow,
@@ -766,10 +771,15 @@ def train(
     image_size = model_cfg.get("image_size")
     processor = get_image_processor(model_name, image_size=image_size)
     train_data, val_data, test_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
-    train_dataset, val_dataset, weight_summary = _build_datasets(
+    train_dataset, val_dataset, weight_summary, sampler_weights = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
         axis1_power=axis1_power, axis2_power=axis2_power,
+        sampler_participation=sampler_participation,
     )
+    # Use WeightedRandomSampler when sampler does any of the correction (sp > 0).
+    # Weights derive from compute_balancing_weights so the math (sampler_target = lerp
+    # between P_train and P_target) is consistent with what the loss expects via P_batch.
+    use_gender_sampler = sampler_participation > 0.0
     test_holdout_dataset = None
     if not test_data.empty:
         test_holdout_dataset = FaceOccDataset(
@@ -925,11 +935,23 @@ def train(
 
     gender_sampler = None
     if use_gender_sampler:
-        gender_sampler = create_gender_balanced_sampler(
-            gender=train_data["gender"].astype(float).values,
-            seed=val_seed or seed,
+        from src.data.dataset import DistributedWeightedSampler
+        # DDP-aware: each rank draws disjoint shards from the SAME global weighted
+        # multinomial sequence (vs vanilla WeightedRandomSampler which would duplicate
+        # samples across ranks).
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        gender_sampler = DistributedWeightedSampler(
+            weights=sampler_weights,
+            num_samples=len(sampler_weights),
+            num_replicas=max(world_size, 1),
+            rank=max(local_rank, 0),
+            seed=int(val_seed or seed),
+            replacement=True,
         )
-        print(f"Gender-balanced WeightedRandomSampler enabled (feature_fairness={feature_fairness})")
+        print(f"DistributedWeightedSampler enabled (sp={sampler_participation:.2f}, "
+              f"axis1={axis1_power:.2f}, axis2={axis2_power:.2f}, "
+              f"world_size={world_size}, rank={local_rank})")
 
     ema_cb: Optional[EMAWeightCallback] = None
     ema_best_tracker: Optional[EMABestTracker] = None

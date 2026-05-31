@@ -644,3 +644,118 @@ Script `scripts/estimate_test_gender.py` fait déjà le MID lookup (validation $
 | Group fairness impossibility | Chouldechova 2017 |
 
 Voir [references.md](references.md) pour bibliographie complète.
+
+## 12. Changements v13 → v15 (récap)
+
+### 12.1 Pooling — refacto complet ([src/models/face_occ_regressor.py](../src/models/face_occ_regressor.py))
+
+5 options dispo (v15) :
+
+| pooling_type | Output | Description |
+|---|---|---|
+| `cls` | (B, D) | Token CLS du Transformer — natif ViT, **default DINOv3/Sapiens** |
+| `gap` | (B, D) | Global Average Pool sur patches — natif CNN, **default EfficientNet**. `skip_cls=has_cls` géré auto (skip token 0 pour ViT) |
+| `mean_var` | (B, 2D) | `concat(mean, std)` sur patches — capture stats globales (utile pour flou). `skip_cls=has_cls` auto |
+| `attention_k_query` | (B, K·D) | K queries learnable avec température par-query (focal/diffuse/free), softmax(q·k / √D·τ) |
+| `mil` | (B, 4) ou (B, 1) | Multi-Instance Learning (voir §12.1.1) |
+
+**Retiré v15** : `multihead_attention` (`MultiHeadAttentionPooling` class) — redondant avec K-query, jamais utilisé en HPO.
+
+#### 12.1.1 MIL — refonte v15
+
+Per-patch scoring head produit `score_i ∈ R` (2-layer MLP). 5 aggregations :
+
+| `mil_agg` | Mécanisme | Force |
+|---|---|---|
+| `mean` | `mean(scores)` | Flou / signal uniforme |
+| `max` | `max(scores)` | Occlusion sparse extrême |
+| `topk_mean` | `mean(topK(scores))`, `K=mil_k_top` | Sparse robuste (anti-noise) |
+| `attention` | **Gated attention** (Ilse 2018) : `softmax(w·(tanh(V·h) ⊙ σ(U·h)))` puis `sum(α·scores)`. Head séparée du scorer | Apprend où regarder |
+| **`multi` (default)** | Concat des 4 → (B, 4). Head linear apprend la mix | Capte sparse + flou simultanément |
+
+**Bug fix v15** : ancienne `attention` agg faisait `sum(softmax(scores) · scores)` = Boltzmann smooth-max (auto-pondération des scores). Maintenant attention **découplée** : head séparée avec params dédiés `attn_V, attn_U, attn_w`. Conforme Ilse et al. 2018 "Attention-based Deep MIL".
+
+**Multi-aggregation (default)** : `mil_agg=multi` concat les 4 aggs → feature (B, 4) → `Linear(4, output_dim)` apprend la pondération. Résout le tradeoff "either/or" (occlusion sparse vs flou global captés simultanément).
+
+### 12.2 Calibration — 5 calibrators (v14+v15)
+
+| Nom | Type | Description |
+|---|---|---|
+| `isotonic` | PAV (Best 1955) | Monotone piecewise-constant, par-gender, IS-weighted |
+| `linear` | Platt regression | `y = a·pred + b`, 2 params/gender, closed-form WLS |
+| `pchip` | PCHIP spline (Fritsch-Carlson) | Monotone cubic Hermite, ~20 knots, plus smooth qu'isotonic |
+| `isotonic_regime` (v14) | Per-(g × y-regime) | Splits gt en y<0.20 / y≥0.20, fit 1 isotonic/régime, blend linéaire smooth dans [0.15, 0.25] (`blend_halfwidth=0.05`). Stretch high-y tail |
+| `isotonic_tailboost` (v15) | Single isotonic, weights boostés | `w_i = (1/30+y) × IS_ratio × (1 + boost · max(0, y-y_pivot))`. Pas de boundary, pas d'artefact géométrique. `y_pivot=0.20, boost=5.0` |
+
+**Alpha-blend scan** : `pred_blend = α·cal(pred) + (1-α)·raw` pour `α ∈ [0, 1.5]` step 0.1 (16 valeurs). `α > 1` overshoot, utile quand isotonic est conservatrice sur la queue.
+
+**Sélection** : `(cal, α)` optimal pour la **submission** choisi sur val IS-stratifié. Métriques per-cal aussi loggées (`best_alpha_<cal>` MLflow).
+
+**Ensemble** : appliquer la calibration **APRÈS** l'ensemble — `cal(mean(preds_i))` plutôt que `mean(cal_i(preds_i))`. Détails §4.9.
+
+### 12.3 Lagrangien — fix v14 (threshold + descente)
+
+Bug v11-v13 : update `λ_{t+1} = clip(λ_t + lr · err_diff_ema, 0, λ_max)`. `err_diff_ema ≥ 0` toujours → λ ne fait que monter, sature à `λ_max=5` dès epoch 2.
+
+**Fix v14** : ajout `lambda_threshold ε = 0.0005` :
+```
+λ_{t+1} = clip(λ_t + lr · (err_diff_ema - ε), 0, λ_max)
+  err_diff > ε  → contrainte violée → λ monte
+  err_diff < ε  → contrainte satisfaite → λ descend (vrai Lagrangien)
+```
+
+### 12.4 EMA tracker — refacto v14+v15
+
+**Bug v13** : `MLflowClientCallback.on_log` recevait `eval_*` (chosen min de raw/EMA par epoch) = série qui alterne entre 2 valeurs → graph en dents de scie.
+
+**Fix v15** : `evaluate()` appelle 2× `super().evaluate()` avec `metric_key_prefix="eval"` (live) puis `metric_key_prefix="ema"` (EMA shadow). HF log direct chaque appel sous son préfixe → **2 séries MLflow propres séparées** :
+- `eval_challenge_score` : live model, 1 valeur/epoch
+- `ema_challenge_score` : EMA shadow, 1 valeur/epoch (lissé par nature)
+
+**EMABestTracker** : callback qui snapshot l'EMA state à disque (`output_dir/ema_best_rank{R}.pt`, ~50ms write par "new best") quand `ema_challenge_score` atteint un new min. Post-train, compare `state.best_metric` (HF best live) vs `ema_best_tracker.best_score` (EMA) et charge le winner dans `trainer.model`. Tous les ranks DDP indépendamment (snapshot identique grâce DDP sync), pas de broadcast.
+
+Metrics MLflow post-train : `best_live_score`, `best_ema_score`, `used_ema_weights` (0/1).
+
+### 12.5 Sampler-aware IS — bug v15 réglé
+
+**Bug** : quand `feature_fairness != "none"` (= sampler 50/50 actif) ET `axis2_power > 0`, on faisait du **double-upweight** du genre minoritaire :
+
+- Sampler effective : `P_batch(g, y) = 0.5 · P_train(y|g)`
+- Weight calculé contre P_train(emp) : `w = P_target / P_train_emp`
+- Effective : `P_batch × w = 0.5 · P_target / P_train(g)`
+- Pour F (P_train(F) ≈ 0.10) : effective = **5× P_target(F, y)** au lieu de 1×
+- Ratio F/M effectif : **9× la cible**
+
+**Fix v15** ([src/utils/distribution.py:compute_target_weights](../src/utils/distribution.py)) : flag `gender_sampler_active` → dénominateur devient `P_sampler(g, y) = 0.5 · P_train(y|g)` au lieu de `P_train(g, y)`. Restore l'estimateur IS non-biaisé `E_batch[w · ℓ] = E_P_target[ℓ]` indépendamment du sampler.
+
+### 12.6 EfficientNet — pivot B5 → B0 (v15)
+
+Biais identifiés v14 (`tf_efficientnet_b5`) :
+- Input 224 au lieu de native 456 → 4× moins de pixels que designé
+- Pas de `gap` pooling option → forcé sur K-query/MIL qui détruit l'alignement pretrained
+- bf16 sur BatchNorm = précision insuffisante
+- `head_dropout=0.1` au lieu de native 0.4
+- `layer_decay` HPO sur MBConv (ill-defined)
+- `backbone_drop_path_rate` ignoré par timm
+- LR cap 2e-4 (trop haut pour CNN)
+- focal + axis1 + axis2 triple-weighting → instabilité
+
+**v15 fix** : pivot vers `tf_efficientnet_b0` (5M params, native 224, batch 128 OK). Default pooling=`gap` (natif), `head_dropout=0.2` (B0 native), `fp16`, `layer_decay=1.0` (disabled), LR cap 1e-4, `mil_agg=multi` pinned.
+
+### 12.7 UI ([scripts/qualitative_viewer.py](../scripts/qualitative_viewer.py))
+
+- Default experiment filter : `-v15$`
+- Post-processing tab "Déformation par calibrator" : small multiples (1 chart per cal × gender), affiche blend `α·cal + (1-α)·raw` avec best α par cal fetché depuis MLflow
+- Palette dark-theme : bars colorées vives, GT en amber `#fbbf24`, P_test target en blanc dotted (avant : noir invisible sur fond noir)
+- Bug fixed : `_final_metric_value` accédait à `run["metrics"]` inexistant → utilise `run.get(metric)` directement
+- Metric names mis à jour : `test_holdout_score_best_cal` → `test_holdout_score_selected_cal` (+ `_oracle_cal`)
+
+### 12.8 Autres fixes (v14/v15)
+
+- **MLflow logging conditionnel** : `adv_lambda/mmd_lambda/ot_lambda` loggués **résolus** (=0 si feature_fairness=none) au lieu du yaml raw (qui montrait `adv_lambda=0.01` même sans DANN)
+- **SLURM `--mem` 60G → 100G** : EMA double-eval et dataloader persistent_workers poussaient au-dessus de 60G en epoch 12+
+- **`ddp_find_unused_parameters=False`** toujours (était `True` quand `dann_active`, ce qui était inversé)
+- **MHA pooling retiré** entièrement du code (classe, build_pooling branch, yaml HPO)
+- **`mil_agg`, `mil_hidden`, `mil_k_top` defaults model** ajoutés pour HPO trial yamls cohérents
+- **`image_size` configurable** via yaml model section (passé à `get_image_processor`)
+- **`ema_decay` retiré de la LEGACY list** d'`optimize.py` (était en conflit avec `_TRAINING_KEYS`)

@@ -16,7 +16,7 @@ Hypothesis H_C (= "H1 covariate shift Y-only" in fairness.md historical doc):
       docs/v12_theory.md §2-3) à 0.5 pt d'écart sur la marginale F.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -128,28 +128,44 @@ def estimate_test_pmf_joint(
 # Unified rebalancing target (axes 1 + 2)
 # ============================================================================
 
-def compute_target_weights(
+def compute_balancing_weights(
     targets: np.ndarray, gender: np.ndarray,
     axis1_power: float, axis2_power: float,
+    sampler_participation: float = 0.0,
     n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
     test_pmf_y: np.ndarray = _TEST_PMF,
-    test_p_gender: np.ndarray = _TEST_P_GENDER,
+    axis2_target_g: np.ndarray = _TEST_P_GENDER,
     clip: float = 10.0,
-) -> np.ndarray:
-    """Per-sample loss weight for the unified rebalancing target.
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-sample weights for the unified balancing framework.
 
-        P_target(g, y) = mix_y(α1) × mix_g(α2)
-            mix_y(α1) = (1-α1)·P_train(y) + α1·P_test(y)              ← axe 1
-            mix_g(α2) = (1-α2)·P_train(g|y) + α2·P_test(g)            ← axe 2 (v13)
+    Returns (sampler_weights, loss_weights), both normalized to mean=1.
 
-        sample_weight_i = clip(P_target(g_i, y_i) / P_train(g_i, y_i), 1/clip, clip)
-        sample_weight  ← sample_weight / mean(sample_weight)          ← v3 hygiene trick
+    Framework
+    ---------
+    Target distribution (per-cell (g, b)) :
+        P_target(g, y) = mix_y(α1)[y] · mix_g(α2)[g | y]
+            mix_y(α1)[y]    = (1-α1)·P_train(y) + α1·P_test(y)        ← axe 1 (Y marginal)
+            mix_g(α2)[g|y]  = (1-α2)·P_train(g|y) + α2·axis2_target_g ← axe 2
 
-    v13 change: axe 2 target = P_test(g) ≈ (0.48, 0.52) from MID lookup, instead of
-    uniform (0.5, 0.5). Aligned with empirical P_test(g) — marginal 2% correction
-    but theoretically clean (uniform was a proxy when P_test(g) was unknown).
+    `axis2_target_g` default = `_TEST_P_GENDER ≈ (0.49, 0.51)` — la marginale P_test(g)
+    estimée via MID + DINOv3 probe. Constante sur y (= correction "marginale").
+    Alternative future : (0.5, 0.5) uniforme per-bin (force la parité conditionnelle).
 
-    Returns per-sample float32 array of same length as `targets`.
+    Split of correction between sampler and loss (sampler_participation = sp ∈ [0, 1]) :
+        P_sampler(g, y) = (1-sp) · P_train(g, y) + sp · P_target(g, y)
+                       = lerp(P_train, P_target, sp)
+
+        w_sampler_i = P_sampler / P_train = (1-sp) + sp · ratio_i
+        w_loss_i    = P_target / P_sampler = ratio_i / ((1-sp) + sp · ratio_i)
+
+    where ratio_i = P_target(g_i, y_i) / P_train(g_i, y_i), clipped to [1/clip, clip].
+
+    Edge cases:
+        sp = 0 → w_sampler = 1 (no sampler effect), w_loss = ratio (loss-only)
+        sp = 1 → w_sampler = ratio (sampler does all), w_loss = 1 (no further loss correction)
+
+    Estimator E_batch[w_loss · ℓ] = E_P_target[ℓ] is unbiased regardless of sp.
     """
     g = (np.asarray(gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
@@ -159,16 +175,30 @@ def compute_target_weights(
     p_train_g_given_y = p_joint / safe_y[None, :]
 
     p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
-    # axe 2 target = P_test(g) repeated across y bins (g-only, not depending on y bin)
-    test_p_g_broadcast = np.asarray(test_p_gender, dtype=np.float64)[:, None] * np.ones((1, n_bins))
-    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * test_p_g_broadcast
+    target_g_broadcast = np.asarray(axis2_target_g, dtype=np.float64)[:, None] * np.ones((1, n_bins))
+    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * target_g_broadcast
     p_target_joint = p_target_y[None, :] * p_target_g_given_y
 
-    ratio = p_target_joint / np.maximum(p_joint, 1e-9)
-    ratio = np.clip(ratio, 1.0 / clip, clip)
-    sample_w = ratio[g, b]
-    sample_w = sample_w / max(float(sample_w.mean()), 1e-9)
-    return sample_w.astype(np.float32)
+    ratio_cell = p_target_joint / np.maximum(p_joint, 1e-9)
+    ratio_cell = np.clip(ratio_cell, 1.0 / clip, clip)
+    ratio_i = ratio_cell[g, b]
+
+    sp = float(sampler_participation)
+    sampler_w = (1.0 - sp) + sp * ratio_i
+    loss_w = ratio_i / np.maximum(sampler_w, 1e-9)
+
+    sampler_w = sampler_w / max(float(sampler_w.mean()), 1e-9)
+    loss_w = loss_w / max(float(loss_w.mean()), 1e-9)
+    return sampler_w.astype(np.float32), loss_w.astype(np.float32)
+
+
+# Backward-compat alias — returns only the loss_weights component.
+def compute_target_weights(*args, **kwargs) -> np.ndarray:
+    """Deprecated alias: prefer compute_balancing_weights which returns BOTH
+    sampler_weights and loss_weights. This wrapper assumes sampler_participation=0
+    (loss-only correction) and returns only loss_weights."""
+    _, loss_w = compute_balancing_weights(*args, sampler_participation=0.0, **kwargs)
+    return loss_w
 
 
 # ============================================================================

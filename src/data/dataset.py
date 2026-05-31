@@ -10,26 +10,42 @@ from torch.utils.data import Dataset, Sampler
 
 
 class GenderBalancedSampler(Sampler[int]):
-    """Per-epoch: every Male sample seen exactly once + oversampled Females (also without
-    replacement within each pass) so the batch composition is ≈ 50/50 F/M.
+    """Per-epoch sampler with configurable F/M target ratio.
 
-    Concretely, per epoch:
-      - All n_M Males are yielded (each exactly once, shuffled)
-      - n_M Females are yielded, drawn as (n_M // n_F) full permutations of the F set
-        + (n_M % n_F) extras drawn without replacement from F.
-      - Final order is one big shuffle of all 2·n_M indices.
+    target_F ∈ [P_train(F), P_test(F)] is the target Female fraction in the batches.
+    target_F = P_train(F)  → equivalent to no sampler (preserves natural ratio)
+    target_F = 0.5         → fully balanced 50/50
+    Any value in between   → partial balancing
 
-    Each epoch sees all Males and oversamples Females by a factor ≈ n_M / n_F.
-    Stateless except for epoch counter — call `set_epoch(e)` for reproducibility under DDP.
+    Construction (per epoch, draws stratified without replacement, may repeat within
+    each gender pool to reach the target count):
+
+      - epoch_len = max(n_F / target_F, n_M / (1 - target_F))  (so the rarer class is fully visited)
+      - n_F_to_draw = round(epoch_len · target_F)
+      - n_M_to_draw = epoch_len - n_F_to_draw
+      - draw n_F_to_draw F samples and n_M_to_draw M samples (each without replacement
+        within full-permutation passes; extras drawn without replacement)
+      - shuffle the union
+
+    With target_F = P_train(F), epoch_len ≈ n_total and each sample is seen ~once.
+    With target_F = 0.5, epoch_len = 2 · max(n_F, n_M).
     """
 
-    def __init__(self, gender: np.ndarray, seed: int = 42) -> None:
+    def __init__(self, gender: np.ndarray, target_F: float = 0.5, seed: int = 42) -> None:
         g = (np.asarray(gender) >= 0.5).astype(int)
         self.f_idx = np.where(g == 0)[0].astype(np.int64)
         self.m_idx = np.where(g == 1)[0].astype(np.int64)
         if len(self.f_idx) == 0 or len(self.m_idx) == 0:
             raise ValueError(f"Cannot balance: F={len(self.f_idx)}, M={len(self.m_idx)}")
-        self.n_per_class = max(len(self.f_idx), len(self.m_idx))
+        target_F = float(target_F)
+        if not (0.0 < target_F < 1.0):
+            raise ValueError(f"target_F must be in (0, 1), got {target_F}")
+        self.target_F = target_F
+        # Epoch length = max so the rarer class (after weighting) is fully visited
+        n_F, n_M = len(self.f_idx), len(self.m_idx)
+        epoch_len = max(int(round(n_F / target_F)), int(round(n_M / (1.0 - target_F))))
+        self.n_F_draw = int(round(epoch_len * target_F))
+        self.n_M_draw = epoch_len - self.n_F_draw
         self.seed = int(seed)
         self.epoch = 0
 
@@ -48,18 +64,68 @@ class GenderBalancedSampler(Sampler[int]):
 
     def __iter__(self) -> Iterator[int]:
         rng = np.random.RandomState(self.seed + self.epoch)
-        f = self._draw_without_replacement(self.f_idx, self.n_per_class, rng)
-        m = self._draw_without_replacement(self.m_idx, self.n_per_class, rng)
+        f = self._draw_without_replacement(self.f_idx, self.n_F_draw, rng)
+        m = self._draw_without_replacement(self.m_idx, self.n_M_draw, rng)
         combined = np.concatenate([f, m])
         rng.shuffle(combined)
         return iter(combined.tolist())
 
     def __len__(self) -> int:
-        return 2 * self.n_per_class
+        return self.n_F_draw + self.n_M_draw
 
 
-def create_gender_balanced_sampler(gender: np.ndarray, seed: int = 42) -> GenderBalancedSampler:
-    return GenderBalancedSampler(gender=gender, seed=seed)
+def create_gender_balanced_sampler(gender: np.ndarray, target_F: float = 0.5, seed: int = 42) -> GenderBalancedSampler:
+    return GenderBalancedSampler(gender=gender, target_F=target_F, seed=seed)
+
+
+class DistributedWeightedSampler(Sampler[int]):
+    """DDP-aware weighted sampler with replacement.
+
+    PyTorch's WeightedRandomSampler is NOT distributed-aware: in DDP, each rank
+    would draw indices independently → duplicate / missed samples across ranks.
+
+    This sampler:
+      - Generates the SAME full draw sequence on all ranks (seeded by seed+epoch)
+      - Each rank takes every num_replicas-th index starting at `rank` → disjoint shards
+      - Total batched samples per epoch = num_samples (≈ len(dataset) by default)
+      - Per rank length = num_samples // num_replicas
+
+    Call `set_epoch(e)` between epochs for the seed to advance (HF Trainer does this).
+    """
+
+    def __init__(
+        self,
+        weights: np.ndarray,
+        num_samples: Optional[int] = None,
+        num_replicas: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+        replacement: bool = True,
+    ) -> None:
+        import torch
+        self.weights = torch.as_tensor(np.asarray(weights, dtype=np.float64), dtype=torch.double)
+        self.num_samples = int(num_samples) if num_samples is not None else len(weights)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.replacement = bool(replacement)
+        self.epoch = 0
+        # Truncate so total_size is divisible by num_replicas (no orphan sample)
+        self.total_size = (self.num_samples // self.num_replicas) * self.num_replicas
+        self.per_rank = self.total_size // self.num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        import torch
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(self.weights, self.total_size, replacement=self.replacement, generator=g)
+        return iter(indices[self.rank::self.num_replicas].tolist())
+
+    def __len__(self) -> int:
+        return self.per_rank
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 

@@ -43,7 +43,7 @@ _TRAINING_KEYS = {
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level",
-    "axis1_power", "axis2_power",
+    "axis1_power", "axis2_power", "sampler_participation",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",

@@ -86,6 +86,7 @@ optuna:
 
     axis1_power: {type: float, low: 0.0, high: 1.0}
     axis2_power: {type: float, low: 0.0, high: 1.0}
+    sampler_participation: {type: float, low: 0.0, high: 1.0}
 
     feature_fairness:
       type: categorical

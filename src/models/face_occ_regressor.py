@@ -300,16 +300,16 @@ def build_pooling(
     mil_agg: str = "multi",
     mil_hidden: int = 128,
     mil_k_top: int = 30,
-    gap_skip_cls: bool = False,
+    has_cls: bool = True,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
     if pooling_type == "gap":
-        return GAPPooling(dim=dim, skip_cls=gap_skip_cls)
+        return GAPPooling(dim=dim, skip_cls=has_cls)
     if pooling_type == "mean_var":
-        return MeanVarPooling(dim=dim)
+        return MeanVarPooling(dim=dim, skip_cls=has_cls)
     if pooling_type == "mil":
-        return MILPooling(dim=dim, hidden=mil_hidden, agg=mil_agg, k_top=mil_k_top)
+        return MILPooling(dim=dim, hidden=mil_hidden, agg=mil_agg, k_top=mil_k_top, skip_cls=has_cls)
     if pooling_type == "attention_k_query":
         return AttentionPooling(
             dim=dim, n_focal=n_focal, n_diffuse=n_diffuse, n_free=n_free,
@@ -421,6 +421,8 @@ class FaceOccRegressor(nn.Module):
             model_name, drop_path_rate=backbone_drop_path_rate, pretrained=pretrained,
         )
 
+        # ViT has CLS at position 0; CNN (timm) has none. Tells pools whether to skip it.
+        has_cls = not _is_timm_cnn(model_name)
         self.pool = build_pooling(
             pooling_type=pooling_type,
             dim=hidden_size,
@@ -429,6 +431,7 @@ class FaceOccRegressor(nn.Module):
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
             mil_agg=mil_agg, mil_hidden=mil_hidden, mil_k_top=mil_k_top,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
+            has_cls=has_cls,
         )
 
         if projection_size:

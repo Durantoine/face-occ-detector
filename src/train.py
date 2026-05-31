@@ -893,11 +893,20 @@ def train(
     r2 = eval_results.get("eval_r2", 0.0)
     print(f"  human-readable : MAE_pct={mae_pct:.2f}%  R²={r2:.3f}")
 
+    # IMPORTANT: trainer.predict() is a DDP collective — ALL ranks must call it.
+    # Only AFTER predict completes, we can isolate post-processing on rank 0.
     try:
         pred_out = trainer.predict(val_dataset)
     except Exception as e:
-        print(f"WARNING: trainer.predict failed: {e}")
+        print(f"WARNING: trainer.predict(val) failed: {e}")
         pred_out = None
+
+    test_pred_out = None
+    if test_holdout_dataset is not None:
+        try:
+            test_pred_out = trainer.predict(test_holdout_dataset)
+        except Exception as e_test:
+            print(f"WARNING: trainer.predict(test_holdout) failed: {e_test}")
 
     preds = gt = gender = None
     if pred_out is not None and trainer.is_world_process_zero():
@@ -927,10 +936,9 @@ def train(
                 f"val_err_M_{cal_name}_self_eval": float(scores_cal["err_M"]),
             })
 
-        # === True post-hoc validation on test holdout (if available) ===
-        if test_holdout_dataset is not None:
+        # === True post-hoc validation on test holdout (predict already done above) ===
+        if test_pred_out is not None:
             try:
-                test_pred_out = trainer.predict(test_holdout_dataset)
                 test_preds_raw = test_pred_out.predictions
                 if isinstance(test_preds_raw, (tuple, list)):
                     test_preds_raw = test_preds_raw[0]

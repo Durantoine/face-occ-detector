@@ -64,7 +64,7 @@ training:
   bf16: true
   fp16: false
   gradient_checkpointing: false
-  augmentation_level: light
+  augmentation_level: none
   layer_decay: 0.85
   ema_decay: 0.999
   loss_lambda_init: 1.0

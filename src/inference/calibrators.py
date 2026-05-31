@@ -244,18 +244,76 @@ class PCHIPSplineCalibrator(PerGenderCalibratorBase):
 
 
 # ============================================================================
-# Convenience: fit all 3 (with IS-weighting) and return best
+# 4. Isotonic per (gender × y-regime) — stretches high-y tail
+# ============================================================================
+
+class IsotonicRegimeCalibrator(PerGenderCalibratorBase):
+    """Per-(gender × y-regime) isotonic with smooth blend at the regime boundary.
+
+    Motivation: global isotonic shrinks toward identity in sparse regions; on the
+    rare high-y tail (y > 0.2, ~15% of P_test mass), the model systematically under-
+    predicts but global isotonic can't stretch enough due to few support points.
+    Fitting a SEPARATE isotonic on the high-y subset gives it more pull there.
+
+    Fit:  partitions samples by GT into low (y < thr) and high (y ≥ thr) regimes,
+          fits one isotonic per regime per gender.
+    Transform: uses PREDICTED value to pick regime (we don't have GT at inference).
+          Smooth linear blend in [thr - hw, thr + hw] to avoid stair at the boundary.
+    """
+    name = "isotonic_regime"
+
+    def __init__(self, y_threshold: float = 0.20, blend_halfwidth: float = 0.02,
+                 min_samples_per_regime: int = 50, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.y_threshold = float(y_threshold)
+        self.blend_halfwidth = float(blend_halfwidth)
+        self.min_samples = int(min_samples_per_regime)
+
+    def _fit_one(self, preds: np.ndarray, gt: np.ndarray, w: np.ndarray) -> object:
+        mask_low = gt < self.y_threshold
+        mask_high = ~mask_low
+        iso_low = iso_high = None
+        if mask_low.sum() >= self.min_samples:
+            iso_low = IsotonicRegression(y_min=self.out_min, y_max=self.out_max, out_of_bounds="clip")
+            iso_low.fit(preds[mask_low], gt[mask_low], sample_weight=w[mask_low])
+        if mask_high.sum() >= self.min_samples:
+            iso_high = IsotonicRegression(y_min=self.out_min, y_max=self.out_max, out_of_bounds="clip")
+            iso_high.fit(preds[mask_high], gt[mask_high], sample_weight=w[mask_high])
+        # Fallback: global isotonic when one regime is too sparse
+        iso_global = None
+        if iso_low is None or iso_high is None:
+            iso_global = IsotonicRegression(y_min=self.out_min, y_max=self.out_max, out_of_bounds="clip")
+            iso_global.fit(preds, gt, sample_weight=w)
+        return (iso_low, iso_high, iso_global)
+
+    def _transform_one(self, model: object, preds: np.ndarray) -> np.ndarray:
+        iso_low, iso_high, iso_global = model
+        if iso_low is None and iso_high is None:
+            return iso_global.transform(preds) if iso_global is not None else preds
+        if iso_low is None:
+            return iso_high.transform(preds)
+        if iso_high is None:
+            return iso_low.transform(preds)
+        out_low = iso_low.transform(preds)
+        out_high = iso_high.transform(preds)
+        hw = self.blend_halfwidth
+        w_high = np.clip((preds - (self.y_threshold - hw)) / (2.0 * hw), 0.0, 1.0)
+        return (1.0 - w_high) * out_low + w_high * out_high
+
+
+# ============================================================================
+# Convenience: fit all calibrators (with IS-weighting)
 # ============================================================================
 
 def fit_all_calibrators(
     preds: np.ndarray, gt: np.ndarray, gender: np.ndarray,
     use_is_weight: bool = True,
 ) -> Dict[str, PerGenderCalibratorBase]:
-    """Fit isotonic + linear + PCHIP per-gender calibrators on (preds, gt, gender).
+    """Fit all per-gender calibrators on (preds, gt, gender).
     Returns dict keyed by calibrator name. All use IS-weighting by default.
     """
     out: Dict[str, PerGenderCalibratorBase] = {}
-    for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator]:
+    for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator, IsotonicRegimeCalibrator]:
         try:
             cal = cls(use_is_weight=use_is_weight).fit(preds, gt, gender)
             out[cal.name] = cal

@@ -424,13 +424,12 @@ def _render_trials_comparison() -> None:
 def _final_metric_value(
     tracking_uri: str, run: Dict[str, Any], metric: str
 ) -> Optional[float]:
-    """Return the final (last logged) value of `metric` for the given run.
-    Falls back to run.data.metrics if no history available."""
+    """Return the final (last logged) value of `metric` for the given run."""
     hist = _fetch_metric_history(tracking_uri, run["run_id"], metric)
     if hist:
         return float(hist[-1][1])
-    v = run["metrics"].get(metric)
-    return float(v) if v is not None else None
+    v = run.get(metric)
+    return float(v) if isinstance(v, (int, float)) else None
 
 
 def _render_inter_trial(
@@ -851,17 +850,26 @@ def _render_isotonic_effect() -> None:
     # === Metrics summary ===
     st.markdown("### Métriques test holdout")
     raw_score = _final_metric_value(TRACKING_URI, selected_run, "test_holdout_score_raw")
-    best_cal_score = _final_metric_value(TRACKING_URI, selected_run, "test_holdout_score_best_cal")
+    selected_cal_score = _final_metric_value(TRACKING_URI, selected_run, "test_holdout_score_selected_cal")
+    oracle_cal_score = _final_metric_value(TRACKING_URI, selected_run, "test_holdout_score_oracle_cal")
     raw_diff = _final_metric_value(TRACKING_URI, selected_run, "test_holdout_err_diff_raw")
 
-    cols = st.columns(2 + len(cal_methods))
+    cols = st.columns(3 + len(cal_methods))
     cols[0].metric("Score RAW", f"{raw_score:.5f}" if raw_score is not None else "n/a")
-    if best_cal_score is not None:
-        delta_best = f"{(best_cal_score - raw_score):+.5f}" if raw_score is not None else None
-        cols[1].metric("Score BEST cal", f"{best_cal_score:.5f}",
-                        delta=delta_best, delta_color="inverse")
+    if selected_cal_score is not None:
+        delta_sel = f"{(selected_cal_score - raw_score):+.5f}" if raw_score is not None else None
+        cols[1].metric("Score SELECTED (val)", f"{selected_cal_score:.5f}",
+                        delta=delta_sel, delta_color="inverse",
+                        help="Best (cal, α) sélectionné sur val IS-strat — ce qu'on submit")
     else:
-        cols[1].metric("Score BEST cal", "n/a")
+        cols[1].metric("Score SELECTED (val)", "n/a")
+    if oracle_cal_score is not None:
+        delta_orc = f"{(oracle_cal_score - raw_score):+.5f}" if raw_score is not None else None
+        cols[2].metric("Score ORACLE (test, biased)", f"{oracle_cal_score:.5f}",
+                        delta=delta_orc, delta_color="inverse",
+                        help="Best cal post-hoc sur test holdout — upper bound biased")
+    else:
+        cols[2].metric("Score ORACLE", "n/a")
     for i, m in enumerate(cal_methods):
         s_m = _final_metric_value(TRACKING_URI, selected_run, f"test_holdout_score_{m}")
         delta_m = f"{(s_m - raw_score):+.5f}" if (s_m is not None and raw_score is not None) else None

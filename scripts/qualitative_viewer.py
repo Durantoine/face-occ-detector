@@ -63,20 +63,18 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
     "correction_strength",
-    "axis1_power",
-    "axis2_power",
     "feature_fairness",
-    "mmd_lambda",
+    "ot_lambda", "ot_method", "sinkhorn_eps",
     "adv_lambda",
     "loss_focal_gamma",
-    "loss_fairness_lambda",
+    "loss_lambda_threshold",
     "pretrained_source",
     "pooling_type",
-    "augmentation_level",
+    "grid_size", "mil_k_top",
     "learning_rate",
     "weight_decay",
-    "num_train_epochs",
     "layer_decay",
+    "min_lr_rate",
 ]
 
 
@@ -551,13 +549,11 @@ def _render_inter_trial(
 
         focus_cols = [
             "experiment", "trial_idx", "trial", "final_value", "err_diff",
-            # v10 — unified rebalancing
-            "axis1_power", "axis2_power",
-            "feature_fairness", "mmd_lambda", "adv_lambda",
-            "loss_focal_gamma", "loss_fairness_lambda",
-            # Architecture + hyperparams
-            "pretrained_source", "pooling_type",
-            "learning_rate", "weight_decay",
+            "correction_strength",
+            "feature_fairness", "ot_lambda", "ot_method", "sinkhorn_eps", "adv_lambda",
+            "loss_focal_gamma", "loss_lambda_threshold",
+            "pretrained_source", "pooling_type", "grid_size", "mil_k_top",
+            "learning_rate", "weight_decay", "layer_decay",
         ]
 
         def _family(name: str) -> str:
@@ -604,10 +600,10 @@ def _render_inter_trial(
         # v8 : breakdown des continus binnés en quartiles. Permet de voir si γ haut/bas
         # marche mieux, si focal_gamma converge vers une zone, etc.
         AXIS_CONTINUOUS = [
-            "axis1_power", "axis2_power",
-            "mmd_lambda",
-            "loss_focal_gamma",
-            "learning_rate", "weight_decay",
+            "correction_strength",
+            "ot_lambda", "adv_lambda", "sinkhorn_eps",
+            "loss_focal_gamma", "loss_lambda_threshold",
+            "learning_rate", "weight_decay", "layer_decay", "min_lr_rate",
             "head_dropout", "backbone_drop_path_rate",
         ]
         N_BINS_CONTINUOUS = 4
@@ -931,8 +927,13 @@ def _render_isotonic_effect() -> None:
         st.plotly_chart(fig_iso, use_container_width=True)
 
     # === 2. Déformation des distributions par calibrator (small multiples) ===
-    st.markdown("### 2. Déformation par calibrator (au best α de chacun)")
-    st.caption("Pour chaque méthode : histogram du blend `α·cal + (1-α)·raw` à son α optimal (val IS-strat) + GT + P_test cible.")
+    st.markdown("### 2. Glissement P_train → P_test par calibrator (au best α de chacun)")
+    st.caption(
+        "Barres = density du blend `α·cal + (1-α)·raw` à son α optimal (val IS-strat). "
+        "**Ambre** = P_train (val GT, ce sur quoi le modèle a appris). "
+        "**Vert clair pointillé** = P_test cible (où on veut amener la distribution). "
+        "Bonne calibration ⇒ barres qui décollent de l'ambre vers le pointillé vert."
+    )
 
     try:
         from src.utils.distribution import _TEST_PMF, N_BINS as _NB, BIN_WIDTH as _BW
@@ -964,8 +965,8 @@ def _render_isotonic_effect() -> None:
         "linear": "#4ade80",           # Bright Green
         "pchip": "#2dd4bf",            # Teal
     }
-    gt_color = "#fbbf24"        # Amber — very high visibility
-    target_color = "#ffffff"    # Pure White for reference P_test
+    gt_color = "#fbbf24"        # Amber — P_train (val GT), starting point
+    target_color = "#86efac"    # Bright green — P_test cible, where pred should land
 
     def _density(values, bins):
         h, _ = np.histogram(values, bins=bins)
@@ -995,27 +996,89 @@ def _render_isotonic_effect() -> None:
             title = f"{m.upper()} (α={alpha:.1f})" if m != "raw" else "RAW"
             fig = go.Figure()
             fig.add_trace(go.Bar(x=bin_centers, y=pred_density, name="pred",
-                                  marker_color=bar_color.get(m, "#9ca3af"), opacity=0.9,
+                                  marker_color=bar_color.get(m, "#9ca3af"), opacity=0.85,
                                   width=bin_w * 0.95))
-            fig.add_trace(go.Scatter(x=bin_centers, y=gt_density, name="GT",
-                                      mode="lines+markers", line=dict(color=gt_color, width=2.5),
-                                      marker=dict(size=6, color=gt_color)))
+            fig.add_trace(go.Scatter(x=bin_centers, y=gt_density, name="P_train (val GT)",
+                                      mode="lines", line=dict(color=gt_color, width=2.5)))
             if ref_x is not None:
                 fig.add_trace(go.Scatter(x=ref_x, y=ref_density, name="P_test cible",
-                                          mode="lines", line=dict(color=target_color, width=2.5, dash="dot")))
+                                          mode="lines", line=dict(color=target_color, width=3, dash="dot"),
+                                          fill="tozeroy", fillcolor="rgba(134,239,172,0.08)"))
             fig.update_layout(title=title, height=280,
-                                xaxis=dict(title="Y", range=[0, 0.5]),
-                                yaxis=dict(title="density"),
+                                xaxis=dict(title="Y", range=[0, 0.5], gridcolor="rgba(255,255,255,0.05)"),
+                                yaxis=dict(title="density", gridcolor="rgba(255,255,255,0.05)"),
                                 margin=dict(l=30, r=10, t=35, b=30),
                                 showlegend=(i == 0),
                                 legend=dict(orientation="h", y=-0.25, x=0))
             cols[i].plotly_chart(fig, use_container_width=True)
 
+    # === 2bis. Drift toward P_test — quantification du glissement ===
+    if ref_x is not None:
+        st.markdown("### 2bis. Drift vers P_test (Wasserstein-1 distance)")
+        st.caption(
+            "Pour chaque méthode × gender : W1(pred_density, P_test). "
+            "Plus la barre est basse, plus la prédiction est proche de la cible. "
+            "Référence ambre = W1(P_train, P_test) (ce qu'on aurait sans calibration)."
+        )
+        # W1(p, q) = sum |CDF_p - CDF_q| * bin_width (1D, bins identiques)
+        def _w1(p_density: np.ndarray, q_density: np.ndarray, bw: float) -> float:
+            cdf_p = np.cumsum(p_density) * bw
+            cdf_q = np.cumsum(q_density) * bw
+            return float(np.sum(np.abs(cdf_p - cdf_q)) * bw)
+
+        # Resample P_test density to our bin grid if shapes differ
+        if len(ref_density) == len(bin_centers):
+            ptest_on_grid = np.asarray(ref_density)
+        else:
+            ptest_on_grid = np.interp(bin_centers, ref_x, ref_density)
+            s = ptest_on_grid.sum() * bin_w
+            if s > 0:
+                ptest_on_grid = ptest_on_grid / s
+
+        drift_rows: List[Dict[str, Any]] = []
+        ptrain_w1_by_g: Dict[str, float] = {}
+        for gname, gdf in [("Female", g_F), ("Male", g_M)]:
+            ptrain_density = _density(gdf["gt"].values, bin_edges)
+            ptrain_w1_by_g[gname] = _w1(ptrain_density, ptest_on_grid, bin_w)
+            for m in methods_show:
+                col = "pred_raw" if m == "raw" else f"pred_{m}"
+                if col not in gdf.columns:
+                    continue
+                alpha = best_alpha.get(m, 1.0)
+                if m == "raw":
+                    pred_vals = gdf["pred_raw"].values
+                else:
+                    pred_vals = np.clip(alpha * gdf[col].values + (1.0 - alpha) * gdf["pred_raw"].values, 0.0, 1.0)
+                pred_density = _density(pred_vals, bin_edges)
+                drift_rows.append({
+                    "gender": gname, "method": m.upper(),
+                    "W1_to_Ptest": _w1(pred_density, ptest_on_grid, bin_w),
+                })
+
+        if drift_rows:
+            df_drift = pd.DataFrame(drift_rows)
+            fig_drift = px.bar(
+                df_drift, x="method", y="W1_to_Ptest", color="method",
+                facet_col="gender", height=380,
+                color_discrete_map={m.upper(): bar_color.get(m, "#9ca3af") for m in methods_show},
+                labels={"W1_to_Ptest": "W1(pred, P_test) — lower is closer"},
+            )
+            for gname, w1_ref in ptrain_w1_by_g.items():
+                # Add P_train reference line per facet
+                fig_drift.add_hline(
+                    y=w1_ref, line_dash="dot", line_color=gt_color, line_width=2,
+                    annotation_text=f"P_train: {w1_ref:.4f}", annotation_position="top right",
+                    annotation_font_color=gt_color,
+                    col=1 if gname == "Female" else 2,
+                )
+            fig_drift.update_layout(showlegend=False, margin=dict(l=30, r=10, t=50, b=30))
+            st.plotly_chart(fig_drift, use_container_width=True)
+
     # === 3. Calibration plot: pred vs gt for RAW + each calibrator (small multiples) ===
     st.markdown("### 3. Calibration (pred vs gt), par méthode")
-    st.caption("Points proches de y=x = bien calibré. Au-dessus = sur-estimation, en-dessous = sous-estimation. F=rouge/orange, M=bleu/cyan.")
+    st.caption("Points proches de y=x = bien calibré. Au-dessus = sur-estimation, en-dessous = sous-estimation. F=rose, M=cyan.")
     line_diag = go.Scatter(x=[0, 0.5], y=[0, 0.5], mode="lines", name="y=x",
-                              line=dict(color="black", dash="dash"), showlegend=False)
+                              line=dict(color="#e5e7eb", dash="dash", width=1.5), showlegend=False)
     methods_for_calibration = ["raw"] + cal_methods
     cols_cal = st.columns(min(len(methods_for_calibration), 4))
     for i, m in enumerate(methods_for_calibration):
@@ -1026,9 +1089,9 @@ def _render_isotonic_effect() -> None:
             fig_c = go.Figure()
             fig_c.add_trace(line_diag)
             fig_c.add_trace(go.Scatter(x=g_F["gt"], y=g_F[col], mode="markers", name="F",
-                                         marker=dict(color="#d62728", size=3, opacity=0.35)))
+                                         marker=dict(color="#fb7185", size=3, opacity=0.5)))
             fig_c.add_trace(go.Scatter(x=g_M["gt"], y=g_M[col], mode="markers", name="M",
-                                         marker=dict(color="#1f77b4", size=3, opacity=0.35)))
+                                         marker=dict(color="#38bdf8", size=3, opacity=0.5)))
             fig_c.update_layout(title=m.upper(), xaxis_title="gt", yaxis_title="pred", height=350)
             st.plotly_chart(fig_c, use_container_width=True)
 
@@ -1064,7 +1127,7 @@ def _render_isotonic_effect() -> None:
                            facet_row="gender", height=500,
                            labels={"delta_mae": "Δ MAE = MAE_cal - MAE_raw", "bin_center": "Y bin center"},
                            barmode="group", title="Δ MAE par méthode × bin × gender")
-        fig_mae.add_hline(y=0, line_dash="dash", line_color="black")
+        fig_mae.add_hline(y=0, line_dash="dash", line_color="#e5e7eb")
         st.plotly_chart(fig_mae, use_container_width=True)
 
     with st.expander("Raw data (preview)"):
@@ -1198,20 +1261,20 @@ with tab_params:
     else:
         # Highlight panel : v10 search-space params ordonnés par lisibilité.
         OPTUNA_KEYS = [
-            # === v10 unified rebalancing target ===
-            "axis1_power", "axis2_power",
+            # === v16+ single-axis correction under H_C ===
+            "correction_strength",
             # === Feature fairness ===
-            "feature_fairness", "mmd_lambda",
-            # === Loss ===
-            "loss_focal_gamma",
+            "feature_fairness", "ot_lambda", "ot_method", "sinkhorn_eps", "adv_lambda",
+            # === Loss / Lagrangien ===
+            "loss_focal_gamma", "loss_lambda_threshold",
             # === Architecture ===
-            "pretrained_source", "pooling_type",
+            "pretrained_source", "pooling_type", "grid_size", "mil_k_top", "mil_hidden",
             # === Hyperparams ===
-            "learning_rate", "weight_decay",
+            "learning_rate", "weight_decay", "layer_decay", "min_lr_rate",
             "head_dropout", "backbone_drop_path_rate",
             "pool_attn_dropout", "pool_proj_dropout",
             "tau_focal_init", "tau_diffuse_init",
-            "n_focal", "n_diffuse", "n_free", "num_heads",
+            "n_focal", "n_diffuse", "n_free",
             "loss_query_diversity_lambda",
         ]
         # v9 : afficher TOUS les OPTUNA_KEYS (même les manquants → "—") pour qu'on voie

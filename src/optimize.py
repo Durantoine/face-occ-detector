@@ -200,7 +200,9 @@ def objective(
             "n": trial.number, "min_score_to_save": min_score_to_save,
         }
 
+    barrier()
     trial_data = broadcast(trial_data)
+    barrier()
     assert trial_data is not None
     arch_name = trial_data["arch"]
     run_id = trial_data["run_id"]
@@ -519,7 +521,6 @@ def optimize_hyperparameters(
                       seed=data["seed"], val_seed=data["val_seed"])
             except Exception:
                 pass
-            barrier()
 
     if is_main():
         if use_mlflow and client and parent_run_id:

@@ -81,7 +81,7 @@ training:
   save_qualitative_k: 10
 
 optuna:
-  n_trials: 50
+  n_trials: 100
   objective_mode: score
   rotate_val_seed: false
   keep_top_n: 3

@@ -62,6 +62,7 @@ TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 # Params we show in hover tooltips on the trials comparison chart. Order matters
 # (top to bottom in the tooltip). Anything else still queryable via the param table.
 HOVER_PARAMS = [
+    "correction_strength",
     "axis1_power",
     "axis2_power",
     "feature_fairness",
@@ -805,7 +806,7 @@ def _render_isotonic_effect() -> None:
     exp_labels = list(exp_label_to_id.keys())
     default_idx = 0
     for i, label in enumerate(exp_labels):
-        if "v15" in label.lower():
+        if "v16" in label.lower():
             default_idx = i
             break
     selected_exp_label = st.sidebar.selectbox("Experiment", exp_labels, index=default_idx, key="pp_exp")
@@ -953,11 +954,18 @@ def _render_isotonic_effect() -> None:
     g_F = df_pred[df_pred["gender"] < 0.5]
     g_M = df_pred[df_pred["gender"] >= 0.5]
     methods_show = ["raw"] + cal_methods
-    # Dark-theme friendly palette (bright, distinct on dark background)
-    bar_color = {"raw": "#9ca3af", "isotonic": "#f87171", "isotonic_regime": "#f472b6",
-                  "linear": "#34d399", "pchip": "#a78bfa", "iso": "#f87171"}
-    gt_color = "#fbbf24"        # amber — pops on dark, distinct from cal colors
-    target_color = "#ffffff"    # white — max contrast on dark
+    # Neon-style palette (vibrant on dark background)
+    bar_color = {
+        "raw": "#60a5fa",              # Bright Blue
+        "isotonic": "#f87171",         # Bright Red
+        "isotonic_continuous": "#fb923c", # Orange
+        "isotonic_regime": "#fb7185",  # Rose
+        "isotonic_tailboost": "#c084fc", # Purple
+        "linear": "#4ade80",           # Bright Green
+        "pchip": "#2dd4bf",            # Teal
+    }
+    gt_color = "#fbbf24"        # Amber — very high visibility
+    target_color = "#ffffff"    # Pure White for reference P_test
 
     def _density(values, bins):
         h, _ = np.histogram(values, bins=bins)

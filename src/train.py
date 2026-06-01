@@ -735,6 +735,8 @@ def train(
     min_score_to_save: Optional[float] = None,
     optuna_trial: Any = None,
 ) -> Tuple[float, float, float, str, float, float]:
+    from src.utils.distributed import barrier
+    barrier()
     cfg = load_architecture_config(architecture_name).to_dict()
     train_cfg = cfg.get("training", {})
     model_cfg = cfg.get("model", {})
@@ -774,6 +776,7 @@ def train(
     # Log RESOLVED values for conditional knobs so MLflow doesn't show stale yaml defaults
     # (e.g. adv_lambda=0.01 from yaml when feature_fairness=none → actual adv_lambda=0).
     train_cfg_logged = dict(train_cfg)
+    train_cfg_logged["correction_strength"] = correction_strength
     train_cfg_logged["adv_lambda"] = adv_lambda
     train_cfg_logged["mmd_lambda"] = mmd_lambda
     train_cfg_logged["ot_lambda"] = ot_lambda
@@ -1257,98 +1260,99 @@ def train(
             except Exception as e_test:
                 print(f"WARNING: test holdout eval failed: {e_test}")
 
-    save_qualitative_k = int(train_cfg.get("save_qualitative_k", 0))
-    if save_qualitative_k > 0 and pred_out is not None and trainer.is_world_process_zero():
-        try:
-            w = 1.0 / 30.0 + gt
-            per_sample_err = w * (preds - gt) ** 2
-            worst_order = np.argsort(-per_sample_err)[:save_qualitative_k]
-            best_order = np.argsort(per_sample_err)[:save_qualitative_k]
-            paths_all = val_data["image_path"].values if "image_path" in val_data.columns else None
-            qual_root = Path(output_dir) / "qualitative"
-            base = Path(image_base_dir) if image_base_dir else None
-
-            def _dump(order: Any, label: str) -> None:
-                paths = paths_all[order] if paths_all is not None else None
-                df = pd.DataFrame({
-                    "rank": np.arange(1, len(order) + 1),
-                    "filename": paths if paths is not None else order,
-                    "gt": gt[order],
-                    "pred": preds[order],
-                    "abs_err": np.abs(preds[order] - gt[order]),
-                    "weighted_err": per_sample_err[order],
-                    "gender": gender[order],
-                })
-                sub = qual_root / label
-                sub.mkdir(parents=True, exist_ok=True)
-                df.to_csv(sub / f"{label}.csv", index=False)
-                img_dir = sub / "images"
-                img_dir.mkdir(exist_ok=True)
-                if paths is None:
-                    return
-                for rank, row in enumerate(df.itertuples(index=False), start=1):
-                    src = Path(row.filename)
-                    if base and not src.is_absolute():
-                        src = base / row.filename
-                    if not src.exists():
-                        continue
-                    dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
-                    if dst.exists():
-                        dst.unlink()
-                    shutil.copy(src, dst)
-                print(f"Saved {len(df)} {label} : {sub}/{label}.csv + {img_dir}")
-
-            _dump(worst_order, "worst")
-            _dump(best_order, "best")
-
-            try:
-                _save_diagnostic_charts(qual_root, preds, gt, gender)
-            except Exception as e_chart:
-                print(f"WARNING: could not save diagnostic charts: {e_chart}")
-
-            if use_mlflow:
-                if use_client and client and run_id:
-                    client.log_artifacts(run_id, str(qual_root), "qualitative")
-                elif mlflow.active_run():
-                    mlflow.log_artifacts(str(qual_root), "qualitative")
-        except Exception as e:
-            print(f"WARNING: could not save qualitative-K: {e}")
-
-    if not trainer.is_world_process_zero():
-        return eval_loss, eval_score, err_diff, "", err_F, err_M
-
-    ml_log_metrics(client, run_id, {
-        "val_score": eval_score,
-        "val_err_F": err_F,
-        "val_err_M": err_M,
-        "val_err_diff": err_diff,
-        "final_eval_loss": eval_loss,
-    })
-    if use_mlflow:
-        artifact = f"configs/architectures/{architecture_name}.yaml"
-        if use_client and client and run_id:
-            client.log_artifact(run_id, artifact)
-        elif mlflow.active_run():
-            mlflow.log_artifact(artifact)
-
+    # Qualitatives, diagnostic charts and model saving (Rank 0 only)
     model_uri = ""
-    should_save = use_mlflow and (
-        min_score_to_save is None or float(eval_score) < float(min_score_to_save)
-    )
-    if use_mlflow and not should_save:
-        print(f"Skipping model save: eval_score={eval_score:.5f} ≥ best={min_score_to_save:.5f}")
-    if should_save:
-        try:
-            model_uri = _save_model_to_mlflow(trainer, processor, run_id, f"{cfg['name']}")
-            print(f"Model saved: {model_uri}")
-        except Exception as e:
-            print(f"ERROR saving model: {e}")
-            if mlflow.active_run():
-                mlflow.end_run()
+    if trainer.is_world_process_zero():
+        save_qualitative_k = int(train_cfg.get("save_qualitative_k", 0))
+        if save_qualitative_k > 0 and pred_out is not None:
+            try:
+                w = 1.0 / 30.0 + gt
+                per_sample_err = w * (preds - gt) ** 2
+                worst_order = np.argsort(-per_sample_err)[:save_qualitative_k]
+                best_order = np.argsort(per_sample_err)[:save_qualitative_k]
+                paths_all = val_data["image_path"].values if "image_path" in val_data.columns else None
+                qual_root = Path(output_dir) / "qualitative"
+                base = Path(image_base_dir) if image_base_dir else None
 
-    if output_dir and output_dir != "./results":
-        shutil.rmtree(output_dir, ignore_errors=True)
+                def _dump(order: Any, label: str) -> None:
+                    paths = paths_all[order] if paths_all is not None else None
+                    df = pd.DataFrame({
+                        "rank": np.arange(1, len(order) + 1),
+                        "filename": paths if paths is not None else order,
+                        "gt": gt[order],
+                        "pred": preds[order],
+                        "abs_err": np.abs(preds[order] - gt[order]),
+                        "weighted_err": per_sample_err[order],
+                        "gender": gender[order],
+                    })
+                    sub = qual_root / label
+                    sub.mkdir(parents=True, exist_ok=True)
+                    df.to_csv(sub / f"{label}.csv", index=False)
+                    img_dir = sub / "images"
+                    img_dir.mkdir(exist_ok=True)
+                    if paths is None:
+                        return
+                    for rank, row in enumerate(df.itertuples(index=False), start=1):
+                        src = Path(row.filename)
+                        if base and not src.is_absolute():
+                            src = base / row.filename
+                        if not src.exists():
+                            continue
+                        dst = img_dir / f"{rank:03d}_gt{row.gt:.3f}_pred{row.pred:.3f}_g{int(row.gender)}_{src.name}"
+                        if dst.exists():
+                            dst.unlink()
+                        shutil.copy(src, dst)
+                    print(f"Saved {len(df)} {label} : {sub}/{label}.csv + {img_dir}")
 
+                _dump(worst_order, "worst")
+                _dump(best_order, "best")
+
+                try:
+                    _save_diagnostic_charts(qual_root, preds, gt, gender)
+                except Exception as e_chart:
+                    print(f"WARNING: could not save diagnostic charts: {e_chart}")
+
+                if use_mlflow:
+                    if use_client and client and run_id:
+                        client.log_artifacts(run_id, str(qual_root), "qualitative")
+                    elif mlflow.active_run():
+                        mlflow.log_artifacts(str(qual_root), "qualitative")
+            except Exception as e:
+                print(f"WARNING: could not save qualitative-K: {e}")
+
+        ml_log_metrics(client, run_id, {
+            "val_score": eval_score,
+            "val_err_F": err_F,
+            "val_err_M": err_M,
+            "val_err_diff": err_diff,
+            "final_eval_loss": eval_loss,
+        })
+        if use_mlflow:
+            artifact = f"configs/architectures/{architecture_name}.yaml"
+            if use_client and client and run_id:
+                client.log_artifact(run_id, artifact)
+            elif mlflow.active_run():
+                mlflow.log_artifact(artifact)
+
+        should_save = use_mlflow and (
+            min_score_to_save is None or float(eval_score) < float(min_score_to_save)
+        )
+        if use_mlflow and not should_save:
+            print(f"Skipping model save: eval_score={eval_score:.5f} ≥ best={min_score_to_save:.5f}")
+        if should_save:
+            try:
+                model_uri = _save_model_to_mlflow(trainer, processor, run_id, f"{cfg['name']}")
+                print(f"Model saved: {model_uri}")
+            except Exception as e:
+                print(f"ERROR saving model: {e}")
+                if mlflow.active_run():
+                    mlflow.end_run()
+
+        if output_dir and output_dir != "./results":
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    from src.utils.distributed import barrier
+    barrier()
     return eval_loss, eval_score, err_diff, model_uri, err_F, err_M
 
 

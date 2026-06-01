@@ -344,6 +344,51 @@ class IsotonicTailBoostCalibrator(PerGenderCalibratorBase):
 
 
 # ============================================================================
+# 6. Continuous Isotonic (Isotonic + PCHIP interpolation)
+# ============================================================================
+
+class ContinuousIsotonicCalibrator(PerGenderCalibratorBase):
+    """Continuous version of Isotonic regression.
+
+    Standard Isotonic (PAV) is piecewise-constant ("stairs"). This version:
+      1. Fits a standard IsotonicRegression.
+      2. Extracts the unique (x, y) jump points.
+      3. Interpolates smoothly between them using PCHIP (monotone cubic spline).
+
+    Result: non-parametric flexible fit (like Isotonic) but C1-continuous and
+    strictly monotone (like PCHIP). No staircase artifacts.
+    """
+    name = "isotonic_continuous"
+
+    def _fit_one(self, preds: np.ndarray, gt: np.ndarray, w: np.ndarray) -> object:
+        iso = IsotonicRegression(y_min=self.out_min, y_max=self.out_max, out_of_bounds="clip")
+        iso.fit(preds, gt, sample_weight=w)
+
+        # Extract knots from the step function
+        # X values are the unique values in preds used by the fit
+        x_knots = iso.X_
+        y_knots = iso.y_
+        
+        if len(x_knots) < 4:
+            return ("iso", iso)
+            
+        from scipy.interpolate import PchipInterpolator
+        pchip = PchipInterpolator(x_knots, y_knots, extrapolate=True)
+        return ("pchip", pchip, float(x_knots[0]), float(x_knots[-1]),
+                float(y_knots[0]), float(y_knots[-1]))
+
+    def _transform_one(self, model: object, preds: np.ndarray) -> np.ndarray:
+        kind = model[0]
+        if kind == "pchip":
+            _, pchip, x_lo, x_hi, y_lo, y_hi = model
+            out = pchip(preds)
+            out = np.where(preds < x_lo, y_lo, out)
+            out = np.where(preds > x_hi, y_hi, out)
+            return np.asarray(out)
+        return model[1].transform(preds)
+
+
+# ============================================================================
 # Convenience: fit all calibrators (with IS-weighting)
 # ============================================================================
 
@@ -356,7 +401,8 @@ def fit_all_calibrators(
     """
     out: Dict[str, PerGenderCalibratorBase] = {}
     for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator,
-                IsotonicRegimeCalibrator, IsotonicTailBoostCalibrator]:
+                IsotonicRegimeCalibrator, IsotonicTailBoostCalibrator,
+                ContinuousIsotonicCalibrator]:
         try:
             cal = cls(use_is_weight=use_is_weight).fit(preds, gt, gender)
             out[cal.name] = cal

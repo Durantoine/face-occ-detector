@@ -52,25 +52,54 @@ def _build_backbone(
     return backbone, backbone.config.hidden_size
 
 
-def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor) -> torch.Tensor:
+def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor, model_name: str) -> torch.Tensor:
     """Return (B, N, D) — sequence of token/spatial features compatible with all pools.
 
-    For ViT-like backbones: native (B, N, D) where N = num_patches + (CLS).
-    For timm CNN (features_only): (B, C, H, W) → reshaped to (B, H·W, C). No CLS token,
-    so CLSPooling won't work — use K-query, MHA, MIL or mean_var.
+    Standardizes output to [CLS, Patches] for ViTs (removing registers/storage tokens)
+    or [Patches] for CNNs.
     """
+    if _is_dinov3(model_name) and hasattr(backbone, "get_intermediate_layers"):
+        # DINOv3 get_intermediate_layers returns only patches by default.
+        # We ask for CLS to maintain standardized [CLS, Patches] for pooling.
+        layers = backbone.get_intermediate_layers(pixel_values, n=1, return_class_token=True)
+        patches, cls_token = layers[0]
+        return torch.cat([cls_token.unsqueeze(1), patches], dim=1)
+
     if hasattr(backbone, "get_intermediate_layers"):
+        # Generic ViT with intermediate layers support
         return backbone.get_intermediate_layers(pixel_values, n=1)[0]
+
     out = backbone(pixel_values)
     if isinstance(out, (tuple, list)):
         out = out[0]
     if hasattr(out, "last_hidden_state"):
-        return out.last_hidden_state
-    # timm CNN features_only returns list of (B, C, H, W); we already selected out_indices=(-1,)
-    if isinstance(out, torch.Tensor) and out.dim() == 4:
-        # (B, C, H, W) → (B, H·W, C)
-        b, c, h, w = out.shape
-        return out.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        out = out.last_hidden_state
+
+    if _is_timm_cnn(model_name):
+        if isinstance(out, torch.Tensor) and out.dim() == 4:
+            # (B, C, H, W) → (B, H·W, C)
+            b, c, h, w = out.shape
+            return out.permute(0, 2, 3, 1).reshape(b, h * w, c)
+        return out
+
+    # Generic ViT handling (e.g. Sapiens2 which returns [CLS, Registers, Patches])
+    if isinstance(out, torch.Tensor) and out.dim() == 3:
+        B, N_tot, D = out.shape
+        # Infer patch count. Sapiens2 and DINOv3 use patch_size=16.
+        # image_size is usually 224 -> 14x14 = 196 patches.
+        H_img, W_img = pixel_values.shape[-2:]
+        # Try to detect if it's a ViT by seeing if N_tot is around expected patch count
+        for ps in [16, 14, 32, 8]:
+            n_patches = (H_img // ps) * (W_img // ps)
+            if n_patches > 0 and n_patches <= N_tot:
+                n_extra = N_tot - n_patches
+                if n_extra > 0:
+                    # Found a match. Standardize to [CLS, Patches], skipping registers.
+                    cls_token = out[:, 0:1, :]
+                    patches = out[:, n_extra:, :]
+                    return torch.cat([cls_token, patches], dim=1)
+                break
+
     return out
 
 
@@ -84,6 +113,7 @@ class CLSPooling(nn.Module):
         return self.dim
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        # Standardized _forward_backbone ensures CLS is at index 0
         return x[:, 0, :], None
 
 
@@ -106,20 +136,9 @@ class GAPPooling(nn.Module):
 class GridPooling(nn.Module):
     """Spatial grid average pooling: AdaptiveAvgPool2d(grid_size) → (B, grid²·D).
 
-    Faces are canonically aligned (eyes top, mouth bottom, ears sides) so a coarse
-    spatial grid naturally captures region-specific occlusion (glasses=top, mask=bottom,
-    scarf=lower, hair=sides). 0 learnable parameters in the pool itself — only the
-    downstream Linear(grid²·D, output_dim) learns the region weighting.
-
-    Tradeoffs vs other poolings :
-        - GAP (=Grid 1×1)  : output (B, D)     — discards all spatial info
-        - Grid 2×2          : output (B, 4·D)  — upper/lower × left/right quadrants
-        - Grid 3×3          : output (B, 9·D)  — finer (forehead/eyes/mouth × L/C/R)
-        - K-query attention : output (B, K·D)  — learned regions, more flexible but +params
-        - MIL multi         : output (B, 4)    — global stats only, no spatial
-
-    Requires square spatial (N = H·W = perfect square). True for our backbones at 224 :
-    ViT-B/16 → 14², CoAtNet → 7², EffNet-B0 → 7².
+    Requires square spatial (N = H·W = perfect square).
+    If input is not square (e.g. includes registers), we take the last perfect
+    square of tokens.
     """
     def __init__(self, dim: int, grid_size: int = 2, skip_cls: bool = False) -> None:
         super().__init__()
@@ -134,13 +153,17 @@ class GridPooling(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         patches = x[:, 1:, :] if self.skip_cls else x
         B, N, D = patches.shape
-        H = int(round(N ** 0.5))
+        H = int(N ** 0.5)
         if H * H != N:
-            raise ValueError(f"GridPooling: expected square spatial, got N={N}")
+            # Robustness: take the last perfect square of tokens (assume they are the patches)
+            N = H * H
+            patches = patches[:, -N:, :]
+        
         # (B, N=H·W, D) → (B, D, H, W) for adaptive pool
         spatial = patches.transpose(1, 2).reshape(B, D, H, H)
         pooled = F.adaptive_avg_pool2d(spatial, self.grid_size)  # (B, D, g, g)
         return pooled.flatten(1), None  # (B, D·g²)
+
 
 
 class MeanVarPooling(nn.Module):
@@ -562,7 +585,7 @@ class FaceOccRegressor(nn.Module):
             self.backbone.gradient_checkpointing_disable()
 
     def forward(self, pixel_values: torch.Tensor, **kwargs: Any) -> Dict[str, torch.Tensor]:
-        hidden = _forward_backbone(self.backbone, pixel_values)
+        hidden = _forward_backbone(self.backbone, pixel_values, self.model_name)
         pooled, attn_weights = self.pool(hidden)
         if self.projection is not None:
             pooled = self.projection(pooled)

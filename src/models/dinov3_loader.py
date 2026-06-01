@@ -119,7 +119,8 @@ def get_image_processor(model_name: str, image_size: Optional[int] = None) -> An
             proc.size = {"height": int(image_size), "width": int(image_size)}
             proc.do_resize = True
         return proc
-    timm_prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv", "tf_efficientnet")
+    timm_prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv",
+                      "tf_efficientnet", "coatnet", "maxvit")
     if any(model_name.startswith(p) for p in timm_prefixes):
         proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
         proc.image_mean = list(IMAGENET_MEAN)

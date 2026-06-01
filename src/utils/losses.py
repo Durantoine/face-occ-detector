@@ -111,8 +111,8 @@ class WeightedMSELoss(nn.Module):
         return (err_f + err_m) / 2.0 + lam * err_diff
 
 
-def sliced_wasserstein(x: torch.Tensor, y: torch.Tensor, n_projections: int = 50) -> torch.Tensor:
-    """Sliced Wasserstein-2 distance between two feature sets.
+def sliced_wasserstein(x: torch.Tensor, y: torch.Tensor, n_projections: int = 100) -> torch.Tensor:
+    """Sliced Wasserstein-2 distance between two feature sets (v16: L=100).
 
     Projects x, y onto random 1D directions, computes 1D OT (= sorted L2) per
     projection, averages. Differentiable, batch-size-agnostic (handles unequal
@@ -136,6 +136,55 @@ def sliced_wasserstein(x: torch.Tensor, y: torch.Tensor, n_projections: int = 50
         y_sorted = torch.nn.functional.interpolate(y_sorted.unsqueeze(1), size=n, mode="linear", align_corners=True).squeeze(1)
 
     return ((x_sorted - y_sorted) ** 2).mean()
+
+
+def sinkhorn_distance(
+    x: torch.Tensor, y: torch.Tensor,
+    eps: float = 0.1, n_iter: int = 50,
+) -> torch.Tensor:
+    """Entropic OT distance (Sinkhorn algorithm, Cuturi 2013) — log-space stable.
+
+    Computes <P, C> where P is the optimal entropy-regularized transport plan
+    between empirical distributions of x and y:
+        P = argmin_{P∈U(a,b)} <P, C> - eps · H(P)
+        U(a, b) = {P ≥ 0 : P·1 = a, P^T·1 = b}    (couplings with uniform marginals)
+        C_ij = ||x_i - y_j||²                       (squared Euclidean cost)
+
+    Plus précis que sliced_wasserstein (vraie OT régularisée, pas projections 1D),
+    mais ~3-5× plus coûteux à batch=128. Numérique stable via log-sum-exp.
+
+    Args:
+        eps: entropy regularization. Plus petit = plus proche de W2 exact mais moins stable.
+        n_iter: itérations Sinkhorn (converge en 20-100 typiquement)
+
+    Returns:
+        Coût d'OT régularisé approximation de W2² (scalar tensor).
+    """
+    import math
+    if x.shape[0] < 2 or y.shape[0] < 2:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+
+    n_x, n_y = x.shape[0], y.shape[0]
+    C = torch.cdist(x, y).pow(2)                                                  # (n_x, n_y)
+
+    # Log-space marginals (uniform): log a_i = -log(n_x), log b_j = -log(n_y)
+    log_a = torch.full((n_x,), -math.log(n_x), device=x.device, dtype=x.dtype)
+    log_b = torch.full((n_y,), -math.log(n_y), device=y.device, dtype=y.dtype)
+    log_K = -C / eps                                                              # log Gibbs kernel
+
+    # Sinkhorn log-iterations:
+    #   log_v = log_b - logsumexp(log_K + log_u[:, None], dim=0)
+    #   log_u = log_a - logsumexp(log_K + log_v[None, :], dim=1)
+    log_u = torch.zeros_like(log_a)
+    log_v = torch.zeros_like(log_b)
+    for _ in range(n_iter):
+        log_v = log_b - torch.logsumexp(log_K + log_u[:, None], dim=0)
+        log_u = log_a - torch.logsumexp(log_K + log_v[None, :], dim=1)
+
+    # Transport plan in log-space: log P_ij = log u_i + log K_ij + log v_j
+    log_P = log_u[:, None] + log_K + log_v[None, :]
+    P = log_P.exp()
+    return (P * C).sum()
 
 
 def mmd_rbf(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

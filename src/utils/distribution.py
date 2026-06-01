@@ -130,75 +130,69 @@ def estimate_test_pmf_joint(
 
 def compute_balancing_weights(
     targets: np.ndarray, gender: np.ndarray,
-    axis1_power: float, axis2_power: float,
-    sampler_participation: float = 0.0,
+    correction_strength: float,
     n_bins: int = N_BINS, bin_width: float = BIN_WIDTH,
     test_pmf_y: np.ndarray = _TEST_PMF,
-    axis2_target_g: np.ndarray = _TEST_P_GENDER,
     clip: float = 10.0,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-sample weights for the unified balancing framework.
+) -> np.ndarray:
+    """Per-sample loss weight for the unified P_target under H_C (v16).
 
-    Returns (sampler_weights, loss_weights), both normalized to mean=1.
+    Framework (single-axis under H_C)
+    ----------------------------------
+    Under H_C  ⟹  P_test_joint(g, y) = P_train(g|y) · P_test(y).
 
-    Framework
-    ---------
-    Target distribution (per-cell (g, b)) :
-        P_target(g, y) = mix_y(α1)[y] · mix_g(α2)[g | y]
-            mix_y(α1)[y]    = (1-α1)·P_train(y) + α1·P_test(y)        ← axe 1 (Y marginal)
-            mix_g(α2)[g|y]  = (1-α2)·P_train(g|y) + α2·axis2_target_g ← axe 2
+    Cible unifiée avec un SEUL paramètre `α = correction_strength ∈ [0, 1]` :
+        P_target(g, y) = (1-α)·P_train(g, y) + α·P_test_joint(g, y)
+                      = P_train(g|y) · [(1-α)·P_train(y) + α·P_test(y)]
+                      = P_train(g|y) · mix_y(α)[y]
 
-    `axis2_target_g` default = `_TEST_P_GENDER ≈ (0.49, 0.51)` — la marginale P_test(g)
-    estimée via MID + DINOv3 probe. Constante sur y (= correction "marginale").
-    Alternative future : (0.5, 0.5) uniforme per-bin (force la parité conditionnelle).
+    Le facteur `P_train(g|y)` s'annule au ratio per-cellule :
+        ratio(g, y) = P_target(g, y) / P_train(g, y)
+                   = mix_y(α)[y] / P_train(y)
+                   = (1 - α) + α · (P_test(y) / P_train(y))
 
-    Split of correction between sampler and loss (sampler_participation = sp ∈ [0, 1]) :
-        P_sampler(g, y) = (1-sp) · P_train(g, y) + sp · P_target(g, y)
-                       = lerp(P_train, P_target, sp)
+    Le ratio dépend SEULEMENT de y (par bin). w_loss_i = ratio(y_i), clip [1/clip, clip].
+    Estimateur unbiased : E_{i∼P_train}[w_loss · ℓ_i] = E_P_target[ℓ].
 
-        w_sampler_i = P_sampler / P_train = (1-sp) + sp · ratio_i
-        w_loss_i    = P_target / P_sampler = ratio_i / ((1-sp) + sp · ratio_i)
-
-    where ratio_i = P_target(g_i, y_i) / P_train(g_i, y_i), clipped to [1/clip, clip].
-
-    Edge cases:
-        sp = 0 → w_sampler = 1 (no sampler effect), w_loss = ratio (loss-only)
-        sp = 1 → w_sampler = ratio (sampler does all), w_loss = 1 (no further loss correction)
-
-    Estimator E_batch[w_loss · ℓ] = E_P_target[ℓ] is unbiased regardless of sp.
+    v16 simplifications vs v15 :
+        - 1 paramètre α (au lieu de axis1_power + axis2_power)
+        - Pas de sampler (avec P_train(F)=0.32 et batch=128, ~41 F par batch — assez
+          pour MMD/DANN/OT et pour la variance des gradients fairness)
+        - axis2 effective fixé à 0 (cohérent avec H_C validé à 0.6 pt)
+        - Marginale G corrigée gratuitement via H_C (mix_y change ⇒ P_target(g) suit
+          la marginale prédite via H_C)
     """
     g = (np.asarray(gender) >= 0.5).astype(int)
     b = np.clip((np.asarray(targets) / bin_width).astype(int), 0, n_bins - 1)
     p_joint = empirical_pmf_joint(targets, gender, n_bins=n_bins, bin_width=bin_width)
     p_train_y = p_joint.sum(axis=0)
     safe_y = np.maximum(p_train_y, 1e-9)
-    p_train_g_given_y = p_joint / safe_y[None, :]
 
-    p_target_y = (1.0 - axis1_power) * p_train_y + axis1_power * test_pmf_y
-    target_g_broadcast = np.asarray(axis2_target_g, dtype=np.float64)[:, None] * np.ones((1, n_bins))
-    p_target_g_given_y = (1.0 - axis2_power) * p_train_g_given_y + axis2_power * target_g_broadcast
-    p_target_joint = p_target_y[None, :] * p_target_g_given_y
+    alpha = float(correction_strength)
+    p_target_y = (1.0 - alpha) * p_train_y + alpha * test_pmf_y
+    ratio_y = p_target_y / safe_y                                  # shape (n_bins,)
+    ratio_y = np.clip(ratio_y, 1.0 / clip, clip)
 
-    ratio_cell = p_target_joint / np.maximum(p_joint, 1e-9)
-    ratio_cell = np.clip(ratio_cell, 1.0 / clip, clip)
-    ratio_i = ratio_cell[g, b]
-
-    sp = float(sampler_participation)
-    sampler_w = (1.0 - sp) + sp * ratio_i
-    loss_w = ratio_i / np.maximum(sampler_w, 1e-9)
-
-    sampler_w = sampler_w / max(float(sampler_w.mean()), 1e-9)
-    loss_w = loss_w / max(float(loss_w.mean()), 1e-9)
-    return sampler_w.astype(np.float32), loss_w.astype(np.float32)
+    sample_w = ratio_y[b]                                          # gender-independent
+    sample_w = sample_w / max(float(sample_w.mean()), 1e-9)
+    return sample_w.astype(np.float32)
 
 
-# Backward-compat alias — returns only the loss_weights component.
-def compute_target_weights(*args, **kwargs) -> np.ndarray:
-    """Deprecated alias: prefer compute_balancing_weights which returns BOTH
-    sampler_weights and loss_weights. This wrapper assumes sampler_participation=0
-    (loss-only correction) and returns only loss_weights."""
-    _, loss_w = compute_balancing_weights(*args, sampler_participation=0.0, **kwargs)
-    return loss_w
+# Backward-compat alias for older call sites that still use compute_target_weights.
+def compute_target_weights(
+    targets: np.ndarray, gender: np.ndarray,
+    axis1_power: float = 0.0, axis2_power: float = 0.0,
+    **kwargs: object,
+) -> np.ndarray:
+    """Deprecated: maps the legacy (axis1, axis2) interface to the unified single-axis
+    framework. Uses `correction_strength = axis1_power` (axis2 ignored under H_C)."""
+    kwargs.pop("sampler_participation", None)
+    kwargs.pop("axis2_target_g", None)
+    return compute_balancing_weights(
+        targets, gender,
+        correction_strength=float(axis1_power),
+        **{k: v for k, v in kwargs.items() if k in {"n_bins", "bin_width", "test_pmf_y", "clip"}},
+    )
 
 
 # ============================================================================

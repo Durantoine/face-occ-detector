@@ -63,8 +63,8 @@ _NON_HF_TRAIN_KEYS = {
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
     "loss_lambda_threshold",
-    "axis1_power", "axis2_power", "sampler_participation",
-    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
+    "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
+    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_query_diversity_lambda",
     "save_qualitative_k",
     "layer_decay",
@@ -275,6 +275,8 @@ class WeightedMSETrainer(Trainer):
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
         ot_lambda: float = 0.0,
+        sinkhorn_lambda: float = 0.0,
+        sinkhorn_eps: float = 0.1,
         layer_decay: float = 1.0,
         gender_sampler: Optional[Any] = None,
         *args: Any,
@@ -285,6 +287,8 @@ class WeightedMSETrainer(Trainer):
         self._adv_lambda = float(adv_lambda)
         self._mmd_lambda = float(mmd_lambda)
         self._ot_lambda = float(ot_lambda)
+        self._sinkhorn_lambda = float(sinkhorn_lambda)
+        self._sinkhorn_eps = float(sinkhorn_eps)
         self._layer_decay = float(layer_decay)
         self._gender_sampler = gender_sampler
         self.loss_fct = WeightedMSELoss(
@@ -298,8 +302,8 @@ class WeightedMSETrainer(Trainer):
         print(f"WeightedMSETrainer: focal_gamma={focal_gamma}, "
               f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ_max={lambda_max}, λ_ema={lambda_ema}, "
               f"query_div={query_diversity_lambda}, adv={adv_lambda}, "
-              f"mmd={mmd_lambda}, ot={ot_lambda}, layer_decay={layer_decay}, "
-              f"gender_sampler={'ON' if gender_sampler is not None else 'off'}")
+              f"mmd={mmd_lambda}, ot={ot_lambda}, sinkhorn={sinkhorn_lambda}, "
+              f"layer_decay={layer_decay}")
 
     def _get_train_sampler(self, *args: Any, **kwargs: Any) -> Any:
         if self._gender_sampler is not None:
@@ -379,6 +383,16 @@ class WeightedMSETrainer(Trainer):
                 m_mask = g >= 0.5
                 sw = sliced_wasserstein(feats[f_mask], feats[m_mask])
                 loss = loss + self._ot_lambda * sw
+
+        if self._sinkhorn_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
+            if labels.dim() == 2 and labels.size(1) >= 2:
+                from src.utils.losses import sinkhorn_distance
+                feats = outputs["features"]
+                g = labels[:, 1]
+                f_mask = g < 0.5
+                m_mask = g >= 0.5
+                sk = sinkhorn_distance(feats[f_mask], feats[m_mask], eps=self._sinkhorn_eps)
+                loss = loss + self._sinkhorn_lambda * sk
 
         return (loss, outputs) if return_outputs else loss
 
@@ -484,21 +498,17 @@ def _build_datasets(
     processor: Any,
     image_base_dir: Optional[str],
     augmentation_level: str,
-    axis1_power: float,
-    axis2_power: float,
-    sampler_participation: float = 0.0,
-) -> Tuple[FaceOccDataset, FaceOccDataset, Dict[str, float], np.ndarray]:
+    correction_strength: float,
+) -> Tuple[FaceOccDataset, FaceOccDataset, Dict[str, float]]:
     transform = build_train_transform(augmentation_level)
     targets_arr = train_data["FaceOcclusion"].astype(float).values
     gender_arr = train_data["gender"].astype(float).values
 
     from src.utils.distribution import compute_balancing_weights
-    sampler_weights, loss_weights = compute_balancing_weights(
+    loss_weights = compute_balancing_weights(
         targets=targets_arr,
         gender=gender_arr,
-        axis1_power=axis1_power,
-        axis2_power=axis2_power,
-        sampler_participation=sampler_participation,
+        correction_strength=correction_strength,
     )
 
     train_ds = FaceOccDataset(
@@ -528,13 +538,10 @@ def _build_datasets(
         "loss_weight_max": float(loss_weights.max()),
         "loss_weight_mean": float(loss_weights.mean()),
         "loss_weight_std": float(loss_weights.std()),
-        "sampler_weight_min": float(sampler_weights.min()),
-        "sampler_weight_max": float(sampler_weights.max()),
-        "sampler_weight_std": float(sampler_weights.std()),
         "target_mean_weighted": target_mean_weighted,
         "target_mean_unweighted": float(targets_arr.mean()),
     }
-    return train_ds, val_ds, summary, sampler_weights
+    return train_ds, val_ds, summary
 
 
 def _start_or_attach_run(
@@ -739,18 +746,23 @@ def train(
     image_base_dir = data_cfg.get("image_base_dir")
     augmentation_level = train_cfg.get("augmentation_level", "light")
 
-    axis1_power = float(train_cfg.get("axis1_power", 0.0))
-    axis2_power = float(train_cfg.get("axis2_power", 0.0))
-    sampler_participation = float(train_cfg.get("sampler_participation", 0.0))
+    # v16: 1 single axis (under H_C). axis1_power kept as fallback name for backward compat.
+    correction_strength = float(train_cfg.get("correction_strength",
+                                                train_cfg.get("axis1_power", 0.0)))
     layer_decay = float(train_cfg.get("layer_decay", 1.0))
 
     feature_fairness = str(train_cfg.get("feature_fairness", "none"))
     mmd_active = feature_fairness == "mmd"
     dann_active = feature_fairness == "dann"
     ot_active = feature_fairness == "ot"
+    ot_method = str(train_cfg.get("ot_method", "sliced"))   # 'sliced' or 'sinkhorn'
     mmd_lambda = float(train_cfg.get("mmd_lambda", 0.0)) if mmd_active else 0.0
     adv_lambda = float(train_cfg.get("adv_lambda", 0.01)) if dann_active else 0.0
+    # Single ot_lambda dispatched to either Sliced-W (default, fast) or Sinkhorn (precise).
     ot_lambda = float(train_cfg.get("ot_lambda", 0.0)) if ot_active else 0.0
+    sinkhorn_eps = float(train_cfg.get("sinkhorn_eps", 0.1))
+    sliced_lambda = ot_lambda if (ot_active and ot_method == "sliced") else 0.0
+    sinkhorn_lambda = ot_lambda if (ot_active and ot_method == "sinkhorn") else 0.0
 
     client, run_id, use_client = _start_or_attach_run(
         cfg, mlflow_tracking_uri, mlflow_run_id, mlflow_experiment, use_mlflow,
@@ -765,21 +777,18 @@ def train(
     train_cfg_logged["adv_lambda"] = adv_lambda
     train_cfg_logged["mmd_lambda"] = mmd_lambda
     train_cfg_logged["ot_lambda"] = ot_lambda
+    train_cfg_logged["ot_method"] = ot_method if ot_active else "none"
+    train_cfg_logged["sinkhorn_eps"] = sinkhorn_eps if (ot_active and ot_method == "sinkhorn") else 0.0
     ml_log_params(client, run_id, train_cfg_logged)
     ml_log_params(client, run_id, dict(data_cfg))
 
     image_size = model_cfg.get("image_size")
     processor = get_image_processor(model_name, image_size=image_size)
     train_data, val_data, test_data = _load_train_val(data_cfg, data_csv, val_data_csv, val_seed or seed)
-    train_dataset, val_dataset, weight_summary, sampler_weights = _build_datasets(
+    train_dataset, val_dataset, weight_summary = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
-        axis1_power=axis1_power, axis2_power=axis2_power,
-        sampler_participation=sampler_participation,
+        correction_strength=correction_strength,
     )
-    # Use WeightedRandomSampler when sampler does any of the correction (sp > 0).
-    # Weights derive from compute_balancing_weights so the math (sampler_target = lerp
-    # between P_train and P_target) is consistent with what the loss expects via P_batch.
-    use_gender_sampler = sampler_participation > 0.0
     test_holdout_dataset = None
     if not test_data.empty:
         test_holdout_dataset = FaceOccDataset(
@@ -844,6 +853,7 @@ def train(
             mil_agg=str(model_cfg.get("mil_agg", "multi")),
             mil_hidden=int(model_cfg.get("mil_hidden", 128)),
             mil_k_top=int(model_cfg.get("mil_k_top", 30)),
+            grid_size=int(model_cfg.get("grid_size", 2)),
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
             pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", 0.0)),
             enable_adv_disc=dann_active,
@@ -933,25 +943,11 @@ def train(
     else:
         compute_metrics = make_compute_metrics()
 
+    # v16: no sampler. With P_train(F)=0.324 and batch≥32, ~10-41 F per batch is
+    # plenty for MMD/DANN/OT (need ≥2) and for fairness gradient variance. The full
+    # P_target correction is carried by the per-sample loss weight (IS unbiased).
     gender_sampler = None
-    if use_gender_sampler:
-        from src.data.dataset import DistributedWeightedSampler
-        # DDP-aware: each rank draws disjoint shards from the SAME global weighted
-        # multinomial sequence (vs vanilla WeightedRandomSampler which would duplicate
-        # samples across ranks).
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        gender_sampler = DistributedWeightedSampler(
-            weights=sampler_weights,
-            num_samples=len(sampler_weights),
-            num_replicas=max(world_size, 1),
-            rank=max(local_rank, 0),
-            seed=int(val_seed or seed),
-            replacement=True,
-        )
-        print(f"DistributedWeightedSampler enabled (sp={sampler_participation:.2f}, "
-              f"axis1={axis1_power:.2f}, axis2={axis2_power:.2f}, "
-              f"world_size={world_size}, rank={local_rank})")
+    print(f"correction_strength={correction_strength:.2f} (loss-only, no sampler — v16)")
 
     ema_cb: Optional[EMAWeightCallback] = None
     ema_best_tracker: Optional[EMABestTracker] = None
@@ -989,7 +985,9 @@ def train(
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,
         mmd_lambda=mmd_lambda,
-        ot_lambda=ot_lambda,
+        ot_lambda=sliced_lambda,
+        sinkhorn_lambda=sinkhorn_lambda,
+        sinkhorn_eps=sinkhorn_eps,
         layer_decay=layer_decay,
         gender_sampler=gender_sampler,
         model=model,

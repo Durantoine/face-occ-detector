@@ -43,8 +43,8 @@ _TRAINING_KEYS = {
     "learning_rate", "weight_decay", "num_train_epochs", "warmup_ratio",
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level",
-    "axis1_power", "axis2_power", "sampler_participation",
-    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda",
+    "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
+    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
     "loss_query_diversity_lambda",
@@ -61,6 +61,7 @@ _MODEL_KEYS = {
     "n_focal", "n_diffuse", "n_free",
     "tau_focal_init", "tau_diffuse_init", "tau_free_init", "learnable_tau",
     "mil_agg", "mil_hidden", "mil_k_top",   # v13: MIL pooling
+    "grid_size",                              # v16: grid pooling
     "pool_attn_dropout", "pool_proj_dropout",
 }
 
@@ -370,7 +371,6 @@ def _validate_search_space(base_config: Dict[str, Any]) -> None:
         "loss_rw_strategy": "v4-v7",
         "correction_strategy": "v6.5",
         "correction_alpha": "v6.5",
-        "correction_strength": "v7",
         "axis1_sampler_share": "v8-v9 stick-breaking (retiré v10)",
         "axis1_loss_fraction": "v8 stick-breaking",
         "axis1_share_loss": "v8",

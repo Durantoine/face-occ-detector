@@ -16,7 +16,8 @@ def _is_dinov3(model_name: str) -> bool:
 
 def _is_timm_cnn(model_name: str) -> bool:
     """Detect timm CNN models (efficientnet*, resnet*, convnext*, etc.)."""
-    prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv", "tf_efficientnet")
+    prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv",
+                 "tf_efficientnet", "coatnet", "maxvit")
     return any(model_name.startswith(p) for p in prefixes)
 
 
@@ -87,12 +88,7 @@ class CLSPooling(nn.Module):
 
 
 class GAPPooling(nn.Module):
-    """Global Average Pool over patch dim → (B, D).
-
-    Mirrors the native CNN pretrained head (classifier was GAP + Linear). For
-    EfficientNet / ResNet etc, this preserves the pretrained representation
-    alignment instead of replacing GAP with K-query/MIL learned from scratch.
-    """
+    """Global Average Pool over patch dim → (B, D). Equivalent to AdaptiveAvgPool2d(1)."""
     def __init__(self, dim: int, skip_cls: bool = False) -> None:
         super().__init__()
         self.dim = dim
@@ -105,6 +101,46 @@ class GAPPooling(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         patches = x[:, 1:, :] if self.skip_cls else x
         return patches.mean(dim=1), None
+
+
+class GridPooling(nn.Module):
+    """Spatial grid average pooling: AdaptiveAvgPool2d(grid_size) → (B, grid²·D).
+
+    Faces are canonically aligned (eyes top, mouth bottom, ears sides) so a coarse
+    spatial grid naturally captures region-specific occlusion (glasses=top, mask=bottom,
+    scarf=lower, hair=sides). 0 learnable parameters in the pool itself — only the
+    downstream Linear(grid²·D, output_dim) learns the region weighting.
+
+    Tradeoffs vs other poolings :
+        - GAP (=Grid 1×1)  : output (B, D)     — discards all spatial info
+        - Grid 2×2          : output (B, 4·D)  — upper/lower × left/right quadrants
+        - Grid 3×3          : output (B, 9·D)  — finer (forehead/eyes/mouth × L/C/R)
+        - K-query attention : output (B, K·D)  — learned regions, more flexible but +params
+        - MIL multi         : output (B, 4)    — global stats only, no spatial
+
+    Requires square spatial (N = H·W = perfect square). True for our backbones at 224 :
+    ViT-B/16 → 14², CoAtNet → 7², EffNet-B0 → 7².
+    """
+    def __init__(self, dim: int, grid_size: int = 2, skip_cls: bool = False) -> None:
+        super().__init__()
+        self.dim = dim
+        self.grid_size = int(grid_size)
+        self.skip_cls = skip_cls
+
+    @property
+    def output_dim(self) -> int:
+        return self.dim * self.grid_size * self.grid_size
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        patches = x[:, 1:, :] if self.skip_cls else x
+        B, N, D = patches.shape
+        H = int(round(N ** 0.5))
+        if H * H != N:
+            raise ValueError(f"GridPooling: expected square spatial, got N={N}")
+        # (B, N=H·W, D) → (B, D, H, W) for adaptive pool
+        spatial = patches.transpose(1, 2).reshape(B, D, H, H)
+        pooled = F.adaptive_avg_pool2d(spatial, self.grid_size)  # (B, D, g, g)
+        return pooled.flatten(1), None  # (B, D·g²)
 
 
 class MeanVarPooling(nn.Module):
@@ -151,7 +187,7 @@ class MILPooling(nn.Module):
     Other values keep the single-agg behaviour for ablations.
     """
     def __init__(self, dim: int, hidden: int = 128, agg: str = "multi",
-                  k_top: int = 30, skip_cls: bool = True) -> None:
+                  k_top: int = 30, skip_cls: bool = True, dropout: float = 0.1) -> None:
         super().__init__()
         if agg not in ("multi", "mean", "max", "topk_mean", "attention"):
             raise ValueError(f"Unknown MIL agg: {agg}")
@@ -160,9 +196,12 @@ class MILPooling(nn.Module):
         self.agg = agg
         self.k_top = k_top
         self.skip_cls = skip_cls
+        # Scorer MLP with intermediate dropout — regularizes the per-patch scorer
+        # which otherwise overfits easily (single output dim → strong gradient signal).
         self.scorer = nn.Sequential(
             nn.Linear(dim, hidden),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
         needs_attn = agg in ("attention", "multi")
@@ -170,8 +209,10 @@ class MILPooling(nn.Module):
             self.attn_V = nn.Linear(dim, hidden)
             self.attn_U = nn.Linear(dim, hidden)
             self.attn_w = nn.Linear(hidden, 1)
+            self.attn_dropout = nn.Dropout(dropout)
         else:
             self.attn_V = self.attn_U = self.attn_w = None
+            self.attn_dropout = None
 
     @property
     def output_dim(self) -> int:
@@ -189,6 +230,7 @@ class MILPooling(nn.Module):
             gated = torch.tanh(self.attn_V(patches)) * torch.sigmoid(self.attn_U(patches))
             attn_logits = self.attn_w(gated).squeeze(-1)
             attn = F.softmax(attn_logits, dim=1)
+            attn = self.attn_dropout(attn)
             attn_p = (attn * scores).sum(dim=1, keepdim=True)
             pooled = torch.cat([mean_p, max_p, topk_p, attn_p], dim=-1)  # (B, 4)
         elif self.agg == "mean":
@@ -201,6 +243,7 @@ class MILPooling(nn.Module):
             gated = torch.tanh(self.attn_V(patches)) * torch.sigmoid(self.attn_U(patches))
             attn_logits = self.attn_w(gated).squeeze(-1)
             attn = F.softmax(attn_logits, dim=1)
+            attn = self.attn_dropout(attn)
             pooled = (attn * scores).sum(dim=1, keepdim=True)
         return pooled, scores  # (B, output_dim), (B, N)
 
@@ -253,6 +296,11 @@ class AttentionPooling(nn.Module):
         else:
             self.register_buffer("log_tau", log_taus)
 
+        # proj_q (v16) : transforme les queries learnable avant le dot product. Permet
+        # plus de capacité dans l'espace requête sans coût significatif (K·D params).
+        # Sans cette projection, les queries dot-product directement avec keys, ce qui
+        # peut être limitant si l'espace key est très "rotated" par proj_k.
+        self.proj_q = nn.Linear(dim, dim)
         self.proj_k = nn.Linear(dim, dim)
         self.proj_v = nn.Linear(dim, dim)
         self.attn_dropout = nn.Dropout(attn_dropout)
@@ -269,12 +317,13 @@ class AttentionPooling(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """x: (B, N, D)  →  pooled: (B, K·D), attn_weights: (B, K, N)"""
         D = x.size(-1)
+        q = self.proj_q(self.queries)                                  # (K, D) — v16
         k = self.proj_k(x)
         v = self.proj_v(x)
         scale = D ** 0.5
         taus = torch.exp(self.log_tau).view(self.K, 1)
 
-        scores = torch.einsum("kd,bnd->bkn", self.queries, k) / (scale * taus)
+        scores = torch.einsum("kd,bnd->bkn", q, k) / (scale * taus)
         weights = F.softmax(scores, dim=-1)
         weights = self.attn_dropout(weights)
 
@@ -300,12 +349,15 @@ def build_pooling(
     mil_agg: str = "multi",
     mil_hidden: int = 128,
     mil_k_top: int = 30,
+    grid_size: int = 2,
     has_cls: bool = True,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
     if pooling_type == "gap":
         return GAPPooling(dim=dim, skip_cls=has_cls)
+    if pooling_type == "grid":
+        return GridPooling(dim=dim, grid_size=grid_size, skip_cls=has_cls)
     if pooling_type == "mean_var":
         return MeanVarPooling(dim=dim, skip_cls=has_cls)
     if pooling_type == "mil":
@@ -399,6 +451,8 @@ class FaceOccRegressor(nn.Module):
         mil_agg: str = "multi",
         mil_hidden: int = 128,
         mil_k_top: int = 30,
+        # Grid pooling
+        grid_size: int = 2,
         # Common pool regularization
         pool_attn_dropout: float = 0.0,
         pool_proj_dropout: float = 0.0,
@@ -430,6 +484,7 @@ class FaceOccRegressor(nn.Module):
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
             mil_agg=mil_agg, mil_hidden=mil_hidden, mil_k_top=mil_k_top,
+            grid_size=grid_size,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
             has_cls=has_cls,
         )

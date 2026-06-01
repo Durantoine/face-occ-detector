@@ -1,4 +1,4 @@
-name: sapiens2-01b-3090-v15
+name: sapiens2-01b-3090-v16
 description: |
   Sapiens2-0.1B v12 — mirror of dinov3-vitb16 v12.
   See dinov3-vitb16-3090-v12.yaml for rationale.
@@ -9,7 +9,7 @@ model:
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
-  pooling_type: cls   # native ViT head — best alignment with pretraining
+  pooling_type: attention_k_query   # v16: cls retiré
   n_focal: 2
   n_diffuse: 2
   n_free: 2
@@ -38,7 +38,7 @@ training:
   per_device_train_batch_size: 128
   per_device_eval_batch_size: 256
   gradient_accumulation_steps: 1
-  num_train_epochs: 13   # PINNED v15 (was HPO). Early stopping decides real duration.
+  num_train_epochs: 13   # PINNED v16 (was HPO). Early stopping decides real duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
   warmup_ratio: 0.1
@@ -60,7 +60,7 @@ training:
   # Lagrangien adaptatif : λ peut monter ET descendre via threshold (fix v14).
   loss_lambda_init: 1.0
   loss_lambda_lr: 0.5
-  loss_lambda_max: 5.0
+  loss_lambda_max: 3.0
   loss_lambda_ema: 0.9
   loss_lambda_threshold: 0.0005
   adv_lambda: 0.01
@@ -70,7 +70,7 @@ training:
 optuna:
   n_trials: 100
   objective_mode: score
-  rotate_val_seed: false   # v15 (was true): fix seed for ensemble + isotonic on common val.
+  rotate_val_seed: false   # v16 (was true): fix seed for ensemble + isotonic on common val.
   keep_top_n: 3
   search_space:
     pretrained_source:
@@ -82,15 +82,14 @@ optuna:
         - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
     pooling_type:
       type: categorical
-      choices: [cls, gap, attention_k_query, mil]
+      choices: [attention_k_query, mil, grid]   # v16: cls retiré
 
-    axis1_power: {type: float, low: 0.0, high: 1.0}
-    axis2_power: {type: float, low: 0.0, high: 1.0}
-    sampler_participation: {type: float, low: 0.0, high: 1.0}
+    # v16: single-axis correction under H_C (see docs/v16_theory.md §1)
+    correction_strength: {type: float, low: 0.0, high: 1.0}
 
     feature_fairness:
       type: categorical
-      choices: [none, ot, dann]
+      choices: [ot, dann]
     ot_lambda:
       type: float
       low: 0.01
@@ -105,6 +104,19 @@ optuna:
       log: true
       conditional_on:
         feature_fairness: dann
+    ot_method:
+      type: categorical
+      choices: [sliced, sinkhorn]
+      conditional_on:
+        feature_fairness: ot
+    sinkhorn_eps:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: ot
+        ot_method: sinkhorn
 
     loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
 
@@ -180,3 +192,9 @@ optuna:
       high: 50
       conditional_on:
         pooling_type: mil
+
+    grid_size:
+      type: categorical
+      choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14)
+      conditional_on:
+        pooling_type: grid

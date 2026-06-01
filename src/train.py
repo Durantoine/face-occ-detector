@@ -61,8 +61,8 @@ _NON_HF_TRAIN_KEYS = {
     "early_stopping_patience", "metric_for_best_model", "greater_is_better", "seed",
     "augmentation_level",
     "loss_focal_gamma",
-    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
-    "loss_lambda_threshold",
+    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min",
+    "loss_lambda_ema", "loss_lambda_threshold",
     "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_query_diversity_lambda",
@@ -240,26 +240,34 @@ class OptunaPruningCallback(TrainerCallback):
 
 
 class LambdaLogCallback(TrainerCallback):
-    """Logs adaptive Lagrangian λ + err_diff_ema at each epoch end. RANK 0 ONLY
-    (avoids sqlite lock contention with multiple jobs)."""
+    """v16.5: drives the adaptive Lagrangian λ from the CLEAN val signal (eval_err_diff
+    over 15k samples), updating once per epoch on on_evaluate. Logs λ to MLflow.
+
+    Previous version used per-batch err_diff_ema (training, noisy) which systematically
+    over-estimated err_diff (2-18× vs val) → λ stuck at cap.
+    """
     def __init__(self, trainer_ref: List[Any], client: Optional[Any], run_id: Optional[str]) -> None:
         self._trainer_ref = trainer_ref
         self._client = client
         self._run_id = run_id
 
-    def on_epoch_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        if not getattr(state, "is_world_process_zero", True):
-            return
-        if not self._trainer_ref:
+    def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
+        if metrics is None or not self._trainer_ref:
             return
         loss_fct = getattr(self._trainer_ref[0], "loss_fct", None)
-        if loss_fct is None or not hasattr(loss_fct, "lambda_adapt"):
+        if loss_fct is None or not hasattr(loss_fct, "update_lambda"):
             return
-        lam = float(loss_fct.lambda_adapt.item())
-        ema = float(loss_fct.err_diff_ema.item())
-        epoch = int(state.epoch or 0)
-        print(f"  Lagrangien epoch {epoch}: λ_adapt={lam:.4f}  err_diff_ema={ema:.6f}", flush=True)
-        ml_log_metrics(self._client, self._run_id, {"lambda_adapt": lam, "err_diff_ema": ema}, step=epoch)
+        val_err_diff = metrics.get("eval_err_diff")
+        if val_err_diff is None or not isinstance(val_err_diff, (int, float)):
+            return
+        # update_lambda is rank-safe: all ranks recompute the same lambda from same val signal
+        new_lambda = loss_fct.update_lambda(float(val_err_diff))
+        if getattr(state, "is_world_process_zero", True):
+            epoch = int(state.epoch or 0)
+            print(f"  Lagrangien epoch {epoch}: λ_adapt={new_lambda:.4f}  val_err_diff={float(val_err_diff):.6f}", flush=True)
+            ml_log_metrics(self._client, self._run_id,
+                            {"lambda_adapt": new_lambda, "val_err_diff_used": float(val_err_diff)},
+                            step=epoch)
 
 
 class WeightedMSETrainer(Trainer):
@@ -267,10 +275,10 @@ class WeightedMSETrainer(Trainer):
         self,
         focal_gamma: float = 0.0,
         lambda_init: float = 1.0,
-        lambda_lr: float = 0.5,
-        lambda_max: float = 5.0,
-        lambda_ema: float = 0.9,
-        lambda_threshold: float = 0.0005,
+        lambda_lr: float = 1.0,
+        lambda_max: float = 3.0,
+        lambda_min: float = 0.5,
+        lambda_threshold: float = 0.001,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
@@ -296,11 +304,12 @@ class WeightedMSETrainer(Trainer):
             lambda_init=lambda_init,
             lambda_lr=lambda_lr,
             lambda_max=lambda_max,
-            lambda_ema=lambda_ema,
+            lambda_min=lambda_min,
             lambda_threshold=lambda_threshold,
         )
         print(f"WeightedMSETrainer: focal_gamma={focal_gamma}, "
-              f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ_max={lambda_max}, λ_ema={lambda_ema}, "
+              f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ∈[{lambda_min}, {lambda_max}], "
+              f"threshold={lambda_threshold}, "
               f"query_div={query_diversity_lambda}, adv={adv_lambda}, "
               f"mmd={mmd_lambda}, ot={ot_lambda}, sinkhorn={sinkhorn_lambda}, "
               f"layer_decay={layer_decay}")
@@ -865,6 +874,12 @@ def train(
             target_mean=target_mean,
         )
     )
+    # Rank-aware diagnostic — helps detect silent rank crashes in the model construction
+    # path (root cause of mysterious DDP "_verify_param_shape" timeouts across trials).
+    _rank = int(os.environ.get("LOCAL_RANK", "0"))
+    _n_params = sum(p.numel() for p in model.parameters())
+    print(f"[Rank {_rank}] Model built: {model_name}, pooling={model_cfg.get('pooling_type')}, "
+          f"params={_n_params/1e6:.1f}M", flush=True)
 
     init_backbone_from = model_cfg.get("init_backbone_from") if pretrained else None
     if init_backbone_from:
@@ -983,10 +998,10 @@ def train(
     trainer = WeightedMSETrainer(
         focal_gamma=float(train_cfg.get("loss_focal_gamma", 0.0)),
         lambda_init=float(train_cfg.get("loss_lambda_init", 1.0)),
-        lambda_lr=float(train_cfg.get("loss_lambda_lr", 0.5)),
-        lambda_max=float(train_cfg.get("loss_lambda_max", 5.0)),
-        lambda_ema=float(train_cfg.get("loss_lambda_ema", 0.9)),
-        lambda_threshold=float(train_cfg.get("loss_lambda_threshold", 0.0005)),
+        lambda_lr=float(train_cfg.get("loss_lambda_lr", 1.0)),
+        lambda_max=float(train_cfg.get("loss_lambda_max", 3.0)),
+        lambda_min=float(train_cfg.get("loss_lambda_min", 0.5)),
+        lambda_threshold=float(train_cfg.get("loss_lambda_threshold", 0.001)),
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,
         mmd_lambda=mmd_lambda,
@@ -1005,7 +1020,8 @@ def train(
     )
     trainer_ref.append(trainer)
 
-    print(f"Training {cfg['name']} (best_metric={best_metric})")
+    _rank = int(os.environ.get("LOCAL_RANK", "0"))
+    print(f"[Rank {_rank}] Training {cfg['name']} (best_metric={best_metric}) — about to call accelerator.prepare via trainer.train()", flush=True)
     trainer.train()
 
     # HF has loaded the best-live epoch (via load_best_model_at_end). If the EMA shadow

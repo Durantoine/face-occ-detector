@@ -71,11 +71,12 @@ training:
   augmentation_level: none
   layer_decay: 1.0            # LLRD disabled (stages hétérogènes conv+attn)
   ema_decay: 0.999
+  # v16.5 Lagrangien refondu (update per-epoch sur val_err_diff clean)
   loss_lambda_init: 1.0
-  loss_lambda_lr: 0.5
+  loss_lambda_lr: 1.0
   loss_lambda_max: 3.0
-  loss_lambda_ema: 0.9
-  loss_lambda_threshold: 0.0005
+  loss_lambda_min: 0.5
+  loss_lambda_threshold: 0.001
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10

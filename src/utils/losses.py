@@ -27,12 +27,18 @@ class WeightedMSELoss(nn.Module):
     Per-group weighted MSE:
         Err_g = Σ w_i·(p-y)² / Σ w_i   with w_i = 1/30 + y_i  (+ optional sample reweight)
 
-    Training loss (Lagrangian, λ_adapt updated via gradient ascent on the constraint):
+    Training loss (Lagrangian):
         L = (Err_F + Err_M)/2 + λ_adapt · |Err_F - Err_M|
-        λ_adapt ← clip(λ_adapt + η · EMA(|Err_F - Err_M|),  0,  λ_max)
 
-    The challenge metric (logged separately by metrics.compute_score) always uses
-    λ_metric = 1.0 — only the TRAINING loss has an adaptive λ.
+    v16.5: λ updated EXTERNALLY by callback once per epoch from CLEAN val signal
+    (eval_err_diff over 15k samples), not from noisy per-batch EMA. Update rule:
+        λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), lambda_min, lambda_max)
+
+    `lambda_min` defaults to 1.0 = challenge metric coefficient — guarantees training
+    never optimizes a LESS fairness-pushing objective than the metric itself.
+    `lambda_max` caps how much extra push (e.g., 2.0 → max 2× metric).
+
+    The challenge metric (logged via compute_score) always uses λ_metric = 1.0.
     """
 
     def __init__(
@@ -40,20 +46,34 @@ class WeightedMSELoss(nn.Module):
         weight_offset: float = 1.0 / 30.0,
         focal_gamma: float = 0.0,
         lambda_init: float = 1.0,
-        lambda_lr: float = 0.5,
-        lambda_max: float = 5.0,
-        lambda_ema: float = 0.9,
-        lambda_threshold: float = 0.0005,
+        lambda_lr: float = 1.0,
+        lambda_max: float = 3.0,
+        lambda_min: float = 0.5,
+        lambda_threshold: float = 0.001,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset
         self.focal_gamma = focal_gamma
         self.lambda_lr = float(lambda_lr)
         self.lambda_max = float(lambda_max)
-        self.lambda_ema = float(lambda_ema)
+        self.lambda_min = float(lambda_min)
         self.lambda_threshold = float(lambda_threshold)
         self.register_buffer("lambda_adapt", torch.tensor(float(lambda_init)))
-        self.register_buffer("err_diff_ema", torch.tensor(0.0))
+
+    def update_lambda(self, val_err_diff: float) -> float:
+        """Called once per epoch by LambdaLogCallback after val eval. Uses CLEAN val
+        signal (15k samples) — avoids per-batch noise that previously caused the EMA
+        to systematically over-estimate err_diff and saturate λ at cap.
+
+        Update rule:
+            λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), λ_min, λ_max)
+        """
+        with torch.no_grad():
+            delta = self.lambda_lr * (float(val_err_diff) - self.lambda_threshold)
+            new_lambda = float(self.lambda_adapt.item()) + delta
+            new_lambda = max(self.lambda_min, min(self.lambda_max, new_lambda))
+            self.lambda_adapt.fill_(new_lambda)
+        return new_lambda
 
     def forward(
         self,
@@ -91,23 +111,8 @@ class WeightedMSELoss(nn.Module):
         err_m = (w[mask_m] * err[mask_m]).sum() / w[mask_m].sum().clamp(min=1e-8)
         err_diff = (err_f - err_m).abs()
 
-        if self.training:
-            lam = self.lambda_adapt
-            with torch.no_grad():
-                err_diff_sync = err_diff.detach().clone()
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.all_reduce(err_diff_sync, op=torch.distributed.ReduceOp.AVG)
-                self.err_diff_ema.mul_(self.lambda_ema).add_(err_diff_sync * (1.0 - self.lambda_ema))
-                # PROPER Lagrangian update with constraint threshold ε:
-                #   constraint:  |err_F - err_M| ≤ ε
-                #   λ_t+1 = clip(λ_t + η · (err_diff_ema - ε), 0, λ_max)
-                # If err_diff > ε (violated) → λ goes up. If < ε (satisfied) → λ goes down.
-                # Without -ε, λ would only go up (since err_diff_ema ≥ 0) → saturates at cap.
-                self.lambda_adapt.add_(self.lambda_lr * (self.err_diff_ema - self.lambda_threshold))
-                self.lambda_adapt.clamp_(0.0, self.lambda_max)
-        else:
-            lam = torch.tensor(1.0, device=err_diff.device, dtype=err_diff.dtype)
-
+        # λ used in training loss is the externally-updated buffer; eval uses λ_metric=1.
+        lam = self.lambda_adapt if self.training else torch.tensor(1.0, device=err_diff.device, dtype=err_diff.dtype)
         return (err_f + err_m) / 2.0 + lam * err_diff
 
 

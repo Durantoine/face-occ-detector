@@ -19,6 +19,7 @@ from src.utils.distributed import (
     broadcast,
     cleanup_distributed,
     is_main,
+    reinit_process_group,
     setup_distributed,
 )
 from src.utils.environment import setup_environment
@@ -46,7 +47,7 @@ _TRAINING_KEYS = {
     "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_focal_gamma",
-    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_ema",
+    "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min", "loss_lambda_ema",
     "loss_query_diversity_lambda",
     "layer_decay",
     "ema_decay",
@@ -276,7 +277,17 @@ def objective(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        barrier()
+        # Defensive: if NCCL was aborted earlier in this trial, dist.barrier() will
+        # raise. Catch so we don't propagate cleanup-time errors over the real failure.
+        try:
+            barrier()
+        except Exception as e_barrier:
+            print(f"[Trial {trial.number}] WARNING: barrier() failed in cleanup: {e_barrier}", flush=True)
+        # Re-init NCCL between trials to clear any stale communicator state from a
+        # previously failed/timed-out collective. Both ranks call this together.
+        # Cost ~5s but eliminates cross-trial NCCL contamination (root cause of mysterious
+        # `_verify_param_shape_across_processes` timeouts that started in v15/v16).
+        reinit_process_group()
 
     if mode == "pareto":
         return (score, err_diff)
@@ -522,10 +533,20 @@ def optimize_hyperparameters(
                 train(architecture_name=data["arch"], output_dir=f"{os.environ.get('TMPDIR', '/tmp')}/face_occ_results/optuna_{architecture}_trial_{data['n']}",
                       mlflow_tracking_uri=tracking_uri, mlflow_run_id=data["run_id"],
                       seed=data["seed"], val_seed=data["val_seed"])
-            except Exception:
-                pass
+            except Exception as e_train:
+                # Print the failure with rank info so we can diagnose silent rank crashes.
+                rank = int(os.environ.get("LOCAL_RANK", "0"))
+                print(f"[Rank {rank}] Trial {data['n']} train() raised: "
+                      f"{type(e_train).__name__}: {e_train}", flush=True)
             finally:
-                barrier()
+                # Same defensive barrier as in objective() — survive NCCL-aborted state.
+                try:
+                    barrier()
+                except Exception as e_barrier:
+                    rank = int(os.environ.get("LOCAL_RANK", "0"))
+                    print(f"[Rank {rank}] WARNING: barrier() failed in cleanup: {e_barrier}", flush=True)
+                # Mirror rank 0's NCCL re-init for clean cross-trial state.
+                reinit_process_group()
 
     if is_main():
         if use_mlflow and client and parent_run_id:

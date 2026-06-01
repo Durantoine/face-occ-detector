@@ -72,15 +72,17 @@ def _collect_metadata(
             "pretrained":           params.get("pretrained"),
             "init_backbone_from":   params.get("init_backbone_from"),
             "pooling_type":         params.get("pooling_type"),
-            # v10 unified rebalancing
-            "axis1_power":           params.get("axis1_power"),
-            "axis2_power":           params.get("axis2_power"),
-            "aug_share":             params.get("aug_share"),
-            "mmd_lambda":            params.get("mmd_lambda"),
+            # v16: single-axis correction (fallback to v10 axis1/2 for old runs)
+            "correction_strength":   params.get("correction_strength",
+                                                 params.get("axis1_power")),
             "feature_fairness":      params.get("feature_fairness"),
+            "ot_method":             params.get("ot_method"),
+            "ot_lambda":             params.get("ot_lambda"),
+            "sinkhorn_eps":          params.get("sinkhorn_eps"),
+            "adv_lambda":            params.get("adv_lambda"),
+            "mmd_lambda":            params.get("mmd_lambda"),
             "loss_focal_gamma":      params.get("loss_focal_gamma"),
-            "loss_fairness_lambda":  params.get("loss_fairness_lambda"),
-            "loss_type":             params.get("loss_type"),
+            "loss_lambda_max":       params.get("loss_lambda_max"),
             "learning_rate":         params.get("learning_rate"),
             "num_train_epochs":      params.get("num_train_epochs"),
             "augmentation_level":    params.get("augmentation_level"),
@@ -108,14 +110,13 @@ def _print_metadata_summary(metadata: Dict[str, Any]) -> None:
     init = key.get("init_backbone_from") or "—"
     print(f"  iBOT init         : {init}")
     print(f"  Pooling           : {key.get('pooling_type')}")
-    # v10 axes
-    print(f"  Axe 1 (Y shift) : α1={key.get('axis1_power')}")
-    print(f"  Axe 2 (G balance): α2={key.get('axis2_power')}")
-    print(f"  aug_share       : {key.get('aug_share')}")
-    print(f"  MMD λ           : {key.get('mmd_lambda')}")
-    print(f"  Feature fairness : {key.get('feature_fairness')}")
-    print(f"  Focal γ          : {key.get('loss_focal_gamma')}")
-    print(f"  λ_fairness        : {key.get('loss_fairness_lambda')}")
+    print(f"  Correction α       : {key.get('correction_strength')}    (v16: single-axis under H_C)")
+    print(f"  Feature fairness   : {key.get('feature_fairness')}  "
+          f"ot_method={key.get('ot_method')}  λ={key.get('ot_lambda') or key.get('adv_lambda')}")
+    if key.get("sinkhorn_eps"):
+        print(f"  Sinkhorn ε         : {key.get('sinkhorn_eps')}")
+    print(f"  Focal γ            : {key.get('loss_focal_gamma')}")
+    print(f"  Lagrangien λ_max   : {key.get('loss_lambda_max')}")
     print(f"  Post-hoc          : TTA={opts.get('use_tta')}  "
           f"bias={'on' if opts.get('bias_correction') else 'off'}  "
           f"quantile_match={opts.get('match_test_pmf')}")

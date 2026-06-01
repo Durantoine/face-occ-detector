@@ -54,6 +54,9 @@ def load_sapiens2(
         with_cls_token=True,
         drop_rate=drop_rate,
     )
+    # Expose patch_size for _forward_backbone token-standardization (avoids guessing
+    # via loop — robust if Sapiens variants ever use non-16 patches).
+    backbone.patch_size_used = 16
     if not pretrained:
         print(f"Sapiens2 {arch}: random init (pretrained=False)")
         return backbone

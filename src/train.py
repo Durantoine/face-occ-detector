@@ -735,8 +735,10 @@ def train(
     min_score_to_save: Optional[float] = None,
     optuna_trial: Any = None,
 ) -> Tuple[float, float, float, str, float, float]:
-    from src.utils.distributed import barrier
-    barrier()
+    # DDP coordination is handled at the trial boundary by the caller (optimize.py):
+    # SYNC 1 = broadcast(trial_data) at trial start, SYNC 2 = barrier() at trial end.
+    # Inside train(), HF Trainer + accelerator handle DDP internally (model wrap,
+    # gradient all-reduce, etc.) so no extra barriers are needed here.
     cfg = load_architecture_config(architecture_name).to_dict()
     train_cfg = cfg.get("training", {})
     model_cfg = cfg.get("model", {})
@@ -1351,8 +1353,6 @@ def train(
         if output_dir and output_dir != "./results":
             shutil.rmtree(output_dir, ignore_errors=True)
 
-    from src.utils.distributed import barrier
-    barrier()
     return eval_loss, eval_score, err_diff, model_uri, err_F, err_M
 
 

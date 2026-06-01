@@ -85,16 +85,20 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor, model_nam
     # Generic ViT handling (e.g. Sapiens2 which returns [CLS, Registers, Patches])
     if isinstance(out, torch.Tensor) and out.dim() == 3:
         B, N_tot, D = out.shape
-        # Infer patch count. Sapiens2 and DINOv3 use patch_size=16.
-        # image_size is usually 224 -> 14x14 = 196 patches.
         H_img, W_img = pixel_values.shape[-2:]
-        # Try to detect if it's a ViT by seeing if N_tot is around expected patch count
-        for ps in [16, 14, 32, 8]:
+        # Prefer an explicit hint set by the loader (most reliable for arch with non-16 ps).
+        # Falls back to a detection loop ordered SMALLEST→LARGEST patch_size (= largest
+        # n_patches first), so we pick the FINEST grid that fits N_tot — avoids
+        # misidentifying patch_size=14 (n=256) as patch_size=16 (n=196) when N_tot=257.
+        ps_hint = getattr(backbone, "patch_size_used", None)
+        candidate_ps = [int(ps_hint)] if ps_hint else [8, 14, 16, 32]
+        for ps in candidate_ps:
             n_patches = (H_img // ps) * (W_img // ps)
             if n_patches > 0 and n_patches <= N_tot:
                 n_extra = N_tot - n_patches
                 if n_extra > 0:
                     # Found a match. Standardize to [CLS, Patches], skipping registers.
+                    # CLS is always at position 0; registers (if any) sit between CLS and patches.
                     cls_token = out[:, 0:1, :]
                     patches = out[:, n_extra:, :]
                     return torch.cat([cls_token, patches], dim=1)

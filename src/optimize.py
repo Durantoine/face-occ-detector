@@ -200,9 +200,9 @@ def objective(
             "n": trial.number, "min_score_to_save": min_score_to_save,
         }
 
-    barrier()
+    # SYNC 1 (start of trial) — broadcast is itself a collective, no separate barrier needed.
+    # Non-main rank's broadcast(None) (optimize.py while loop) receives this trial_data.
     trial_data = broadcast(trial_data)
-    barrier()
     assert trial_data is not None
     arch_name = trial_data["arch"]
     run_id = trial_data["run_id"]
@@ -511,6 +511,9 @@ def optimize_hyperparameters(
         )
         broadcast(None)
     else:
+        # Non-main ranks: same trial loop, mirror rank-0's objective() lifecycle.
+        # SYNC 1: broadcast(None) matches rank 0's broadcast(trial_data) in objective.
+        # SYNC 2: barrier() at end of iter matches rank 0's barrier() in objective's finally.
         while True:
             data = broadcast(None)
             if data is None:
@@ -521,6 +524,8 @@ def optimize_hyperparameters(
                       seed=data["seed"], val_seed=data["val_seed"])
             except Exception:
                 pass
+            finally:
+                barrier()
 
     if is_main():
         if use_mlflow and client and parent_run_id:

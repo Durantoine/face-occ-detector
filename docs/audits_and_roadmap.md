@@ -51,6 +51,12 @@
 
 ## Roadmap — next steps
 
+### TODO v18+
+
+- **SWA (Stochastic Weight Averaging)** : retiré EMA poids modele en v17 (instable / pas convaincant). SWA est une alternative classique : moyenne des poids sur les derniers epochs apres convergence. Implementation timm/native pytorch ~50 lignes. Gain typique 0.3-0.8pt. Risque minimal (decoupled de DDP, pas de double eval).
+- **Ensembling final top-N post-HPO** : avec `rotate_val_seed=false`, tous les trials voient le meme val split → on peut moyenner les preds des top-3 trials sur val + recalibrer (isotonic) sur ensemble → +0.5-2pt typique. Script dedie a faire, post-HPO.
+- **MedianPruner → HyperbandPruner** : ✓ fait en v18 (min_resource=2, max_resource=13, reduction_factor=3). Plus efficient sur HPO long.
+
 ### Implemented and runnable now
 
 | # | Lever | Where | Status |

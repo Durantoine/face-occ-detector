@@ -48,7 +48,7 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v17"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v18"),
     "data_csv": "data/raw/train.csv",
     "val_data_csv": None,
     "output_dir": "./results",
@@ -97,24 +97,23 @@ class OptunaPruningCallback(TrainerCallback):
         self.metric_key = metric_key
 
     def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
-        if not getattr(state, "is_world_process_zero", True):
-            return
-        if metrics is None:
-            return
-        value = metrics.get(self.metric_key)
-        if value is None or not isinstance(value, (int, float)):
-            return
-        try:
-            self.trial.report(float(value), int(state.epoch or 0))
-            if self.trial.should_prune():
-                import optuna
-                raise optuna.exceptions.TrialPruned()
-        except Exception as e:
-            # Re-raise TrialPruned, swallow others (Optuna unavailable, etc.)
-            from optuna.exceptions import TrialPruned as _TP
-            if isinstance(e, _TP):
-                raise
-            print(f"[OptunaPruningCallback] WARNING: {e}", flush=True)
+        # Decide on rank 0, then broadcast to all ranks so that TrialPruned is raised
+        # SYMMETRICALLY. Raising only on rank 0 leaves rank 1 in the training loop —
+        # next backward all-reduce desyncs → NCCL hang → 10-min timeout → process death.
+        from src.utils.distributed import broadcast
+        should_prune = False
+        if getattr(state, "is_world_process_zero", True) and metrics is not None:
+            value = metrics.get(self.metric_key)
+            if isinstance(value, (int, float)):
+                try:
+                    self.trial.report(float(value), int(state.epoch or 0))
+                    should_prune = bool(self.trial.should_prune())
+                except Exception as e:
+                    print(f"[OptunaPruningCallback] WARNING: {e}", flush=True)
+        should_prune = bool(broadcast(should_prune, src=0))
+        if should_prune:
+            import optuna
+            raise optuna.exceptions.TrialPruned()
 
 
 class LambdaLogCallback(TrainerCallback):
@@ -153,9 +152,9 @@ class WeightedMSETrainer(Trainer):
         self,
         focal_gamma: float = 0.0,
         lambda_init: float = 1.0,
-        lambda_lr: float = 50.0,
+        lambda_lr: float = 0.2,
         lambda_max: float = 3.0,
-        lambda_min: float = 1,
+        lambda_min: float = 1.0,
         lambda_threshold: float = 0.0005,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
@@ -186,7 +185,7 @@ class WeightedMSETrainer(Trainer):
             lambda_threshold=lambda_threshold,
         )
         print(f"WeightedMSETrainer: focal_gamma={focal_gamma}, "
-              f"λ_init={lambda_init}, λ_lr={lambda_lr}, λ∈[{lambda_min}, {lambda_max}], "
+              f"λ_init={lambda_init}, λ_lr={lambda_lr} (log-space), λ∈[{lambda_min}, {lambda_max}], "
               f"threshold={lambda_threshold}, "
               f"query_div={query_diversity_lambda}, adv={adv_lambda}, "
               f"mmd={mmd_lambda}, ot={ot_lambda}, sinkhorn={sinkhorn_lambda}, "
@@ -447,6 +446,7 @@ def _save_model_to_mlflow(
             pytorch_model=raw,
             artifact_path="model",
             registered_model_name=model_register_name,
+            pip_requirements=[],
         )
         model_uri = info.model_uri
         with tempfile.TemporaryDirectory() as tmp:
@@ -722,12 +722,16 @@ def train(
             target_mean=target_mean,
         )
     )
-    # Rank-aware diagnostic — helps detect silent rank crashes in the model construction
-    # path (root cause of mysterious DDP "_verify_param_shape" timeouts across trials).
     _rank = int(os.environ.get("LOCAL_RANK", "0"))
     _n_params = sum(p.numel() for p in model.parameters())
+    _n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Rank {_rank}] Model built: {model_name}, pooling={model_cfg.get('pooling_type')}, "
-          f"params={_n_params/1e6:.1f}M", flush=True)
+          f"params={_n_params/1e6:.1f}M (trainable={_n_trainable/1e6:.1f}M)", flush=True)
+    if _n_trainable == 0:
+        raise RuntimeError(
+            f"[Rank {_rank}] Model has 0 trainable params (yaml load race or backbone init failure). "
+            f"Fail-fast before DDP collective to keep clear error per rank."
+        )
 
     init_backbone_from = model_cfg.get("init_backbone_from") if pretrained else None
     if init_backbone_from:
@@ -826,9 +830,9 @@ def train(
     trainer = WeightedMSETrainer(
         focal_gamma=float(train_cfg.get("loss_focal_gamma", 0.0)),
         lambda_init=float(train_cfg.get("loss_lambda_init", 1.0)),
-        lambda_lr=float(train_cfg.get("loss_lambda_lr", 50.0)),
+        lambda_lr=float(train_cfg.get("loss_lambda_lr", 0.2)),
         lambda_max=float(train_cfg.get("loss_lambda_max", 3.0)),
-        lambda_min=float(train_cfg.get("loss_lambda_min", 1)),
+        lambda_min=float(train_cfg.get("loss_lambda_min", 1.0)),
         lambda_threshold=float(train_cfg.get("loss_lambda_threshold", 0.0005)),
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,

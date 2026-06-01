@@ -1,23 +1,18 @@
-name: coatnet1-3090-v17
+name: coatnet3-3090-v18
 description: |
-  CoAtNet-1 (Dai et al. 2021, "Marrying Convolution and Attention for All Data Sizes")
-  41M params, native 224, hybride conv (MBConv) + attention (relative).
+  CoAtNet-3 (Dai et al. 2021) — 167M params, native 224, IN-12k pretrain.
+  ~4x capacité de CoAtNet-1. Pretrain IN-12k = ~12k classes (subset filtre IN-22k),
+  beaucoup plus de donnees que IN-1k -> meilleure init.
 
-  Pourquoi CoAtNet pour face occlusion :
-    - Native 224 (pas de hack input)
-    - Hybride : stages conv early (features locales = patches occlus) + stages attn late
-      (relations globales = cohérence du visage)
-    - ImageNet acc @224 = 84.1 (>>+ 2pt vs EffNet B0)
-    - fp16/bf16 stables
-    - Hierarchical comme CNN → output (B, C=768, H, W) compatible notre pipeline
-
-  Settings hérités EffNet (cohérence CNN-style) :
-    - GAP pooling default (head natif)
-    - fp16 (stable sur conv + relative attn)
-    - layer_decay = 1.0 (LLRD ill-defined sur stages hétérogènes)
+  Adjustments vs coatnet1-v18 :
+    - batch_size: 64 -> 24 (4x params, memory bound sur 3090 24GB)
+    - gradient_accumulation_steps: 1 -> 2 (effective batch 48, garde stat de gradient)
+    - learning_rate cap: 1e-4 -> 5e-5 (gros modeles preferent LR plus petit)
+    - layer_decay HPO: monte cote actif (LLRD utile sur 28 blocks vs 14 coatnet1)
+    - backbone_drop_path_rate HPO high 0.5 (regularise gros modele sur 80k samples)
 
 model:
-  model_name: coatnet_1_rw_224.sw_in1k    # timm: 41M, IN-1k pretrain, ImageNet 84.1
+  model_name: coatnet_3_rw_224.sw_in12k    # timm: 167M, IN-12k pretrain
   output_dim: 1
   head_dropout: 0.2
   projection_size: null
@@ -49,9 +44,9 @@ data:
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 64    # CoAtNet 41M @ 224, bf16/fp16 → batch 64 safe
-  per_device_eval_batch_size: 128
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 24    # CoAtNet-3 167M @ 224, fp16 -> batch 24 sur 24GB
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 2     # effective batch = 24 * 2 * 2_GPUs = 96
   num_train_epochs: 13
   learning_rate: 5.0e-05
   weight_decay: 0.05
@@ -67,16 +62,16 @@ training:
   greater_is_better: false
   bf16: false
   fp16: true                  # CoAtNet stable en fp16 (vs bf16 imprécis sur BN)
-  gradient_checkpointing: false
+  gradient_checkpointing: true   # save memory on 167M model
   augmentation_level: none
-  layer_decay: 1.0            # LLRD disabled (stages hétérogènes conv+attn)
+  layer_decay: 0.85           # LLRD on (28 blocks, gros modele benef de LR decay par couche)
   # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
   # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
   loss_lambda_init: 1.0
-  loss_lambda_lr: 200.0
-  loss_lambda_max: 3.0
-  loss_lambda_min: 1.0
-  loss_lambda_threshold: 0.0003
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -95,7 +90,7 @@ optuna:
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
       low: 0.01
@@ -126,10 +121,12 @@ optuna:
 
     loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
 
-    learning_rate: {type: float, low: 2.0e-05, high: 1.0e-04, log: true}
+    learning_rate: {type: float, low: 1.0e-05, high: 5.0e-05, log: true}
     min_lr_rate:   {type: float, low: 0.1, high: 0.5}
     weight_decay:  {type: float, low: 0.01, high: 0.20}
     head_dropout:  {type: float, low: 0.1, high: 0.4}
+    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.5}    # gros modele, plus de regularisation
+    layer_decay:   {type: float, low: 0.6, high: 1.0}              # LLRD utile sur 28 blocks
 
     pool_attn_dropout:
       type: float
@@ -165,19 +162,19 @@ optuna:
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
       low: 0
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 

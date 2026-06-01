@@ -32,7 +32,7 @@ from sklearn.isotonic import IsotonicRegression
 def compute_is_ratios(gt: np.ndarray) -> np.ndarray:
     """ratio_i = P_test(y_i) / P_train_emp(y_i).
 
-    Both P_test and P_train_emp computed on the same binning (15 bins × 0.0333).
+    Both P_test and P_train_emp computed on the same binning (cf src.utils.distribution.N_BINS).
     Clipped to [1/10, 10] then normalized to mean=1 (echelle hygiene, cf v3 trick).
     """
     from src.utils.distribution import _TEST_PMF, N_BINS, BIN_WIDTH, empirical_pmf_y

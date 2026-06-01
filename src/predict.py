@@ -201,9 +201,9 @@ def predict_csv(
                            bias_correction.get("delta_m", 0.0))
 
     if match_test_pmf:
-        from src.utils.losses import _TEST_PMF as _TEST_PMF_0025
+        from src.utils.losses import _TEST_PMF
         before_mean = float(preds.mean())
-        preds = quantile_match_to_test_pmf(preds, _TEST_PMF_0025)
+        preds = quantile_match_to_test_pmf(preds, _TEST_PMF)
         after_mean = float(preds.mean())
         print(f"Quantile-matched to P_test : mean shift {before_mean:.3f} → {after_mean:.3f}")
 

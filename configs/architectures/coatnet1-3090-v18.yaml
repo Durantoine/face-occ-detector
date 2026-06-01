@@ -1,15 +1,29 @@
-name: sapiens2-01b-3090-v17
+name: coatnet1-3090-v18
 description: |
-  Sapiens2-0.1B v12 — mirror of dinov3-vitb16 v12.
-  See dinov3-vitb16-3090-v12.yaml for rationale.
+  CoAtNet-1 (Dai et al. 2021, "Marrying Convolution and Attention for All Data Sizes")
+  41M params, native 224, hybride conv (MBConv) + attention (relative).
+
+  Pourquoi CoAtNet pour face occlusion :
+    - Native 224 (pas de hack input)
+    - Hybride : stages conv early (features locales = patches occlus) + stages attn late
+      (relations globales = cohérence du visage)
+    - ImageNet acc @224 = 84.1 (>>+ 2pt vs EffNet B0)
+    - fp16/bf16 stables
+    - Hierarchical comme CNN → output (B, C=768, H, W) compatible notre pipeline
+
+  Settings hérités EffNet (cohérence CNN-style) :
+    - GAP pooling default (head natif)
+    - fp16 (stable sur conv + relative attn)
+    - layer_decay = 1.0 (LLRD ill-defined sur stages hétérogènes)
 
 model:
-  model_name: sapiens2_0.1b
+  model_name: coatnet_1_rw_224.sw_in1k    # timm: 41M, IN-1k pretrain, ImageNet 84.1
   output_dim: 1
-  head_dropout: 0.1
+  head_dropout: 0.2
   projection_size: null
   output_activation: sigmoid
-  pooling_type: attention_k_query   # v16: cls retiré
+  pooling_type: attention_k_query
+  # image_size: omitted → default 224 (CoAtNet-1 native)
   n_focal: 2
   n_diffuse: 2
   n_free: 2
@@ -35,33 +49,34 @@ data:
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 128
-  per_device_eval_batch_size: 256
+  per_device_train_batch_size: 64    # CoAtNet 41M @ 224, bf16/fp16 → batch 64 safe
+  per_device_eval_batch_size: 128
   gradient_accumulation_steps: 1
-  num_train_epochs: 13   # PINNED v16 (was HPO). Early stopping decides real duration.
+  num_train_epochs: 13
   learning_rate: 5.0e-05
-  weight_decay: 0.10
+  weight_decay: 0.05
   warmup_ratio: 0.1
   lr_scheduler_type: cosine_with_min_lr
   lr_scheduler_kwargs:
-    min_lr_rate: 0.3   # HPO override via top-level `min_lr_rate` (see search_space)
+    min_lr_rate: 0.3
   max_grad_norm: 1.0
   early_stopping_patience: 3
   seed: 42
   logging_steps: 25
   metric_for_best_model: eval_challenge_score
   greater_is_better: false
-  bf16: true
-  fp16: false
+  bf16: false
+  fp16: true                  # CoAtNet stable en fp16 (vs bf16 imprécis sur BN)
   gradient_checkpointing: false
   augmentation_level: none
-  layer_decay: 0.85
+  layer_decay: 1.0            # LLRD disabled (stages hétérogènes conv+attn)
   # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
+  # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
   loss_lambda_init: 1.0
-  loss_lambda_lr: 200.0
-  loss_lambda_max: 3.0
-  loss_lambda_min: 1.0
-  loss_lambda_threshold: 0.0003
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -69,26 +84,18 @@ training:
 optuna:
   n_trials: 100
   objective_mode: score
-  rotate_val_seed: false   # v16 (was true): fix seed for ensemble + isotonic on common val.
+  rotate_val_seed: false
   keep_top_n: 3
   search_space:
-    pretrained_source:
-      type: categorical
-      choices:
-        - "sapiens_default"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_50000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
     pooling_type:
       type: categorical
-      choices: [attention_k_query, mil, grid]   # v16: cls retiré
+      choices: [attention_k_query, mil, grid]
 
-    # v16: single-axis correction under H_C (see docs/v16_theory.md §1)
     correction_strength: {type: float, low: 0.0, high: 1.0}
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
       low: 0.01
@@ -119,14 +126,10 @@ optuna:
 
     loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
 
-    # LR cap 2e-4 + layer_decay cap 0.9 (v11 trials sweet spot).
-    learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
-    # num_train_epochs PINNED at 13, early_stopping_patience=3 decides real duration.
+    learning_rate: {type: float, low: 2.0e-05, high: 1.0e-04, log: true}
     min_lr_rate:   {type: float, low: 0.1, high: 0.5}
-    weight_decay:  {type: float, low: 0.05, high: 0.50}
-    head_dropout:  {type: float, low: 0.0, high: 0.4}
-    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
-    layer_decay:   {type: float, low: 0.65, high: 0.9}
+    weight_decay:  {type: float, low: 0.01, high: 0.20}
+    head_dropout:  {type: float, low: 0.1, high: 0.4}
 
     pool_attn_dropout:
       type: float
@@ -140,7 +143,6 @@ optuna:
       high: 0.3
       conditional_on:
         pooling_type: attention_k_query
-
     loss_query_diversity_lambda:
       type: float
       low: 0.0
@@ -149,37 +151,36 @@ optuna:
         pooling_type: attention_k_query
     tau_focal_init:
       type: float
-      low: 0.03   # was 0.05; allow sharper attention (1-2 patches). bf16 safe limit
+      low: 0.03
       high: 0.3
       log: true
       conditional_on:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 0.5   # was 1.0; allow transition focal↔diffuse
+      low: 0.5
       high: 3.0
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
-      low: 0   # was 1; allow no diffuse queries (pure focal+free config)
-      high: 4
+      low: 0
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 
-    # MIL pooling: mil_agg pinned to "multi" (concat 4 aggs), no HPO needed.
     mil_hidden:
       type: categorical
       choices: [64, 128, 256]
@@ -192,8 +193,9 @@ optuna:
       conditional_on:
         pooling_type: mil
 
+    # Grid pooling: 2×2 (4 régions) ou 3×3 (9 régions)
     grid_size:
       type: categorical
-      choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14)
+      choices: [3, 4, 5, 6]
       conditional_on:
         pooling_type: grid

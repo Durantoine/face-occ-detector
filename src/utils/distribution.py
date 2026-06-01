@@ -25,28 +25,39 @@ import numpy as np
 # Binning + extracted test PMF (P_test(Y) measured from PDF via pixel reading)
 # ============================================================================
 
-N_BINS: int = 15
-BIN_WIDTH: float = 0.5 / N_BINS
+N_BINS: int = 25
+BIN_WIDTH: float = 0.5 / N_BINS   # = 0.02
 
-# P_test(Y) — 15 bins × 0.0333. Extracted from PDF page 3 via pdf-render-to-image
-# + per-column blue-bar height detection (cf docs/v12_theory.md §6.3).
-# Sums to 1.0 within float precision.
+# P_test(Y) — v18 re-extraction: 25 bins × 0.02 (vs v17 : 15 × 0.0333).
+# Resolution finer captures bumps a 0.05/0.10/0.15 visibles dans PDF page 3.
+# Script: scripts/extract_test_pmf_from_pdf.py (PyMuPDF render 300 DPI, blue
+# RGB mask, axis tick auto-calibration, mean bar height per target bin).
 _TEST_PMF: np.ndarray = np.array([
-    0.118034,
-    0.092728,
-    0.092810,
-    0.108154,
-    0.102878,
-    0.094643,
-    0.106911,
-    0.091066,
-    0.079910,
-    0.054407,
-    0.034125,
-    0.015720,
-    0.005424,
-    0.002145,
-    0.001046,
+    0.081394,
+    0.050224,
+    0.059882,
+    0.060745,
+    0.053540,
+    0.067261,
+    0.058360,
+    0.064360,
+    0.062282,
+    0.054443,
+    0.065130,
+    0.059760,
+    0.056048,
+    0.051151,
+    0.045269,
+    0.035512,
+    0.025891,
+    0.020349,
+    0.012773,
+    0.007651,
+    0.003732,
+    0.001861,
+    0.001295,
+    0.000603,
+    0.000487,
 ], dtype=np.float64)
 _TEST_PMF = _TEST_PMF / _TEST_PMF.sum()
 

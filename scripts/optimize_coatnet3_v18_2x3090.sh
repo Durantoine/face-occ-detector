@@ -1,20 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-efficientnet-b0-v17-optuna
+#SBATCH --job-name=face-occ-coatnet3-v18-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=100G
-#SBATCH --time=20:00:00
+#SBATCH --time=40:00:00
 
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - EfficientNet-B0 (CNN ~30M) v16 - Baseline CNN (2x 3090, BF16)"
-echo "  Backbone: timm tf_efficientnet_b0 (ImageNet pretrained)"
+echo "OPTUNA HPO - CoAtNet-3 (CNN ~167M) v18 - 167M IN-12k pretrain (2x 3090, BF16)"
+echo "  Backbone: timm tf_coatnet3 (ImageNet pretrained)"
 echo "  Pools: attention_k_query + mil (no CLS, no MHA)"
-echo "  All v16 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
+echo "  All v18 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
 echo "================================================================================"
 echo "Node: \$(hostname) | Job ID: \$SLURM_JOB_ID | GPUs: \$CUDA_VISIBLE_DEVICES"
 echo "Started: \$(date)"
@@ -47,7 +47,7 @@ export NCCL_TIMEOUT=3600
 
 ulimit -n 65536 || ulimit -n 8192
 
-export FACE_OCC_ARCH=efficientnet-b0-3090-v17
+export FACE_OCC_ARCH=coatnet3-3090-v18
 
 mkdir -p scripts/logs
 

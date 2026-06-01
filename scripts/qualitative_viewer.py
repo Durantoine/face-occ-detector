@@ -313,7 +313,7 @@ def _render_trials_comparison() -> None:
         return
 
     import re
-    _CURRENT_VERSION_RE = re.compile(r"-v15$")
+    _CURRENT_VERSION_RE = re.compile(r"-v18$")
     default_exps = [(eid, name) for eid, name in experiments
                     if name.startswith("optuna-") and _CURRENT_VERSION_RE.search(name)]
     if not default_exps:

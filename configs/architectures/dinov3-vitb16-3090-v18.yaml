@@ -1,4 +1,4 @@
-name: dinov3-vitb16-3090-v17
+name: dinov3-vitb16-3090-v18
 description: |
   DINOv3 ViT-B/16 (86M) v12 — refinements on top of v11.
 
@@ -72,10 +72,10 @@ training:
   # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
   # λ_metric=1 toujours utilisé en eval (challenge metric inchangée).
   loss_lambda_init: 1.0
-  loss_lambda_lr: 200.0          # équilibre atteint en 3-5 epochs
-  loss_lambda_max: 3.0           # max push fairness (3× métrique)
-  loss_lambda_min: 1.0           # plancher = métrique challenge
-  loss_lambda_threshold: 0.0003  # zone d'équilibre — λ stable autour de ce err_diff
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -105,7 +105,7 @@ optuna:
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
       low: 0.01
@@ -184,19 +184,19 @@ optuna:
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
       low: 0   # was 1; allow no diffuse queries (pure focal+free config)
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 

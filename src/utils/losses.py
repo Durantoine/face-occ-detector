@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import torch
@@ -30,15 +31,26 @@ class WeightedMSELoss(nn.Module):
     Training loss (Lagrangian):
         L = (Err_F + Err_M)/2 + λ_adapt · |Err_F - Err_M|
 
-    v16.5: λ updated EXTERNALLY by callback once per epoch from CLEAN val signal
-    (eval_err_diff over 15k samples), not from noisy per-batch EMA. Update rule:
-        λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), lambda_min, lambda_max)
+    v17.3: log-ratio update from CLEAN val signal (eval_err_diff over 15k samples),
+    once per epoch. Signal moteur = log(val_err_diff / threshold), invariant multiplicatif
+    → symétrique en ascent/descent. Pas de cap explicite : log() croît sub-linéairement,
+    soft-saturation naturelle (worst observé en DB : Δλ ≈ 0.6 pour spike val=0.011).
 
-    `lambda_min` defaults to 1.0 = challenge metric coefficient — guarantees training
-    never optimizes a LESS fairness-pushing objective than the metric itself.
-    `lambda_max` caps how much extra push (e.g., 2.0 → max 2× metric).
+    Update rule:
+        Δλ      = lambda_lr · log(max(val_err_diff, ε) / threshold)
+        λ_{t+1} = clip(λ_t + Δλ, lambda_min, lambda_max)
 
-    The challenge metric (logged via compute_score) always uses λ_metric = 1.0.
+    Properties:
+      - val_err = thr    ⇒ Δλ = 0                              (équilibre)
+      - val_err = thr·e  ⇒ Δλ = +lr                            (ex: +0.2)
+      - val_err = thr/e  ⇒ Δλ = -lr                            (symétrique)
+      - val_err → 0      ⇒ Δλ → -∞ (clip via lambda_min)
+      - val_err = 10·thr ⇒ Δλ = +lr·log(10) ≈ +2.3·lr          (=+0.46 si lr=0.2)
+
+    `lambda_min=1.0` = poids métrique : training pousse fairness AU MOINS autant que
+    la métrique même quand val_err < threshold (= pas de relâchement sous métrique).
+    `lambda_max=3.0` : marge haute, sat naturelle du log suffit (pas de jump style v17).
+    Challenge metric (compute_score) toujours évalué avec λ_metric = 1.0.
     """
 
     def __init__(
@@ -46,9 +58,9 @@ class WeightedMSELoss(nn.Module):
         weight_offset: float = 1.0 / 30.0,
         focal_gamma: float = 0.0,
         lambda_init: float = 1.0,
-        lambda_lr: float = 50.0,
+        lambda_lr: float = 0.2,
         lambda_max: float = 3.0,
-        lambda_min: float = 1,
+        lambda_min: float = 1.0,
         lambda_threshold: float = 0.0005,
     ) -> None:
         super().__init__()
@@ -61,15 +73,12 @@ class WeightedMSELoss(nn.Module):
         self.register_buffer("lambda_adapt", torch.tensor(float(lambda_init)))
 
     def update_lambda(self, val_err_diff: float) -> float:
-        """Called once per epoch by LambdaLogCallback after val eval. Uses CLEAN val
-        signal (15k samples) — avoids per-batch noise that previously caused the EMA
-        to systematically over-estimate err_diff and saturate λ at cap.
-
-        Update rule:
-            λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), λ_min, λ_max)
+        """Called once per epoch by LambdaLogCallback after val eval. log-ratio update,
+        symétrique multiplicative autour de threshold. Log sature naturellement.
         """
         with torch.no_grad():
-            delta = self.lambda_lr * (float(val_err_diff) - self.lambda_threshold)
+            err = max(float(val_err_diff), 1e-9)
+            delta = self.lambda_lr * math.log(err / max(self.lambda_threshold, 1e-9))
             new_lambda = float(self.lambda_adapt.item()) + delta
             new_lambda = max(self.lambda_min, min(self.lambda_max, new_lambda))
             self.lambda_adapt.fill_(new_lambda)

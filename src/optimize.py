@@ -27,7 +27,7 @@ from src.utils.mlflow_utils import get_or_create_experiment
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v17"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v18"),
     "n_trials": 100,
     "study_name": None,
     "tracking_uri": "sqlite:///mlflow.db",
@@ -47,6 +47,7 @@ _TRAINING_KEYS = {
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min",
+    "loss_lambda_threshold",
     "loss_query_diversity_lambda",
     "layer_decay",
     "min_lr_rate",
@@ -144,7 +145,15 @@ def create_trial_config(base_config: Dict[str, Any], trial: optuna.Trial, n: int
     cfg["name"] = f"{cfg['name']}_trial{n}"
     out = Path("configs/architectures/optuna_trials") / f"trial_{n}.yaml"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    payload = yaml.dump(cfg, default_flow_style=False, sort_keys=False)
+    # Atomic write + fsync so rank 1's NFS client sees the new bytes (close-to-open
+    # consistency requires explicit fsync to flush kernel page cache to server).
+    tmp = out.with_suffix(".yaml.tmp")
+    with open(tmp, "w") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(out)
     return f"optuna_trials/trial_{n}"
 
 
@@ -275,7 +284,18 @@ def objective(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
-        barrier()
+        # Defensive try/except: if NCCL was aborted earlier in this trial, barrier()
+        # raises. Swallow so cleanup doesn't propagate over the real failure and
+        # subsequent trials can attempt to recover.
+        _t_pre_barrier = time.perf_counter()
+        try:
+            barrier()
+        except Exception as e_barrier:
+            print(f"[Trial {trial.number}] WARNING: barrier() failed in cleanup: {e_barrier}", flush=True)
+        if is_main():
+            _wait = time.perf_counter() - _t_pre_barrier
+            print(f"[Trial {trial.number}] post-train barrier wait: {_wait:.1f}s "
+                  f"(if >5s ⇒ rank 1 still busy; if ~10min ⇒ NCCL timeout)", flush=True)
 
     if mode == "pareto":
         return (score, err_diff)
@@ -426,7 +446,13 @@ def _validate_pretrained_source_choices(base_config: Dict[str, Any], tracking_ur
 
 
 def _create_study_with_retry(study_name: str, storage: str, mode: str) -> optuna.Study:
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+    # HyperbandPruner: alloue exponentiellement plus de "budget" (epochs) aux trials
+    # qui survivent. Plus efficace que MedianPruner sur HPO long (100 trials), moins
+    # agressif tot et plus selectif tard. min_resource=2 (2 epochs warmup avant prune
+    # possible), max_resource=13 (= num_train_epochs), reduction_factor=3 (default).
+    pruner = optuna.pruners.HyperbandPruner(
+        min_resource=2, max_resource=13, reduction_factor=3,
+    )
     for _ in range(10):
         try:
             if mode == "pareto":
@@ -518,9 +544,15 @@ def optimize_hyperparameters(
                 train(architecture_name=data["arch"], output_dir=f"{os.environ.get('TMPDIR', '/tmp')}/face_occ_results/optuna_{architecture}_trial_{data['n']}",
                       mlflow_tracking_uri=tracking_uri, mlflow_run_id=data["run_id"],
                       seed=data["seed"], val_seed=data["val_seed"])
-            except Exception:
-                pass
-            barrier()
+            except Exception as e_train:
+                rank = int(os.environ.get("LOCAL_RANK", "0"))
+                print(f"[Rank {rank}] Trial {data['n']} train() raised: "
+                      f"{type(e_train).__name__}: {e_train}", flush=True)
+            try:
+                barrier()
+            except Exception as e_barrier:
+                rank = int(os.environ.get("LOCAL_RANK", "0"))
+                print(f"[Rank {rank}] WARNING: barrier() failed: {e_barrier}", flush=True)
 
     if is_main():
         if use_mlflow and client and parent_run_id:

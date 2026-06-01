@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=100G
-#SBATCH --time=20:00:00
+#SBATCH --time=30:00:00
 
 set -e
 

@@ -48,7 +48,7 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v11"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v17"),
     "data_csv": "data/raw/train.csv",
     "val_data_csv": None,
     "output_dir": "./results",
@@ -62,14 +62,13 @@ _NON_HF_TRAIN_KEYS = {
     "augmentation_level",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min",
-    "loss_lambda_ema", "loss_lambda_threshold",
+    "loss_lambda_threshold",
     "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
     "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_query_diversity_lambda",
     "save_qualitative_k",
     "layer_decay",
-    "ema_decay",
-    "min_lr_rate",   # v12: top-level HPO param injected into lr_scheduler_kwargs below
+    "min_lr_rate",
 }
 
 
@@ -85,127 +84,6 @@ def _custom_collator(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         else:
             out[key] = torch.stack([b[key] for b in batch])
     return out
-
-
-class EMAWeightCallback(TrainerCallback):
-    """Maintain an EMA copy of model weights, updated every training step.
-
-    Eval helpers:
-        _swap_to_ema(model)  → temporarily put EMA weights into the live model
-        _swap_to_live(model) → restore the live weights
-    Both are always paired (no leftover EMA in the live model after eval).
-    snapshot() → return a cpu copy of the current EMA state (for best-epoch tracking).
-    """
-
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999) -> None:
-        self.decay = float(decay)
-        self.ema_state: Dict[str, torch.Tensor] = {}
-        self.backup_state: Dict[str, torch.Tensor] = {}
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                self.ema_state[name] = p.detach().clone()
-
-    @staticmethod
-    def _model(kwargs: Dict[str, Any]) -> Optional[torch.nn.Module]:
-        m = kwargs.get("model")
-        return _unwrap(m) if m is not None else None
-
-    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        model = self._model(kwargs)
-        if model is None:
-            return
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                buf = self.ema_state.get(name)
-                if buf is None or not p.requires_grad:
-                    continue
-                if buf.device != p.device:
-                    buf = buf.to(p.device)
-                    self.ema_state[name] = buf
-                buf.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
-
-    def _swap_to_ema(self, model: torch.nn.Module) -> None:
-        if self.backup_state:
-            return
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                buf = self.ema_state.get(name)
-                if buf is None:
-                    continue
-                if buf.device != p.device:
-                    buf = buf.to(p.device)
-                    self.ema_state[name] = buf
-                self.backup_state[name] = p.detach().clone()
-                p.copy_(buf)
-
-    def _swap_to_live(self, model: torch.nn.Module) -> None:
-        if not self.backup_state:
-            return
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                live = self.backup_state.get(name)
-                if live is not None:
-                    p.copy_(live.to(p.device) if live.device != p.device else live)
-        self.backup_state.clear()
-
-    def snapshot(self) -> Dict[str, torch.Tensor]:
-        return {name: buf.detach().cpu().clone() for name, buf in self.ema_state.items()}
-
-    def load_snapshot(self, snapshot: Dict[str, torch.Tensor], model: torch.nn.Module) -> None:
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                buf = snapshot.get(name)
-                if buf is None:
-                    continue
-                p.copy_(buf.to(p.device))
-
-
-class EMABestTracker(TrainerCallback):
-    """Track the best EMA epoch independently of HF Trainer's best-model logic.
-
-    HF tracks the best `eval_*` epoch (= live model). We mirror that on `ema_*`,
-    saving the EMA state to local disk (TMPDIR) at the best EMA epoch — keeping
-    it in CPU RAM would cost ~ model_size × num_ranks (≈ 1GB for sapiens × 2 ranks)
-    on top of dataloader buffers, which OOM'd 60G allocations. Disk is local SSD,
-    cost is one write per "new best" event.
-
-    After training, the caller compares best_live vs best_ema and loads from disk.
-    """
-    def __init__(self, ema_cb: "EMAWeightCallback", metric_key: str, greater_is_better: bool,
-                 snapshot_dir: str) -> None:
-        self.ema_cb = ema_cb
-        self.metric_key = metric_key
-        self.greater_is_better = greater_is_better
-        self.snapshot_path = Path(snapshot_dir) / f"ema_best_rank{os.environ.get('LOCAL_RANK', '0')}.pt"
-        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        self.best_score: float = float("-inf") if greater_is_better else float("inf")
-        self.best_epoch: Optional[float] = None
-        self._snapshot_saved: bool = False
-
-    def _improved(self, score: float) -> bool:
-        return score > self.best_score if self.greater_is_better else score < self.best_score
-
-    def on_evaluate(self, args: Any, state: Any, control: Any, metrics: Optional[Dict[str, float]] = None, **kwargs: Any) -> None:
-        # All ranks update — metrics are collective-gathered, EMA weights are DDP-synced,
-        # so each rank's snapshot is identical. Gating on rank 0 would desync the model
-        # in the post-train swap and corrupt the next predict() collective call.
-        if metrics is None:
-            return
-        score = metrics.get(self.metric_key)
-        if score is None or not isinstance(score, (int, float)):
-            return
-        if self._improved(float(score)):
-            self.best_score = float(score)
-            self.best_epoch = float(state.epoch or 0.0)
-            torch.save(self.ema_cb.snapshot(), self.snapshot_path)
-            self._snapshot_saved = True
-
-    def load_best_into(self, model: torch.nn.Module) -> bool:
-        if not self._snapshot_saved or not self.snapshot_path.exists():
-            return False
-        state = torch.load(self.snapshot_path, map_location="cpu")
-        self.ema_cb.load_snapshot(state, model)
-        return True
 
 
 class OptunaPruningCallback(TrainerCallback):
@@ -318,36 +196,6 @@ class WeightedMSETrainer(Trainer):
         if self._gender_sampler is not None:
             return self._gender_sampler
         return super()._get_train_sampler(*args, **kwargs)
-
-    def _find_ema_cb(self) -> Optional["EMAWeightCallback"]:
-        for cb in self.callback_handler.callbacks:
-            if isinstance(cb, EMAWeightCallback):
-                return cb
-        return None
-
-    def evaluate(self, eval_dataset: Any = None, ignore_keys: Any = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
-        metrics_live = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-
-        ema_cb = self._find_ema_cb()
-        # Skip the EMA shadow eval when explicitly requested (e.g. post-train evaluate where
-        # we already swapped the winning weights into the model and the EMA buffer no longer
-        # corresponds to a best epoch).
-        if ema_cb is None or getattr(self, "_skip_ema_double_eval", False):
-            return metrics_live
-
-        model_inner = _unwrap(self.model)
-        ema_cb._swap_to_ema(model_inner)
-        try:
-            # CRITICAL: HF Trainer.evaluate() calls self.log(metrics) INTERNALLY before
-            # returning. If we reuse metric_key_prefix="eval", both the live and EMA evals
-            # get logged under eval_* (last write wins per step in some MLflow backends,
-            # but otherwise two values per step → zigzag). Use prefix "ema" so HF logs the
-            # second call's metrics directly under ema_* — clean separate MLflow chart.
-            metrics_ema = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix="ema")
-        finally:
-            ema_cb._swap_to_live(model_inner)
-
-        return {**metrics_live, **metrics_ema}
 
     def compute_loss(self, model: Any, inputs: Dict[str, Any], return_outputs: bool = False, num_items_in_batch: Any = None) -> Any:
         labels = inputs["labels"]
@@ -969,26 +817,6 @@ def train(
     gender_sampler = None
     print(f"correction_strength={correction_strength:.2f} (loss-only, no sampler — v16)")
 
-    ema_cb: Optional[EMAWeightCallback] = None
-    ema_best_tracker: Optional[EMABestTracker] = None
-    ema_decay = float(train_cfg.get("ema_decay", 0.0))
-    if ema_decay > 0:
-        ema_cb = EMAWeightCallback(model=model, decay=ema_decay)
-        callbacks.append(ema_cb)
-        # Mirror the best-model logic on the EMA series: same metric key, same direction.
-        best_metric_key = str(train_cfg.get("metric_for_best_model", "eval_challenge_score"))
-        if not best_metric_key.startswith("eval_"):
-            best_metric_key = f"eval_{best_metric_key}"
-        ema_metric_key = "ema_" + best_metric_key[len("eval_"):]
-        ema_best_tracker = EMABestTracker(
-            ema_cb=ema_cb,
-            metric_key=ema_metric_key,
-            greater_is_better=bool(train_cfg.get("greater_is_better", False)),
-            snapshot_dir=output_dir,
-        )
-        callbacks.append(ema_best_tracker)
-        print(f"EMA weights enabled with decay={ema_decay}, tracking best on {ema_metric_key}")
-
     trainer_ref: List[Any] = []
     callbacks.append(LambdaLogCallback(trainer_ref, client if use_client else None, run_id if use_client else None))
 
@@ -1020,43 +848,15 @@ def train(
     )
     trainer_ref.append(trainer)
 
-    _rank = int(os.environ.get("LOCAL_RANK", "0"))
-    print(f"[Rank {_rank}] Training {cfg['name']} (best_metric={best_metric}) — about to call accelerator.prepare via trainer.train()", flush=True)
     trainer.train()
 
-    # HF has loaded the best-live epoch (via load_best_model_at_end). If the EMA shadow
-    # reached a better score at some epoch, swap those EMA weights (loaded from disk
-    # snapshot) into the model.
-    best_live_score = float(getattr(trainer.state, "best_metric", float("inf")) or float("inf"))
-    used_ema = False
-    if ema_best_tracker is not None and ema_best_tracker._snapshot_saved:
-        better = (
-            ema_best_tracker.best_score > best_live_score
-            if bool(train_cfg.get("greater_is_better", False))
-            else ema_best_tracker.best_score < best_live_score
-        )
-        print(f"  best_live_score={best_live_score:.5f}  "
-              f"best_ema_score={ema_best_tracker.best_score:.5f} (epoch {ema_best_tracker.best_epoch})  "
-              f"→ {'EMA WINS, swapping weights' if better else 'LIVE wins, keeping weights'}")
-        if better:
-            used_ema = ema_best_tracker.load_best_into(_unwrap(trainer.model))
-        if use_client and client and run_id:
-            ml_log_metrics(client, run_id, {
-                "best_live_score": best_live_score,
-                "best_ema_score": float(ema_best_tracker.best_score),
-                "used_ema_weights": float(used_ema),
-            })
-
-    trainer._skip_ema_double_eval = True
     eval_results = trainer.evaluate()
-    trainer._skip_ema_double_eval = False
     eval_loss = eval_results.get("eval_loss", float("inf"))
     eval_score = eval_results.get("eval_challenge_score", 0.0)
     err_diff = eval_results.get("eval_err_diff", 0.0)
     err_F = eval_results.get("eval_err_F", 0.0)
     err_M = eval_results.get("eval_err_M", 0.0)
-    print(f"loss={eval_loss:.5f}  score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}  "
-          f"({'EMA' if used_ema else 'LIVE'} weights)")
+    print(f"loss={eval_loss:.5f}  score={eval_score:.5f}  err_F={err_F:.5f}  err_M={err_M:.5f}  err_diff={err_diff:.5f}")
     mae_pct = eval_results.get("eval_mae_pct", 0.0)
     r2 = eval_results.get("eval_r2", 0.0)
     print(f"  human-readable : MAE_pct={mae_pct:.2f}%  R²={r2:.3f}")

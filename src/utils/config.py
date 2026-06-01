@@ -32,7 +32,6 @@ FLOAT_KEYS = {
     "attention_probs_dropout_prob",
     "adam_beta1",
     "adam_beta2",
-    "ema_decay",
     "loss_focal_gamma",
     "loss_fairness_lambda",
     "layer_decay",

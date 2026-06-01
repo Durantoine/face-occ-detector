@@ -1,0 +1,201 @@
+name: coatnet1-3090-v17
+description: |
+  CoAtNet-1 (Dai et al. 2021, "Marrying Convolution and Attention for All Data Sizes")
+  41M params, native 224, hybride conv (MBConv) + attention (relative).
+
+  Pourquoi CoAtNet pour face occlusion :
+    - Native 224 (pas de hack input)
+    - Hybride : stages conv early (features locales = patches occlus) + stages attn late
+      (relations globales = cohérence du visage)
+    - ImageNet acc @224 = 84.1 (>>+ 2pt vs EffNet B0)
+    - fp16/bf16 stables
+    - Hierarchical comme CNN → output (B, C=768, H, W) compatible notre pipeline
+
+  Settings hérités EffNet (cohérence CNN-style) :
+    - GAP pooling default (head natif)
+    - fp16 (stable sur conv + relative attn)
+    - layer_decay = 1.0 (LLRD ill-defined sur stages hétérogènes)
+
+model:
+  model_name: coatnet_1_rw_224.sw_in1k    # timm: 41M, IN-1k pretrain, ImageNet 84.1
+  output_dim: 1
+  head_dropout: 0.2
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query
+  # image_size: omitted → default 224 (CoAtNet-1 native)
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  mil_agg: multi
+  mil_hidden: 128
+  mil_k_top: 30
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+  test_split_ratio: 0.05
+
+training:
+  per_device_train_batch_size: 64    # CoAtNet 41M @ 224, bf16/fp16 → batch 64 safe
+  per_device_eval_batch_size: 128
+  gradient_accumulation_steps: 1
+  num_train_epochs: 13
+  learning_rate: 5.0e-05
+  weight_decay: 0.05
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine_with_min_lr
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.3
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 25
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: false
+  fp16: true                  # CoAtNet stable en fp16 (vs bf16 imprécis sur BN)
+  gradient_checkpointing: false
+  augmentation_level: none
+  layer_decay: 1.0            # LLRD disabled (stages hétérogènes conv+attn)
+  # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
+  # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
+  loss_lambda_init: 1.0
+  loss_lambda_lr: 200.0
+  loss_lambda_max: 3.0
+  loss_lambda_min: 1.0
+  loss_lambda_threshold: 0.0003
+  adv_lambda: 0.01
+  ot_lambda: 0.1
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 100
+  objective_mode: score
+  rotate_val_seed: false
+  keep_top_n: 3
+  search_space:
+    pooling_type:
+      type: categorical
+      choices: [attention_k_query, mil, grid]
+
+    correction_strength: {type: float, low: 0.0, high: 1.0}
+
+    feature_fairness:
+      type: categorical
+      choices: [ot, dann]
+    ot_lambda:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: ot
+    adv_lambda:
+      type: float
+      low: 0.001
+      high: 0.05
+      log: true
+      conditional_on:
+        feature_fairness: dann
+    ot_method:
+      type: categorical
+      choices: [sliced, sinkhorn]
+      conditional_on:
+        feature_fairness: ot
+    sinkhorn_eps:
+      type: float
+      low: 0.01
+      high: 1.0
+      log: true
+      conditional_on:
+        feature_fairness: ot
+        ot_method: sinkhorn
+
+    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+
+    learning_rate: {type: float, low: 2.0e-05, high: 1.0e-04, log: true}
+    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
+    weight_decay:  {type: float, low: 0.01, high: 0.20}
+    head_dropout:  {type: float, low: 0.1, high: 0.4}
+
+    pool_attn_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: attention_k_query
+    pool_proj_dropout:
+      type: float
+      low: 0.0
+      high: 0.3
+      conditional_on:
+        pooling_type: attention_k_query
+    loss_query_diversity_lambda:
+      type: float
+      low: 0.0
+      high: 0.2
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_focal_init:
+      type: float
+      low: 0.03
+      high: 0.3
+      log: true
+      conditional_on:
+        pooling_type: attention_k_query
+    tau_diffuse_init:
+      type: float
+      low: 0.5
+      high: 3.0
+      conditional_on:
+        pooling_type: attention_k_query
+    n_focal:
+      type: int
+      low: 1
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_diffuse:
+      type: int
+      low: 0
+      high: 4
+      conditional_on:
+        pooling_type: attention_k_query
+    n_free:
+      type: int
+      low: 0
+      high: 3
+      conditional_on:
+        pooling_type: attention_k_query
+
+    mil_hidden:
+      type: categorical
+      choices: [64, 128, 256]
+      conditional_on:
+        pooling_type: mil
+    mil_k_top:
+      type: int
+      low: 10
+      high: 50
+      conditional_on:
+        pooling_type: mil
+
+    # Grid pooling: 2×2 (4 régions) ou 3×3 (9 régions)
+    grid_size:
+      type: categorical
+      choices: [3, 4, 5, 6]
+      conditional_on:
+        pooling_type: grid

@@ -73,10 +73,10 @@ training:
   # (eval_err_diff sur 15k samples). Plus de bruit per-batch, plus d'EMA.
   # λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), λ_min, λ_max)
   loss_lambda_init: 1.0
-  loss_lambda_lr: 1.0            # per-epoch update, big step OK
+  loss_lambda_lr: 50.0            # per-epoch update, big step OK
   loss_lambda_max: 3.0           # max push fairness (3× métrique)
-  loss_lambda_min: 0.5           # floor (peut descendre sous métrique si fairness easy)
-  loss_lambda_threshold: 0.001   # zone d'équilibre — λ stable quand val_err_diff ≈ 0.001
+  loss_lambda_min: 1           # floor (peut descendre sous métrique si fairness easy)
+  loss_lambda_threshold: 0.0005   # zone d'équilibre — λ stable quand val_err_diff ≈ 0.001
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10

@@ -46,10 +46,10 @@ class WeightedMSELoss(nn.Module):
         weight_offset: float = 1.0 / 30.0,
         focal_gamma: float = 0.0,
         lambda_init: float = 1.0,
-        lambda_lr: float = 1.0,
+        lambda_lr: float = 50.0,
         lambda_max: float = 3.0,
-        lambda_min: float = 0.5,
-        lambda_threshold: float = 0.001,
+        lambda_min: float = 1,
+        lambda_threshold: float = 0.0005,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset

@@ -1,0 +1,124 @@
+name: convnextv2-base-3090-v19
+description: |
+  ConvNeXt v2 Base (~88M params, native 224×224) — v19. Mirrors the v19
+  framework on the existing efficientnet-b0-3090-v19 template, with
+  ConvNeXt-specific overrides driven by the 34-trial v4 sweep and the
+  5 completed v17 trials:
+
+    - pooling_type FIXED to "gap" (ConvNeXt's native head). Validated by v4
+      where pooling_type=cls (= gap-equivalent for our synthesised CLS)
+      won 5/5 of the top trials. Removed from search_space to save Optuna
+      budget.
+    - batch_size 32 (B0 used 192 — ConvNeXt-Base needs more VRAM per sample).
+    - bf16 (already aligned with v19's homogenisation).
+    - layer_decay REACTIVATED: LLRD is well-defined on ConvNeXt's 4-stage
+      hierarchy. v4 sweep clustered around 0.7; v17 trials around 0.85-0.95
+      with the tri-split → range [0.65, 1.0] covers both regimes.
+    - feature_fairness restricted to [none, dann]: ot triggered a DDP
+      deadlock on run 838695 trial 6 (Rank 0 has 380 params, Rank 1 has 0
+      — conditional OT module init diverged across ranks). v4 + v17 data
+      both show none and dann as the winning modes; ot was never a top
+      performer anyway.
+
+model:
+  model_name: convnextv2_base.fcmae_ft_in22k_in1k   # timm — FCMAE + IN22k + IN1k fine-tune
+  output_dim: 1
+  head_dropout: 0.1
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: gap                # FIXED — ConvNeXt native head.
+  # Pool / attention params kept at defaults (unused when pooling_type=gap):
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  mil_agg: multi
+  mil_hidden: 128
+  mil_k_top: 30
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.0
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+  test_split_ratio: 0.05
+
+training:
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 13
+  learning_rate: 4.0e-05
+  weight_decay: 0.10
+  warmup_ratio: 0.1
+  lr_scheduler_type: cosine_with_min_lr
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.3
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 25
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: light        # v4 sweep: light won 4/5 of top trials
+  layer_decay: 0.85                # v17 cluster ≈ 0.85-0.95 with tri-split (v4 was ≈ 0.7)
+  loss_lambda_init: 1.0
+  loss_lambda_lr: 0.2
+  loss_lambda_max: 3.0
+  loss_lambda_min: 1.0
+  loss_lambda_threshold: 0.0005
+  adv_lambda: 0.01
+  ot_lambda: 0.1
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 80
+  objective_mode: score
+  rotate_val_seed: false
+  keep_top_n: 3
+  search_space:
+    # pooling_type DELIBERATELY ABSENT — fixed to "gap" above.
+
+    correction_strength: {type: float, low: 0.4, high: 1.0}    # v19 default; v17 ConvNeXt winners had 0.7-0.99
+
+    feature_fairness:
+      type: categorical
+      choices: [none, dann]              # ot excluded: DDP deadlock on run 838695
+    adv_lambda:
+      type: float
+      low: 0.005
+      high: 0.20
+      log: true
+      conditional_on:
+        feature_fairness: dann
+
+    loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
+
+    # ConvNeXt-Base HPO ranges (v4 + v17 lessons):
+    # - LR cluster v4 ≈ 3-4e-5, v17 ≈ 1.5-5e-5 → range [1.5e-05, 1.0e-04]
+    # - layer_decay well-defined on ConvNeXt stages → reinstated [0.65, 1.0]
+    # - backbone_drop_path_rate kept (timm honours it on convnextv2)
+    learning_rate:           {type: float, low: 1.5e-05, high: 1.0e-04, log: true}
+    min_lr_rate:             {type: float, low: 0.2, high: 0.4}
+    weight_decay:            {type: float, low: 0.03, high: 0.40}
+    head_dropout:            {type: float, low: 0.0, high: 0.3}
+    layer_decay:             {type: float, low: 0.65, high: 1.0}
+    backbone_drop_path_rate: {type: float, low: 0.0, high: 0.2}
+    num_train_epochs:        {type: int,   low: 10,  high: 15}
+    warmup_ratio:            {type: float, low: 0.05, high: 0.15}
+
+    augmentation_level:
+      type: categorical
+      choices: [none, light, medium]      # v4: light won 4/5, none/medium also competitive

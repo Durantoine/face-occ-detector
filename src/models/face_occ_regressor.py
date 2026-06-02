@@ -21,6 +21,15 @@ def _is_timm_cnn(model_name: str) -> bool:
     return any(model_name.startswith(p) for p in prefixes)
 
 
+def _is_convnext(model_name: str) -> bool:
+    """ConvNeXt v1/v2 (timm). Treated specially: keep timm's native head
+    (norm_pre LayerNorm in forward_features + GAP + dropout + Identity-fc
+    in forward_head), so the pretrained classifier alignment is preserved.
+    Other timm CNNs (efficientnet, regnet, ...) still use global_pool=""
+    to expose spatial features for attention/mil/grid pooling."""
+    return model_name.startswith("convnext")
+
+
 def _build_backbone(
     model_name: str,
     drop_path_rate: float = 0.0,
@@ -32,6 +41,17 @@ def _build_backbone(
     if is_sapiens2(model_name):
         backbone = load_sapiens2(model_name, drop_rate=drop_path_rate, pretrained=pretrained)
         return backbone, sapiens2_hidden_size_of(model_name)
+    if _is_convnext(model_name):
+        import timm
+        # Native ConvNeXt head: keep `global_pool="avg"` (default) so timm
+        # runs forward_features (stem -> stages -> norm_pre LayerNorm) +
+        # forward_head (GAP -> flatten -> drop -> Identity-fc since num_classes=0).
+        # Output: (B, num_features) — already pooled and normed.
+        backbone = timm.create_model(
+            model_name, pretrained=pretrained, num_classes=0,
+            drop_path_rate=drop_path_rate,
+        )
+        return backbone, backbone.num_features
     if _is_timm_cnn(model_name):
         import timm
         # num_classes=0 + global_pool="" : keep conv_head (which projects last-stage
@@ -75,6 +95,12 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor, model_nam
     if hasattr(out, "last_hidden_state"):
         out = out.last_hidden_state
 
+    if _is_convnext(model_name):
+        # ConvNeXt native head returns (B, num_features) — wrap as (B, 1, C)
+        # so the pool dispatch (CLSPooling = x[:, 0, :]) yields (B, C).
+        if isinstance(out, torch.Tensor) and out.dim() == 2:
+            return out.unsqueeze(1)
+        return out
     if _is_timm_cnn(model_name):
         if isinstance(out, torch.Tensor) and out.dim() == 4:
             # (B, C, H, W) → (B, H·W, C)

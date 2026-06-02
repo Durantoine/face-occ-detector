@@ -26,7 +26,7 @@ model:
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
-  pooling_type: gap                # FIXED — ConvNeXt native head.
+  pooling_type: cls   # ConvNeXt: native head returns (B,1,C) post-unsqueeze; cls extracts the single token
   # Pool / attention params kept at defaults (unused when pooling_type=gap):
   n_focal: 2
   n_diffuse: 2

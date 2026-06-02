@@ -32,6 +32,7 @@ def _is_convnext(model_name: str) -> bool:
 
 def _build_backbone(
     model_name: str,
+    pooling_type: str = "cls",
     drop_path_rate: float = 0.0,
     pretrained: bool = True,
 ) -> Tuple[nn.Module, int]:
@@ -41,12 +42,14 @@ def _build_backbone(
     if is_sapiens2(model_name):
         backbone = load_sapiens2(model_name, drop_rate=drop_path_rate, pretrained=pretrained)
         return backbone, sapiens2_hidden_size_of(model_name)
-    if _is_convnext(model_name):
+    if _is_convnext(model_name) and pooling_type == "gap":
         import timm
-        # Native ConvNeXt head: keep `global_pool="avg"` (default) so timm
-        # runs forward_features (stem -> stages -> norm_pre LayerNorm) +
-        # forward_head (GAP -> flatten -> drop -> Identity-fc since num_classes=0).
-        # Output: (B, num_features) — already pooled and normed.
+        # ConvNeXt + gap: use timm's NATIVE classifier head — exactly the head
+        # the pretrained checkpoint was fine-tuned with. forward_features applies
+        # norm_pre (LayerNorm) on the spatial map, forward_head then runs GAP +
+        # flatten + drop + Identity-fc (num_classes=0). Output: (B, num_features).
+        # Other pool types (attention_k_query/mil/grid) fall through to the spatial
+        # path below since they need the (B, C, H, W) feature map to attend over.
         backbone = timm.create_model(
             model_name, pretrained=pretrained, num_classes=0,
             drop_path_rate=drop_path_rate,
@@ -95,12 +98,12 @@ def _forward_backbone(backbone: nn.Module, pixel_values: torch.Tensor, model_nam
     if hasattr(out, "last_hidden_state"):
         out = out.last_hidden_state
 
-    if _is_convnext(model_name):
-        # ConvNeXt native head returns (B, num_features) — wrap as (B, 1, C)
-        # so the pool dispatch (CLSPooling = x[:, 0, :]) yields (B, C).
-        if isinstance(out, torch.Tensor) and out.dim() == 2:
-            return out.unsqueeze(1)
-        return out
+    # ConvNeXt with native head returns (B, C) 2-D; wrap as (B, 1, C) so the
+    # pool dispatch yields (B, C). When ConvNeXt is built with global_pool=""
+    # (other pool types), out is 4-D and falls through to the timm_cnn branch
+    # below which reshapes to (B, H*W, C) for attention/mil/grid pooling.
+    if _is_convnext(model_name) and isinstance(out, torch.Tensor) and out.dim() == 2:
+        return out.unsqueeze(1)
     if _is_timm_cnn(model_name):
         if isinstance(out, torch.Tensor) and out.dim() == 4:
             # (B, C, H, W) → (B, H·W, C)
@@ -569,7 +572,8 @@ class FaceOccRegressor(nn.Module):
         self.enable_adv_disc = enable_adv_disc
 
         self.backbone, hidden_size = _build_backbone(
-            model_name, drop_path_rate=backbone_drop_path_rate, pretrained=pretrained,
+            model_name, pooling_type=pooling_type,
+            drop_path_rate=backbone_drop_path_rate, pretrained=pretrained,
         )
 
         # ViT has CLS at position 0; CNN (timm) has none. Tells pools whether to skip it.

@@ -18,7 +18,7 @@ from src.utils.distribution import (  # noqa: F401
 __all__ = [
     "N_BINS", "BIN_WIDTH", "_TEST_PMF",
     "compute_target_weights", "compute_empirical_pmf", "compute_empirical_pmf_cell",
-    "WeightedMSELoss", "mmd_rbf", "sliced_wasserstein",
+    "WeightedMSELoss", "sliced_wasserstein",
 ]
 
 
@@ -201,17 +201,3 @@ def sinkhorn_distance(
     return (P * C).sum()
 
 
-def mmd_rbf(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.shape[0] < 2 or y.shape[0] < 2:
-        return torch.zeros((), device=x.device, dtype=x.dtype)
-
-    dxy = torch.cdist(x, y).pow(2)
-    sigma_sq = dxy.detach().median().clamp(min=1e-6)
-
-    dxx = torch.cdist(x, x).pow(2)
-    dyy = torch.cdist(y, y).pow(2)
-
-    k_xx = (-dxx / sigma_sq).exp().mean()
-    k_yy = (-dyy / sigma_sq).exp().mean()
-    k_xy = (-dxy / sigma_sq).exp().mean()
-    return (k_xx + k_yy - 2.0 * k_xy).clamp(min=0.0)

@@ -10,7 +10,7 @@
 
 Idemia / Télécom Paris **DataChallenge 2026** — regression of `FaceOcclusion ∈ [0, 1]` (ratio of occluded area to total face area on cropped 224×224 face images). The scoring metric explicitly **penalises gender disparity** between female and male errors.
 
-📚 **Documentation théorique** dans [docs/](docs/) — fairness 3-axes, métriques, archi, scaling, etc.
+📚 **Design & rationale (v18)** dans [docs/PROJECT.md](docs/PROJECT.md) — H_C, fairness, Lagrangien log-ratio, calibration per-gender, infrastructure HPO+DDP, roadmap.
 
 ---
 
@@ -44,7 +44,7 @@ $$L = \frac{\sum_i w_i (p_i - GT_i)^2}{\sum_i w_i}, \qquad w_i = \frac{1}{30} + 
 **Score** (lower is better) :
 $$\text{Score} = \frac{\text{Err}_F + \text{Err}_M}{2} + \left|\text{Err}_F - \text{Err}_M\right|$$
 
-Le poids `w_i = 1/30 + GT_i` donne plus d'importance aux fortes occlusions. Le terme `|Err_F − Err_M|` force la fairness genre. Détails dans [docs/metrics.md](docs/metrics.md).
+Le poids `w_i = 1/30 + GT_i` donne plus d'importance aux fortes occlusions. Le terme `|Err_F − Err_M|` force la fairness genre. Détails dans [docs/PROJECT.md](docs/PROJECT.md) §1.
 
 ---
 
@@ -153,13 +153,12 @@ Stop avec `scancel <job-ids>` (le script les imprime).
 src/                  train, optimize, ensemble, pretrain_ibot, predict, evaluate + models/data/utils
 configs/architectures/v6 yamls (dinov3 vitb16, sapiens2 0.1b)
 scripts/              SLURM sbatch files + chain helpers + UI launchers
-docs/                 documentation théorique (fairness, metrics, archi, etc.)
+docs/PROJECT.md       design & rationale unique (v18)
+docs/assets/          screenshots UI
 data/                 raw (train.csv, test_students.csv, databases) + pretrain/ + extra/
 mlflow.db             SQLite backend MLflow (auto)
 optuna_studies/       SQLite per-arch Optuna studies (auto)
 ```
-
-Pour le détail complet du layout, voir [docs/configuration.md](docs/configuration.md) §"Project layout".
 
 ---
 
@@ -167,12 +166,7 @@ Pour le détail complet du layout, voir [docs/configuration.md](docs/configurati
 
 | Need | Where |
 |---|---|
-| Fairness & balancing strategy | [docs/fairness.md](docs/fairness.md) |
-| Comprendre les métriques (challenge_score, err_F/M, R², MAE_pct, ...) | [docs/metrics.md](docs/metrics.md) |
-| Architecture du modèle (poolings, head, backbones) | [docs/architecture.md](docs/architecture.md) |
-| External data (CelebA, MAFA, ...) + comprendre `FaceOcclusion` | [docs/data.md](docs/data.md) |
-| iBOT pretraining (pourquoi pas MAE) | [docs/pretraining.md](docs/pretraining.md) |
-| YAML toggles, MLflow logs, project layout | [docs/configuration.md](docs/configuration.md) |
-| Hardware support, scaling Sapiens2 1B+ | [docs/scaling.md](docs/scaling.md) |
-| Stratégie compétitive, roadmap, audit v4 | [docs/audits_and_roadmap.md](docs/audits_and_roadmap.md) |
-| Bibliographie | [docs/references.md](docs/references.md) |
+| H_C, fairness, calibration, infra HPO+DDP, roadmap | [docs/PROJECT.md](docs/PROJECT.md) |
+| Code clés (losses, distribution, calibrators, gender_classifier, train, optimize) | voir [docs/PROJECT.md §12](docs/PROJECT.md#12-références) |
+| Configs HPO | [configs/architectures/*-v18.yaml](configs/architectures/) |
+| UI screenshots | [docs/assets/](docs/assets/) |

@@ -112,7 +112,7 @@ def get_image_processor(model_name: str, image_size: Optional[int] = None) -> An
     for 456×456 — using 224 cuts pixel count by 4×, severely underutilising the model).
     """
     if model_name.startswith("dinov3_") or "sapiens" in model_name.lower():
-        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224", use_fast=True)
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
         if image_size is not None:
@@ -122,7 +122,7 @@ def get_image_processor(model_name: str, image_size: Optional[int] = None) -> An
     timm_prefixes = ("efficientnet", "resnet", "resnext", "convnext", "regnet", "mobilenetv",
                       "tf_efficientnet", "coatnet", "maxvit")
     if any(model_name.startswith(p) for p in timm_prefixes):
-        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+        proc = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224", use_fast=True)
         proc.image_mean = list(IMAGENET_MEAN)
         proc.image_std = list(IMAGENET_STD)
         if image_size is not None:

@@ -20,7 +20,7 @@ Usage:
 
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -67,7 +67,12 @@ def extract_sapiens_features(
     from src.models.dinov3_loader import get_image_processor
 
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     print(f"Loading {model_name} backbone for feature extraction (device={device})...")
     backbone, hidden_dim = _build_backbone(model_name, drop_path_rate=0.0, pretrained=True)
@@ -85,7 +90,7 @@ def extract_sapiens_features(
                 imgs.append(Image.open(fp).convert("RGB"))
             enc = processor(images=imgs, return_tensors="pt")
             pixel_values = enc["pixel_values"].to(device)
-            out = _forward_backbone(backbone, pixel_values)  # (B, N, D)
+            out = _forward_backbone(backbone, pixel_values, model_name)  # (B, N, D)
             # Use CLS token if available (token 0) else mean pool
             cls_or_mean = out[:, 0, :] if out.size(1) > 1 else out.squeeze(1)
             feats.append(cls_or_mean.cpu().numpy())
@@ -97,35 +102,105 @@ def extract_sapiens_features(
 def train_sapiens_probe(
     train_csv: str,
     image_base_dir: str,
-    sample_size: int = 5000,
+    sample_size: Optional[int] = None,
     model_name: str = "sapiens2_0.1b",
     seed: int = 42,
-) -> Tuple[object, np.ndarray]:
-    """Train a logistic regression on Sapiens features → gender. Returns (model, mean_feat).
-    Subsample train to `sample_size` for speed (linear probe doesn't need all 96k)."""
+    n_cv_folds: int = 5,
+    c_grid: Tuple[float, ...] = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0),
+) -> Tuple[object, np.ndarray, Dict[str, Any]]:
+    """Train logistic regression on Sapiens features → gender.
+
+    Pipeline :
+    1. Extract features from `sample_size` (or full train if None) labeled samples
+    2. Grid search C across {0.01, 0.1, 1, 10, 100, 1000} via StratifiedKFold CV
+    3. Pick best C by OOF accuracy mean; report per-fold + per-class + confusion
+    4. Refit on full data with best C (= production model)
+
+    Returns:
+        (clf, norm_params, metrics) where:
+          - clf : sklearn LogisticRegression refitted on full data with best C
+          - norm_params : (2, D) array [mean, std]
+          - metrics : {cv_accuracy_mean, cv_accuracy_std, best_C, train_acc, all_c_results, ...}
+    """
     from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import StratifiedKFold
 
     df = pd.read_csv(train_csv)
     df = df[df["filename"].notna() & df["gender"].notna()].reset_index(drop=True)
-    rng = np.random.RandomState(seed)
-    if len(df) > sample_size:
+    if sample_size is not None and len(df) > sample_size:
+        rng = np.random.RandomState(seed)
         idx = rng.choice(len(df), sample_size, replace=False)
         df = df.iloc[idx].reset_index(drop=True)
 
-    print(f"Training Sapiens probe on {len(df)} samples ({model_name})...")
+    n = len(df)
+    print(f"Training Sapiens probe on {'FULL' if sample_size is None else 'subsample'} "
+          f"{n:,} labeled train samples ({model_name})...")
     features = extract_sapiens_features(df["filename"].tolist(), image_base_dir, model_name=model_name)
     y = (df["gender"].astype(float).values >= 0.5).astype(int)
+    print(f"  Class balance: F={int((y==0).sum()):,} ({(y==0).mean()*100:.1f}%), "
+          f"M={int((y==1).sum()):,} ({(y==1).mean()*100:.1f}%)")
 
-    # Standardize features (helps logistic regression)
+    # === Standardization ===
     feat_mean = features.mean(axis=0, keepdims=True)
     feat_std = features.std(axis=0, keepdims=True) + 1e-8
     features_norm = (features - feat_mean) / feat_std
 
-    clf = LogisticRegression(max_iter=1000, C=1.0, n_jobs=-1, random_state=seed)
-    clf.fit(features_norm, y)
-    score = clf.score(features_norm, y)
-    print(f"  Sapiens probe train accuracy: {score:.4f}")
-    return clf, np.concatenate([feat_mean, feat_std], axis=0)  # save norm params with model
+    # === Grid search C via StratifiedKFold ===
+    print(f"\nGrid search C ∈ {list(c_grid)} with {n_cv_folds}-fold CV (out-of-fold)...")
+    skf_indices = list(StratifiedKFold(n_splits=n_cv_folds, shuffle=True,
+                                          random_state=seed).split(features_norm, y))
+    cv_results: Dict[float, Dict[str, Any]] = {}
+    oof_for_c: Dict[float, np.ndarray] = {}
+    for C in c_grid:
+        accs: List[float] = []
+        oof = np.full(n, -1, dtype=int)
+        for tr_idx, va_idx in skf_indices:
+            clf_fold = LogisticRegression(max_iter=2000, C=C, n_jobs=-1, random_state=seed)
+            clf_fold.fit(features_norm[tr_idx], y[tr_idx])
+            preds_va = clf_fold.predict(features_norm[va_idx])
+            oof[va_idx] = preds_va
+            accs.append(float((preds_va == y[va_idx]).mean()))
+        acc_mean = float(np.mean(accs))
+        acc_std = float(np.std(accs))
+        cv_results[C] = {"acc_mean": acc_mean, "acc_std": acc_std, "fold_accs": accs}
+        oof_for_c[C] = oof
+        print(f"  C={C:8.2f} : CV acc = {acc_mean:.4f} ± {acc_std:.4f}  "
+              f"(folds: {[f'{a:.4f}' for a in accs]})")
+
+    best_C = max(c_grid, key=lambda c: cv_results[c]["acc_mean"])
+    best = cv_results[best_C]
+    oof = oof_for_c[best_C]
+    print(f"\n=> Best C = {best_C} (CV acc = {best['acc_mean']:.4f} ± {best['acc_std']:.4f})")
+
+    # === OOF confusion + per-class for best C ===
+    n_f, n_m = int((y == 0).sum()), int((y == 1).sum())
+    correct_f = int(((oof == 0) & (y == 0)).sum())
+    correct_m = int(((oof == 1) & (y == 1)).sum())
+    print(f"OOF per-class accuracy: F = {correct_f/n_f:.4f} ({correct_f:,}/{n_f:,})  "
+          f"M = {correct_m/n_m:.4f} ({correct_m:,}/{n_m:,})")
+    fn_f = int(((oof == 1) & (y == 0)).sum())
+    fp_m = int(((oof == 0) & (y == 1)).sum())
+    print(f"Confusion: F→M = {fn_f:,}, M→F = {fp_m:,}")
+
+    # === Refit on full data with best C ===
+    print(f"\nRefitting on FULL {n:,} samples with C={best_C} (production model)...")
+    clf_prod = LogisticRegression(max_iter=2000, C=best_C, n_jobs=-1, random_state=seed)
+    clf_prod.fit(features_norm, y)
+    train_acc = float(clf_prod.score(features_norm, y))
+    print(f"  Production train accuracy: {train_acc:.4f}  "
+          f"(gap with CV acc {best['acc_mean']:.4f} = overfit measure; should be small)")
+
+    metrics = {
+        "cv_accuracy_mean": best["acc_mean"],
+        "cv_accuracy_std": best["acc_std"],
+        "best_C": best_C,
+        "train_acc": train_acc,
+        "n_train_samples": n,
+        "oof_acc_F": correct_f / n_f,
+        "oof_acc_M": correct_m / n_m,
+        "all_c_results": cv_results,
+    }
+    return clf_prod, np.concatenate([feat_mean, feat_std], axis=0), metrics
 
 
 # ============================================================================
@@ -205,19 +280,63 @@ class GenderClassifier:
     @classmethod
     def fit_or_load(cls, train_csv: str, image_base_dir: str,
                      cache_path: str = "cache/gender_classifier.pkl",
-                     sample_size: int = 5000, sapiens_model_name: str = "sapiens2_0.1b",
+                     sample_size: Optional[int] = None,
+                     sapiens_model_name: str = "sapiens2_0.1b",
                      force_refit: bool = False) -> "GenderClassifier":
-        """Load from cache if present, else fit (MID mapping + Sapiens probe) and cache."""
+        """Load from cache if present, else fit (MID mapping + Sapiens probe) and cache.
+
+        Default `sample_size=None` = use FULL labeled train set. With CV + grid search
+        on C, the production probe is now refit on all data after honest validation.
+        """
         if Path(cache_path).exists() and not force_refit:
             print(f"Loading cached GenderClassifier from {cache_path}")
             return cls.load(cache_path)
         print(f"Fitting GenderClassifier (no cache or force_refit=True)...")
         mid_mapping = build_mid_gender_mapping(train_csv)
         print(f"  MID mapping: {len(mid_mapping):,} unique MIDs")
-        probe, probe_norm = train_sapiens_probe(train_csv, image_base_dir,
-                                                  sample_size=sample_size,
-                                                  model_name=sapiens_model_name)
+        probe, probe_norm, metrics = train_sapiens_probe(
+            train_csv, image_base_dir,
+            sample_size=sample_size, model_name=sapiens_model_name,
+        )
         cls_obj = cls(mid_mapping=mid_mapping, probe=probe, probe_norm=probe_norm,
                        sapiens_model_name=sapiens_model_name)
+        cls_obj._probe_metrics = metrics  # type: ignore[attr-defined]
         cls_obj.save(cache_path)
         return cls_obj
+
+    def validate_against_mid_lookup(
+        self, test_csv: str, image_base_dir: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """Real-world accuracy test : run Sapiens probe on the test samples whose MID
+        is already known (= ground truth) and compare. This estimates the probe's
+        accuracy on the test distribution (vs CV which only tells us train-distribution).
+        """
+        if self.probe is None or self.probe_norm is None:
+            print("WARNING: no probe loaded, skipping validation")
+            return {}
+        df = pd.read_csv(test_csv)
+        df["mid"] = df["filename"].apply(extract_mid)
+        df["gender_mid"] = df["mid"].map(self.mid_mapping)
+        known = df[df["gender_mid"].notna()].copy()
+        n_known = len(known)
+        if n_known == 0:
+            print("No MID-known test samples — skipping validation")
+            return {}
+        print(f"\nRunning Sapiens probe on {n_known:,} MID-known test samples for validation...")
+        feats = extract_sapiens_features(known["filename"].tolist(), image_base_dir,
+                                          model_name=self.sapiens_model_name)
+        feats_norm = (feats - self.probe_norm[0:1]) / (self.probe_norm[1:2] + 1e-8)
+        probe_preds = self.probe.predict(feats_norm)
+        gt = known["gender_mid"].astype(int).values
+        acc = float((probe_preds == gt).mean())
+        n_f, n_m = int((gt == 0).sum()), int((gt == 1).sum())
+        acc_f = float(((probe_preds == 0) & (gt == 0)).sum()) / n_f if n_f else 0.0
+        acc_m = float(((probe_preds == 1) & (gt == 1)).sum()) / n_m if n_m else 0.0
+        fn_f = int(((probe_preds == 1) & (gt == 0)).sum())
+        fp_m = int(((probe_preds == 0) & (gt == 1)).sum())
+        print(f"\n=== Sapiens probe accuracy on test (MID-known subset, n={n_known:,}) ===")
+        print(f"  Overall  : {acc:.4f}")
+        print(f"  F  acc   : {acc_f:.4f}  ({n_f-fn_f:,}/{n_f:,}; missed {fn_f:,})")
+        print(f"  M  acc   : {acc_m:.4f}  ({n_m-fp_m:,}/{n_m:,}; missed {fp_m:,})")
+        return {"test_mid_acc": acc, "test_mid_acc_F": acc_f, "test_mid_acc_M": acc_m,
+                "n_test_mid_known": n_known}

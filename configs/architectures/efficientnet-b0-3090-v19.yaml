@@ -1,4 +1,4 @@
-name: efficientnet-b0-3090-v16
+name: efficientnet-b0-3090-v19
 description: |
   EfficientNet-B0 (CNN ~5M params, native 224×224) — v16. Pivoté de B5 à B0 :
   B0 natif 224 = pas de hack `image_size`, batch 128 OK, 5M params suffit pour
@@ -63,18 +63,17 @@ training:
   logging_steps: 25
   metric_for_best_model: eval_challenge_score
   greater_is_better: false
-  bf16: false
-  fp16: true                  # fp16 plus stable que bf16 sur CNN (BN précision)
+  bf16: true                  # v19: homogenized bf16 (safer dynamic range, no loss scaling)
+  fp16: false
   gradient_checkpointing: false
   augmentation_level: none
   layer_decay: 1.0            # disabled (LLRD ill-defined on MBConv stages)
-  ema_decay: 0.999
-  # v16.5 Lagrangien refondu (update per-epoch sur val_err_diff clean)
+  # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
   loss_lambda_init: 1.0
-  loss_lambda_lr: 50.0
-  loss_lambda_max: 3.0
-  loss_lambda_min: 1
-  loss_lambda_threshold: 0.0005
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -90,22 +89,22 @@ optuna:
       choices: [attention_k_query, mil, grid]   # v16: +grid (régions spatiales, head linear simple)
 
     # v16: single-axis correction under H_C
-    correction_strength: {type: float, low: 0.0, high: 1.0}
+    correction_strength: {type: float, low: 0.4, high: 1.0}    # v19: data shows fairness wins concentrate in [0.6, 0.9]; 0.4 = comfortable lower margin
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
-      low: 0.01
-      high: 1.0
+      low: 0.03   # v19: mlflow.db OT trials (n=29) top med 0.11; rare wins outside [0.03, 0.5]
+      high: 0.5
       log: true
       conditional_on:
         feature_fairness: ot
     adv_lambda:
       type: float
-      low: 0.001
-      high: 0.05
+      low: 0.005   # v19: mlflow.db DANN analysis (n=24): TOP-8 geo-mean 0.064, BOT-8 0.014
+      high: 0.20   # → shift right (was [0.001, 0.05])
       log: true
       conditional_on:
         feature_fairness: dann
@@ -123,7 +122,7 @@ optuna:
         feature_fairness: ot
         ot_method: sinkhorn
 
-    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+    loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
 
     # v16 EfficientNet HPO refinements:
     # - LR cap 1e-4 (CNN converges with lower LR than ViTs)
@@ -131,20 +130,20 @@ optuna:
     # - backbone_drop_path_rate REMOVED (timm tf_efficientnet_b0 ignores it)
     # - layer_decay REMOVED (LLRD ill-defined on MBConv)
     learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
-    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
-    weight_decay:  {type: float, low: 0.01, high: 0.20}
+    min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
+    weight_decay:  {type: float, low: 0.03, high: 0.40}   # v19: top cluster [0.10, 0.30] (transformers); extended to 0.40 per user spec
     head_dropout:  {type: float, low: 0.1, high: 0.4}   # B0 native 0.2, range autour
 
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: mlflow.db v10+v11 — ALL top trials use 0.0
       conditional_on:
         pooling_type: attention_k_query
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: same
       conditional_on:
         pooling_type: attention_k_query
 
@@ -163,26 +162,26 @@ optuna:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 0.5
-      high: 3.0
+      low: 1.0   # v19: mlflow.db top-10 cluster [1.9, 2.9], <1.5 is bot-biased
+      high: 3.5   # slight margin above top cluster
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
       low: 0
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 
@@ -204,3 +203,29 @@ optuna:
       choices: [3, 4, 5, 6]
       conditional_on:
         pooling_type: grid
+    # v19 per-query bottleneck (Linear D -> P shared across queries). None = no bottleneck.
+    pool_proj_out_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # v19 per-cell bottleneck (Linear D -> P shared across cells) — required for big backbones
+    grid_cell_proj_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: grid
+    # v19 MLP head (recommended with grid since grid pool has no non-linearity)
+    head_type:
+      type: categorical
+      choices: [linear, mlp]
+      conditional_on:
+        pooling_type: grid
+    head_hidden_dim:
+      type: categorical
+      choices: [64, 128, 256]
+      conditional_on:
+        pooling_type: grid
+        head_type: mlp
+

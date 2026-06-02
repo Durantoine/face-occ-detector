@@ -400,9 +400,11 @@ def fit_all_calibrators(
     Returns dict keyed by calibrator name. All use IS-weighting by default.
     """
     out: Dict[str, PerGenderCalibratorBase] = {}
-    for cls in [IsotonicCalibrator, LinearCalibrator, PCHIPSplineCalibrator,
-                IsotonicRegimeCalibrator, IsotonicTailBoostCalibrator,
-                ContinuousIsotonicCalibrator]:
+    # v19: dropped PCHIPSpline + ContinuousIsotonic (DB shows 0 wins on 22 trials).
+    # Kept the 4 calibrators that have non-trivial win rate: isotonic (77%), linear (14%),
+    # isotonic_tailboost (5%), isotonic_regime (5%).
+    for cls in [IsotonicCalibrator, LinearCalibrator,
+                IsotonicRegimeCalibrator, IsotonicTailBoostCalibrator]:
         try:
             cal = cls(use_is_weight=use_is_weight).fit(preds, gt, gender)
             out[cal.name] = cal

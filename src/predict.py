@@ -27,6 +27,12 @@ CONFIG: Dict[str, Any] = {
     "use_tta": True,
     "bias_correction": None,
     "match_test_pmf": False,
+    # v19: per-gender calibration via pickled artifact from training run.
+    # If apply_calibration=True, predict.py downloads calibrators/calibrators.pkl
+    # from the MLflow run + reads gender from gender_csv (test_students_with_gender.csv)
+    # and applies best (cal, α) blend per sample.
+    "apply_calibration": True,
+    "gender_csv": "data/raw/test_students_with_gender.csv",
 }
 
 
@@ -169,6 +175,59 @@ def predict_images(
     return [max(0.0, min(1.0, float(p))) for p in preds]
 
 
+def _load_calibrators_from_run(model_uri: str, tracking_uri: str) -> Optional[Dict[str, Any]]:
+    """v19: download calibrators.pkl artifact from training run. Returns the unpickled
+    payload {calibrators, best_cal_name, best_alpha, ...} or None if absent/error.
+    """
+    m = re.match(r"runs:/([^/]+)/", model_uri)
+    if not m:
+        print("  Cannot extract run_id from model_uri → skipping calibrator load")
+        return None
+    run_id = m.group(1)
+    try:
+        from mlflow.tracking import MlflowClient
+        client = MlflowClient(tracking_uri=tracking_uri)
+        local_dir = client.download_artifacts(run_id, "calibrators")
+        pkl_path = Path(local_dir) / "calibrators.pkl"
+        if not pkl_path.exists():
+            print(f"  Run {run_id[:8]} has no calibrators.pkl artifact → skipping per-gender cal")
+            return None
+        import pickle as _pkl
+        with open(pkl_path, "rb") as f:
+            payload = _pkl.load(f)
+        print(f"  Loaded calibrators: {list(payload['calibrators'].keys())}, "
+              f"best=({payload['best_cal_name']}, α={payload['best_alpha']:.2f})")
+        return payload
+    except Exception as e:
+        print(f"  WARNING: failed to load calibrators artifact: {e}")
+        return None
+
+
+def _load_test_gender(gender_csv: str, filenames: List[str]) -> Optional[np.ndarray]:
+    """Load gender_predicted column from gender_csv, aligned to `filenames` order.
+    Returns int array {0=F, 1=M} or None if file missing / column missing.
+    """
+    csv_path = Path(gender_csv)
+    if not csv_path.exists():
+        print(f"  gender_csv {gender_csv} not found → skipping per-gender cal")
+        return None
+    df = pd.read_csv(csv_path)
+    if "gender_predicted" not in df.columns or "filename" not in df.columns:
+        print(f"  {gender_csv} missing required columns → skipping per-gender cal")
+        return None
+    # Align to input filenames order via lookup
+    mapping = dict(zip(df["filename"].astype(str), df["gender_predicted"].astype(int)))
+    out = np.array([mapping.get(str(fn), -1) for fn in filenames], dtype=int)
+    n_unknown = int((out < 0).sum())
+    if n_unknown > 0:
+        print(f"  WARNING: {n_unknown:,}/{len(filenames):,} test filenames not in {gender_csv}; "
+              f"defaulting to majority M=1")
+        out[out < 0] = 1
+    n_f, n_m = int((out == 0).sum()), int((out == 1).sum())
+    print(f"  Gender from {gender_csv}: F={n_f:,} M={n_m:,}")
+    return out
+
+
 def predict_csv(
     model_uri: str,
     input_csv: str,
@@ -182,6 +241,8 @@ def predict_csv(
     bias_correction: Optional[Dict[str, float]] = None,
     gender_col: str = "gender",
     match_test_pmf: bool = False,
+    apply_calibration: bool = True,
+    gender_csv: str = "data/raw/test_students_with_gender.csv",
 ) -> None:
     model, processor = load_model(model_uri, tracking_uri)
     df = pd.read_csv(input_csv).dropna(subset=[image_col])
@@ -193,6 +254,28 @@ def predict_csv(
         preds = preds_t.numpy().astype(float)
     else:
         preds = np.array(predict_images(model, processor, df[image_col].tolist(), image_base_dir, batch_size))
+
+    # === v19: per-gender calibration apply ===
+    # Loads the calibrators artifact from the training run + the gender CSV (predicted via
+    # MID lookup + DINOv3/Sapiens linear probe). Applies best (cal, α) blend per sample.
+    # Graceful fallback to old behavior if either artifact is missing.
+    if apply_calibration:
+        print("=== Applying per-gender calibration (v19) ===")
+        cal_payload = _load_calibrators_from_run(model_uri, tracking_uri)
+        gender_test = _load_test_gender(gender_csv, df[image_col].tolist()) if cal_payload else None
+        if cal_payload and gender_test is not None:
+            best_cal_name = cal_payload["best_cal_name"]
+            best_alpha = float(cal_payload["best_alpha"])
+            cal = cal_payload["calibrators"][best_cal_name]
+            preds_cal = cal.transform(preds, gender_test.astype(float))
+            preds_blend = best_alpha * preds_cal + (1.0 - best_alpha) * preds
+            preds_blend = np.clip(preds_blend, 0.0, 1.0)
+            mean_shift = float(preds_blend.mean() - preds.mean())
+            print(f"  Applied {best_cal_name} (α={best_alpha:.2f}, per-gender blend). "
+                  f"Mean pred shift: {mean_shift:+.4f}")
+            preds = preds_blend
+        else:
+            print("  → fallback: no per-gender calibration applied (artifact or gender_csv missing)")
 
     if bias_correction and gender_col in df.columns:
         g = pd.to_numeric(df[gender_col], errors="coerce").fillna(0.5).astype(float)
@@ -246,4 +329,6 @@ if __name__ == "__main__":
         bias_correction=CONFIG["bias_correction"],
         gender_col=CONFIG["gender_col"],
         match_test_pmf=CONFIG["match_test_pmf"],
+        apply_calibration=CONFIG.get("apply_calibration", True),
+        gender_csv=CONFIG.get("gender_csv", "data/raw/test_students_with_gender.csv"),
     )

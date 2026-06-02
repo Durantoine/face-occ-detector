@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-coatnet1-v18-optuna
+#SBATCH --job-name=face-occ-coatnet1-v19-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=3090
@@ -11,10 +11,10 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - CoAtNet-1 (CNN ~42M) v18 - Baseline CNN (2x 3090, BF16)"
+echo "OPTUNA HPO - CoAtNet-1 (CNN ~42M) v19 - Baseline CNN (2x 3090, BF16)"
 echo "  Backbone: timm tf_coatnet1 (ImageNet pretrained)"
 echo "  Pools: attention_k_query + mil (no CLS, no MHA)"
-echo "  All v18 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
+echo "  All v19 features: tri-split + IS stratified + Lagrangian + 3 calibrators"
 echo "================================================================================"
 echo "Node: \$(hostname) | Job ID: \$SLURM_JOB_ID | GPUs: \$CUDA_VISIBLE_DEVICES"
 echo "Started: \$(date)"
@@ -47,7 +47,7 @@ export NCCL_TIMEOUT=3600
 
 ulimit -n 65536 || ulimit -n 8192
 
-export FACE_OCC_ARCH=coatnet1-3090-v18
+export FACE_OCC_ARCH=coatnet1-3090-v19
 
 mkdir -p scripts/logs
 

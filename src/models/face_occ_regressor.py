@@ -138,35 +138,52 @@ class GAPPooling(nn.Module):
 
 
 class GridPooling(nn.Module):
-    """Spatial grid average pooling: AdaptiveAvgPool2d(grid_size) → (B, grid²·D).
+    """Spatial grid average pooling: AdaptiveAvgPool2d(grid_size) → (B, grid²·D) or
+    with v19 per-cell bottleneck → (B, grid²·cell_proj_dim).
 
-    Requires square spatial (N = H·W = perfect square).
-    If input is not square (e.g. includes registers), we take the last perfect
-    square of tokens.
+    Requires square spatial (N = H·W = perfect square). If non-square (registers),
+    take the last perfect square of tokens.
+
+    v19 changes :
+      - Optional `cell_proj_dim` : Linear(D → cell_proj_dim) shared per cell.
+        Reduces output dim from grid²·D to grid²·cell_proj_dim. Mandatory for big
+        backbones (Sapiens 0.6b D=1280 + grid=7 → 62720 dim without it).
+      - cell_proj_dim=None ⇒ v18 behavior (no bottleneck).
     """
-    def __init__(self, dim: int, grid_size: int = 2, skip_cls: bool = False) -> None:
+    def __init__(self, dim: int, grid_size: int = 2, skip_cls: bool = False,
+                 cell_proj_dim: Optional[int] = None) -> None:
         super().__init__()
         self.dim = dim
         self.grid_size = int(grid_size)
         self.skip_cls = skip_cls
+        self.cell_proj_dim = int(cell_proj_dim) if cell_proj_dim is not None else None
+        if self.cell_proj_dim is not None:
+            self.cell_proj = nn.Linear(dim, self.cell_proj_dim)
+        else:
+            self.cell_proj = nn.Identity()
 
     @property
     def output_dim(self) -> int:
-        return self.dim * self.grid_size * self.grid_size
+        out_per_cell = self.cell_proj_dim if self.cell_proj_dim is not None else self.dim
+        return out_per_cell * self.grid_size * self.grid_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         patches = x[:, 1:, :] if self.skip_cls else x
         B, N, D = patches.shape
         H = int(N ** 0.5)
         if H * H != N:
-            # Robustness: take the last perfect square of tokens (assume they are the patches)
             N = H * H
             patches = patches[:, -N:, :]
-        
+
         # (B, N=H·W, D) → (B, D, H, W) for adaptive pool
         spatial = patches.transpose(1, 2).reshape(B, D, H, H)
         pooled = F.adaptive_avg_pool2d(spatial, self.grid_size)  # (B, D, g, g)
-        return pooled.flatten(1), None  # (B, D·g²)
+        if self.cell_proj_dim is not None:
+            # (B, D, g, g) → (B, g, g, D) → cell_proj → (B, g, g, P) → (B, P, g, g)
+            pooled = pooled.permute(0, 2, 3, 1).contiguous()        # (B, g, g, D)
+            pooled = self.cell_proj(pooled)                          # (B, g, g, P)
+            pooled = pooled.permute(0, 3, 1, 2).contiguous()        # (B, P, g, g)
+        return pooled.flatten(1), None  # (B, out_per_cell · g²)
 
 
 
@@ -300,6 +317,7 @@ class AttentionPooling(nn.Module):
         attn_dropout: float = 0.0,
         proj_dropout: float = 0.0,
         learnable_tau: bool = True,
+        proj_out_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -325,37 +343,52 @@ class AttentionPooling(nn.Module):
 
         # proj_q (v16) : transforme les queries learnable avant le dot product. Permet
         # plus de capacité dans l'espace requête sans coût significatif (K·D params).
-        # Sans cette projection, les queries dot-product directement avec keys, ce qui
-        # peut être limitant si l'espace key est très "rotated" par proj_k.
         self.proj_q = nn.Linear(dim, dim)
         self.proj_k = nn.Linear(dim, dim)
         self.proj_v = nn.Linear(dim, dim)
         self.attn_dropout = nn.Dropout(attn_dropout)
-        self.norm = nn.LayerNorm(self.K * dim)
+
+        # v19: per-query bottleneck. Applied to each pooled[k] (D-dim) → P-dim, shared
+        # weights across K queries. Reduces output dim from K·D to K·P. Sample-efficient
+        # for large backbones (Sapiens 0.6b+ where D ≥ 1280).
+        # proj_out_dim=None ⇒ no bottleneck (v18 behavior).
+        self.proj_out_dim = int(proj_out_dim) if proj_out_dim is not None else None
+        if self.proj_out_dim is not None:
+            self.proj_out = nn.Linear(dim, self.proj_out_dim)
+            out_dim_per_query = self.proj_out_dim
+        else:
+            self.proj_out = nn.Identity()
+            out_dim_per_query = dim
+        self._final_dim = self.K * out_dim_per_query
+        self.norm = nn.LayerNorm(self._final_dim)
         self.proj_dropout = nn.Dropout(proj_dropout)
 
     @property
     def output_dim(self) -> int:
-        return self.K * self.dim
+        return self._final_dim
 
     def get_taus(self) -> torch.Tensor:
         return torch.exp(self.log_tau)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """x: (B, N, D)  →  pooled: (B, K·D), attn_weights: (B, K, N)"""
+        """x: (B, N, D)  →  pooled flat: (B, K·proj_out_dim_or_D), attn_weights: (B, K, N)"""
         D = x.size(-1)
-        q = self.proj_q(self.queries)                                  # (K, D) — v16
+        q = self.proj_q(self.queries)                                  # (K, D)
         k = self.proj_k(x)
         v = self.proj_v(x)
         scale = D ** 0.5
         taus = torch.exp(self.log_tau).view(self.K, 1)
 
         scores = torch.einsum("kd,bnd->bkn", q, k) / (scale * taus)
-        weights = F.softmax(scores, dim=-1)
+        # v19: softmax in fp32 to avoid overflow when tau is very small (e.g., 0.03).
+        # bf16 max ≈ 3.4e38 = exp(89); with score range ~[-3, 3] and tau=0.03,
+        # exp(score/tau) can reach exp(200) → inf. fp32 cast prevents this with minimal cost.
+        weights = F.softmax(scores.float(), dim=-1).to(scores.dtype)
         weights = self.attn_dropout(weights)
 
-        pooled = torch.einsum("bkn,bnd->bkd", weights, v)
-        flat = pooled.flatten(start_dim=1)
+        pooled = torch.einsum("bkn,bnd->bkd", weights, v)               # (B, K, D)
+        pooled = self.proj_out(pooled)                                  # (B, K, P) or unchanged
+        flat = pooled.flatten(start_dim=1)                              # (B, K·P)
         flat = self.norm(flat)
         flat = self.proj_dropout(flat)
         return flat, weights
@@ -378,13 +411,16 @@ def build_pooling(
     mil_k_top: int = 30,
     grid_size: int = 2,
     has_cls: bool = True,
+    pool_proj_out_dim: Optional[int] = None,
+    grid_cell_proj_dim: Optional[int] = None,
 ) -> nn.Module:
     if pooling_type == "cls":
         return CLSPooling(dim=dim)
     if pooling_type == "gap":
         return GAPPooling(dim=dim, skip_cls=has_cls)
     if pooling_type == "grid":
-        return GridPooling(dim=dim, grid_size=grid_size, skip_cls=has_cls)
+        return GridPooling(dim=dim, grid_size=grid_size, skip_cls=has_cls,
+                           cell_proj_dim=grid_cell_proj_dim)
     if pooling_type == "mean_var":
         return MeanVarPooling(dim=dim, skip_cls=has_cls)
     if pooling_type == "mil":
@@ -395,6 +431,7 @@ def build_pooling(
             tau_focal_init=tau_focal_init, tau_diffuse_init=tau_diffuse_init,
             tau_free_init=tau_free_init, learnable_tau=learnable_tau,
             attn_dropout=pool_attn_dropout, proj_dropout=pool_proj_dropout,
+            proj_out_dim=pool_proj_out_dim,
         )
     raise ValueError(f"Unknown pooling_type: {pooling_type}")
 
@@ -480,6 +517,13 @@ class FaceOccRegressor(nn.Module):
         mil_k_top: int = 30,
         # Grid pooling
         grid_size: int = 2,
+        # v19 — pooling bottlenecks (per-query for K-attn, per-cell for grid)
+        pool_proj_out_dim: Optional[int] = None,
+        grid_cell_proj_dim: Optional[int] = None,
+        # v19 — optional MLP head (vs Linear). Use mostly with grid to add non-linearity
+        # after pool. For k-attn / mil the non-linearity is already in the pool itself.
+        head_type: str = "linear",
+        head_hidden_dim: int = 128,
         # Common pool regularization
         pool_attn_dropout: float = 0.0,
         pool_proj_dropout: float = 0.0,
@@ -514,6 +558,8 @@ class FaceOccRegressor(nn.Module):
             grid_size=grid_size,
             pool_attn_dropout=pool_attn_dropout, pool_proj_dropout=pool_proj_dropout,
             has_cls=has_cls,
+            pool_proj_out_dim=pool_proj_out_dim,
+            grid_cell_proj_dim=grid_cell_proj_dim,
         )
 
         if projection_size:
@@ -529,7 +575,19 @@ class FaceOccRegressor(nn.Module):
             final_size = self.pool.output_dim
 
         self.dropout = nn.Dropout(head_dropout)
-        self.head = nn.Linear(final_size, output_dim)
+        # v19: head can be linear (default, backward compat) or MLP with 1 hidden layer.
+        # MLP recommended after grid pool (no non-linearity in pool); for k-attn/mil
+        # the pool already has non-linearities (softmax / MLP) so linear is enough.
+        self.head_type = head_type
+        if head_type == "mlp":
+            self.head = nn.Sequential(
+                nn.Linear(final_size, head_hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(head_dropout),
+                nn.Linear(head_hidden_dim, output_dim),
+            )
+        else:
+            self.head = nn.Linear(final_size, output_dim)
         self.adv_disc: Optional[GenderDiscriminator] = (
             GenderDiscriminator(in_dim=final_size, hidden=adv_disc_hidden, dropout=adv_disc_dropout)
             if enable_adv_disc else None
@@ -539,14 +597,26 @@ class FaceOccRegressor(nn.Module):
 
     def _init_weights(self, target_mean: Optional[float] = None) -> None:
         import math
-        nn.init.trunc_normal_(self.head.weight, std=0.02)
+        # v19: head may be Linear OR Sequential (MLP). Find the FINAL linear (= output layer).
+        if isinstance(self.head, nn.Linear):
+            final_linear = self.head
+            # Init intermediate layers of MLP head normally (only for Sequential case)
+        else:  # nn.Sequential
+            final_linear = None
+            for m in self.head:
+                if isinstance(m, nn.Linear):
+                    nn.init.trunc_normal_(m.weight, std=0.02)
+                    nn.init.zeros_(m.bias)
+                    final_linear = m   # keep last (= output)
+            assert final_linear is not None, "MLP head must contain at least one Linear"
+        nn.init.trunc_normal_(final_linear.weight, std=0.02)
         if target_mean is not None and self.output_activation == "sigmoid":
             eps = 1e-6
             p = max(eps, min(1.0 - eps, float(target_mean)))
             bias_init = math.log(p / (1.0 - p))
         else:
             bias_init = 0.0
-        nn.init.constant_(self.head.bias, bias_init)
+        nn.init.constant_(final_linear.bias, bias_init)
         for m in self.pool.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)

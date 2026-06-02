@@ -1,24 +1,17 @@
-name: dinov3-vitb16-3090-v18
+name: sapiens2-08b-3090-v19
 description: |
-  DINOv3 ViT-B/16 (86M) v12 — refinements on top of v11.
-
-  Changes vs v11:
-    - K-query HPO ranges RESTORED to v4 (n_focal/n_diffuse [1,4], n_free [0,3],
-      dropouts [0, 0.3], tau_focal [0.05, 0.3], tau_diffuse [1, 3]) — v11 had tightened
-      these which reduced exploration of configs that produced v4's best (0.0012).
-    - DANN re-added to feature_fairness choices ({none, ot, dann}); MMD stays removed.
-      adv_lambda back in HPO conditional.
-    - min_lr_rate: 0.1 -> 0.3 (gentler cosine decay; v11 decayed too aggressively).
-    - logging_steps: 200 -> 25 (faster MLflow refresh; safe with non-blocking writes).
-    - ema_decay: 0.999 (restored; was temporarily disabled in v11 for debug).
+  Sapiens2-0.8B (D=1280, ~840M params) — large ViT, human-domain pretraining.
+  Mirrors dinov3-vitb16 v19 HPO design but with larger backbone settings.
+  3090 24GB: batch 24 + grad_accum 4 + gradient_checkpointing.
+  v19 HPO same as dinov3 (loss_focal_gamma [0.5, 2.0], wd [0.08, 0.40], pool dropouts ≤0.15, adv_lambda [0.005, 0.20]).
 
 model:
-  model_name: dinov3_vitb16
+  model_name: sapiens2_0.8b
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
   output_activation: sigmoid
-  pooling_type: attention_k_query   # v16: cls retiré (perd info spatiale)
+  pooling_type: attention_k_query   # v16: cls retiré
   n_focal: 2
   n_diffuse: 2
   n_free: 2
@@ -40,23 +33,20 @@ data:
   image_base_dir: data/raw
   data_csv: data/raw/train.csv
   extra_train_csv: null
-  # Tri-split v12: train iid 80% / val iid 15% (stratified IS metric) / test holdout 5%
-  # (match P_test via H_C) — see docs/v12_theory.md §3 for rationale.
   val_split_ratio: 0.15
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 128
-  per_device_eval_batch_size: 256
-  gradient_accumulation_steps: 1
-  num_train_epochs: 13   # PINNED v16 (was HPO [7,13]). Rationale: decouple from LR shape;
-                          # rely on early_stopping_patience=3 for actual duration.
+  per_device_train_batch_size: 24    # Sapiens 0.8b ~D=1280, 24GB tight
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 4    # effective batch = 24*4*2 = 192
+  num_train_epochs: 13   # PINNED v16 (was HPO). Early stopping decides real duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
   warmup_ratio: 0.1
   lr_scheduler_type: cosine_with_min_lr
   lr_scheduler_kwargs:
-    min_lr_rate: 0.3   # HPO override via top-level `min_lr_rate` in training section (see below)
+    min_lr_rate: 0.3   # HPO override via top-level `min_lr_rate` (see search_space)
   max_grad_norm: 1.0
   early_stopping_patience: 3
   seed: 42
@@ -65,12 +55,10 @@ training:
   greater_is_better: false
   bf16: true
   fp16: false
-  gradient_checkpointing: false
+  gradient_checkpointing: true   # 0.8b needs it on 24GB
   augmentation_level: none
   layer_decay: 0.85
   # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
-  # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
-  # λ_metric=1 toujours utilisé en eval (challenge metric inchangée).
   loss_lambda_init: 1.0
   loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
   loss_lambda_max: 3.0            # marge haute, log() sature naturellement
@@ -83,44 +71,40 @@ training:
 optuna:
   n_trials: 100
   objective_mode: score
-  rotate_val_seed: false   # v16 (was true): fix seed so all trials see SAME val split.
-                            # Enables ensemble + isotonic on common val without retraining.
-                            # Variance protection via large val (15k) + stratified IS + test holdout.
+  rotate_val_seed: false   # v16 (was true): fix seed for ensemble + isotonic on common val.
   keep_top_n: 3
   search_space:
     pretrained_source:
       type: categorical
       choices:
-        - "lvd"
-        - "ibot:runs:/c1e1ba1a747747688e3691daa4f7a31a/encoder"
+        - "sapiens_default"
+        # Replace placeholder with cluster MLflow run_id of pretrain_ibot_sapiens2_08b_2x3090.sh.
+        # Validator (_validate_pretrained_source_choices) will fail-fast if run_id unknown.
+        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder"
     pooling_type:
       type: categorical
-      choices: [attention_k_query, mil, grid]   # v16: cls retiré (perd info spatiale)
+      choices: [attention_k_query, mil, grid]   # v16: cls retiré
 
-    # v16: single-axis under H_C — α=correction_strength controls how much we
-    # interpolate from P_train(g, y) toward P_test_joint(g, y) = P_train(g|y)·P_test(y).
-    # Loss-only (no sampler in v16: with ~41 F per batch=128, fairness mechanisms
-    # and gradient variance are fine without oversampling).
-    correction_strength: {type: float, low: 0.0, high: 1.0}
+    # v16: single-axis correction under H_C (see docs/v16_theory.md §1)
+    correction_strength: {type: float, low: 0.4, high: 1.0}    # v19: data shows fairness wins concentrate in [0.6, 0.9]; 0.4 = comfortable lower margin
 
     feature_fairness:
       type: categorical
       choices: [none, ot, dann]
     ot_lambda:
       type: float
-      low: 0.01
-      high: 1.0
+      low: 0.03   # v19: mlflow.db OT trials (n=29) top med 0.11; rare wins outside [0.03, 0.5]
+      high: 0.5
       log: true
       conditional_on:
         feature_fairness: ot
     adv_lambda:
       type: float
-      low: 0.001
-      high: 0.05
+      low: 0.005   # v19: mlflow.db DANN analysis (n=24): TOP-8 geo-mean 0.064, BOT-8 0.014
+      high: 0.20   # → shift right (was [0.001, 0.05])
       log: true
       conditional_on:
         feature_fairness: dann
-    # OT method: 'sliced' (fast, L=100 projections) ou 'sinkhorn' (entropic OT, plus précis ~3x lent)
     ot_method:
       type: categorical
       choices: [sliced, sinkhorn]
@@ -135,16 +119,13 @@ optuna:
         feature_fairness: ot
         ot_method: sinkhorn
 
-    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+    loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
 
-    # LR + LLRD ranges informed by v11 trials analysis:
-    # - Sweet spot: LR ∈ [1e-4, 2.1e-4] with layer_decay ∈ [0.75, 0.87]
-    # - Hence: cap LR at 2e-4 AND layer_decay at 0.9 (was 1.0)
+    # LR cap 2e-4 + layer_decay cap 0.9 (v11 trials sweet spot).
     learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
-    # num_train_epochs PINNED at 13 (max), early_stopping_patience=3 decides real duration.
-    # LR scheduler shape decoupled via min_lr_rate HPO.
-    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
-    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    # num_train_epochs PINNED at 13, early_stopping_patience=3 decides real duration.
+    min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
+    weight_decay:  {type: float, low: 0.08, high: 0.40}   # v19: top cluster [0.10, 0.30] across all sources
     head_dropout:  {type: float, low: 0.0, high: 0.4}
     backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
     layer_decay:   {type: float, low: 0.65, high: 0.9}
@@ -152,13 +133,13 @@ optuna:
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: mlflow.db v10+v11 — ALL top trials use 0.0
       conditional_on:
         pooling_type: attention_k_query
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: same
       conditional_on:
         pooling_type: attention_k_query
 
@@ -177,8 +158,8 @@ optuna:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 0.5   # was 1.0; allow transition focal↔diffuse
-      high: 3.0
+      low: 1.0   # v19: mlflow.db top-10 cluster [1.9, 2.9], <1.5 is bot-biased
+      high: 3.5   # slight margin above top cluster
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
@@ -200,10 +181,7 @@ optuna:
       conditional_on:
         pooling_type: attention_k_query
 
-
-    # === MIL pooling (Multi-Instance Learning) ===
-    # mil_agg pinned to "multi" (concat of mean+max+topk+gated_attn) — no HPO since
-    # multi includes all 4 single-agg modes via its (B, 4) feature passed to head.
+    # MIL pooling: mil_agg pinned to "multi" (concat 4 aggs), no HPO needed.
     mil_hidden:
       type: categorical
       choices: [64, 128, 256]
@@ -216,9 +194,34 @@ optuna:
       conditional_on:
         pooling_type: mil
 
-    # Grid pooling : régions spatiales 2x2 ou 3x3
     grid_size:
       type: categorical
-      choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14 → cells 2x2 patches)
+      choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14)
       conditional_on:
         pooling_type: grid
+    # v19 per-query bottleneck (Linear D -> P shared across queries). None = no bottleneck.
+    pool_proj_out_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # v19 per-cell bottleneck (Linear D -> P shared across cells) — required for big backbones
+    grid_cell_proj_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: grid
+    # v19 MLP head (recommended with grid since grid pool has no non-linearity)
+    head_type:
+      type: categorical
+      choices: [linear, mlp]
+      conditional_on:
+        pooling_type: grid
+    head_hidden_dim:
+      type: categorical
+      choices: [64, 128, 256]
+      conditional_on:
+        pooling_type: grid
+        head_type: mlp
+

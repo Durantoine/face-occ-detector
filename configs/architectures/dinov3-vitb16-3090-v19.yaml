@@ -1,16 +1,15 @@
-name: dinov3-vitb16-3090-v16
+name: dinov3-vitb16-3090-v19
 description: |
-  DINOv3 ViT-B/16 (86M) v12 — refinements on top of v11.
+  DINOv3 ViT-B/16 (86M) — primary transformer baseline. Native 224, LVD-1689M pretrain
+  (also supports iBOT-finetuned encoder via pretrained_source HPO).
 
-  Changes vs v11:
-    - K-query HPO ranges RESTORED to v4 (n_focal/n_diffuse [1,4], n_free [0,3],
-      dropouts [0, 0.3], tau_focal [0.05, 0.3], tau_diffuse [1, 3]) — v11 had tightened
-      these which reduced exploration of configs that produced v4's best (0.0012).
-    - DANN re-added to feature_fairness choices ({none, ot, dann}); MMD stays removed.
-      adv_lambda back in HPO conditional.
-    - min_lr_rate: 0.1 -> 0.3 (gentler cosine decay; v11 decayed too aggressively).
-    - logging_steps: 200 -> 25 (faster MLflow refresh; safe with non-blocking writes).
-    - ema_decay: 0.999 (restored; was temporarily disabled in v11 for debug).
+  v19 HPO refinements (informed by mlflow.db trial analysis):
+    - loss_focal_gamma [0.5, 2.0] (v4: ρ=-0.50 p=0.006 — higher gamma wins consistently)
+    - weight_decay [0.08, 0.40] (top cluster [0.10, 0.30] across v4+v10/11+v17)
+    - pool dropouts capped at 0.15 (v10/v11: all top trials use 0.0)
+    - adv_lambda [0.005, 0.20] log (DANN top-8 geo-mean 0.064 vs bot-8 0.014)
+  Other v19 features: K-query bottleneck (W_OUT), grid pool MLP head, per-gender cal
+  artifacts, ensemble script, tau softmax fp32 (small-tau bf16 overflow guard).
 
 model:
   model_name: dinov3_vitb16
@@ -68,15 +67,14 @@ training:
   gradient_checkpointing: false
   augmentation_level: none
   layer_decay: 0.85
-  ema_decay: 0.999
-  # v16.5 Lagrangien refondu : update une fois par epoch depuis le signal val CLEAN
-  # (eval_err_diff sur 15k samples). Plus de bruit per-batch, plus d'EMA.
-  # λ_{t+1} = clip(λ_t + lr · (val_err_diff - threshold), λ_min, λ_max)
+  # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
+  # Δλ = lr · (val_err_diff − threshold), clip in [λ_min, λ_max].
+  # λ_metric=1 toujours utilisé en eval (challenge metric inchangée).
   loss_lambda_init: 1.0
-  loss_lambda_lr: 50.0            # per-epoch update, big step OK
-  loss_lambda_max: 3.0           # max push fairness (3× métrique)
-  loss_lambda_min: 1           # floor (peut descendre sous métrique si fairness easy)
-  loss_lambda_threshold: 0.0005   # zone d'équilibre — λ stable quand val_err_diff ≈ 0.001
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -102,22 +100,22 @@ optuna:
     # interpolate from P_train(g, y) toward P_test_joint(g, y) = P_train(g|y)·P_test(y).
     # Loss-only (no sampler in v16: with ~41 F per batch=128, fairness mechanisms
     # and gradient variance are fine without oversampling).
-    correction_strength: {type: float, low: 0.0, high: 1.0}
+    correction_strength: {type: float, low: 0.4, high: 1.0}    # v19: data shows fairness wins concentrate in [0.6, 0.9]; 0.4 = comfortable lower margin
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
-      low: 0.01
-      high: 1.0
+      low: 0.03   # v19: mlflow.db OT trials (n=29) top cluster med 0.11; rare wins outside [0.03, 0.5]
+      high: 0.5
       log: true
       conditional_on:
         feature_fairness: ot
     adv_lambda:
       type: float
-      low: 0.001
-      high: 0.05
+      low: 0.005   # v19: mlflow.db DANN analysis (n=24): TOP-8 geo-mean 0.064, BOT-8 0.014
+      high: 0.20   # → shift right (was [0.001, 0.05]; current top sweet spot ~[0.01, 0.1])
       log: true
       conditional_on:
         feature_fairness: dann
@@ -136,7 +134,7 @@ optuna:
         feature_fairness: ot
         ot_method: sinkhorn
 
-    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+    loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better; was [0.0, 1.5]
 
     # LR + LLRD ranges informed by v11 trials analysis:
     # - Sweet spot: LR ∈ [1e-4, 2.1e-4] with layer_decay ∈ [0.75, 0.87]
@@ -144,8 +142,8 @@ optuna:
     learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
     # num_train_epochs PINNED at 13 (max), early_stopping_patience=3 decides real duration.
     # LR scheduler shape decoupled via min_lr_rate HPO.
-    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
-    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
+    weight_decay:  {type: float, low: 0.08, high: 0.40}   # v19: top cluster [0.10, 0.30] across v4+v10/11+v17 (ρ=-0.56 on v17)
     head_dropout:  {type: float, low: 0.0, high: 0.4}
     backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
     layer_decay:   {type: float, low: 0.65, high: 0.9}
@@ -153,13 +151,13 @@ optuna:
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: mlflow.db v10+v11 — ALL top trials use 0.0; tighten ceiling
       conditional_on:
         pooling_type: attention_k_query
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: same as above
       conditional_on:
         pooling_type: attention_k_query
 
@@ -178,26 +176,26 @@ optuna:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 0.5   # was 1.0; allow transition focal↔diffuse
-      high: 3.0
+      low: 1.0   # v19: mlflow.db top-10 cluster [1.9, 2.9], <1.5 is bot-biased
+      high: 3.5   # slight margin above top cluster (one outlier at 3.85)
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
       low: 0   # was 1; allow no diffuse queries (pure focal+free config)
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 
@@ -223,3 +221,29 @@ optuna:
       choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14 → cells 2x2 patches)
       conditional_on:
         pooling_type: grid
+    # v19 per-query bottleneck (Linear D -> P shared across queries). None = no bottleneck.
+    pool_proj_out_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # v19 per-cell bottleneck (Linear D -> P shared across cells) — required for big backbones
+    grid_cell_proj_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: grid
+    # v19 MLP head (recommended with grid since grid pool has no non-linearity)
+    head_type:
+      type: categorical
+      choices: [linear, mlp]
+      conditional_on:
+        pooling_type: grid
+    head_hidden_dim:
+      type: categorical
+      choices: [64, 128, 256]
+      conditional_on:
+        pooling_type: grid
+        head_type: mlp
+

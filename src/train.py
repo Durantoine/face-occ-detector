@@ -48,7 +48,7 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v18"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v19"),
     "data_csv": "data/raw/train.csv",
     "val_data_csv": None,
     "output_dir": "./results",
@@ -64,7 +64,7 @@ _NON_HF_TRAIN_KEYS = {
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min",
     "loss_lambda_threshold",
     "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
-    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
+    "feature_fairness", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_query_diversity_lambda",
     "save_qualitative_k",
     "layer_decay",
@@ -158,7 +158,6 @@ class WeightedMSETrainer(Trainer):
         lambda_threshold: float = 0.0005,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
-        mmd_lambda: float = 0.0,
         ot_lambda: float = 0.0,
         sinkhorn_lambda: float = 0.0,
         sinkhorn_eps: float = 0.1,
@@ -170,7 +169,6 @@ class WeightedMSETrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._query_diversity_lambda = float(query_diversity_lambda)
         self._adv_lambda = float(adv_lambda)
-        self._mmd_lambda = float(mmd_lambda)
         self._ot_lambda = float(ot_lambda)
         self._sinkhorn_lambda = float(sinkhorn_lambda)
         self._sinkhorn_eps = float(sinkhorn_eps)
@@ -188,7 +186,7 @@ class WeightedMSETrainer(Trainer):
               f"λ_init={lambda_init}, λ_lr={lambda_lr} (log-space), λ∈[{lambda_min}, {lambda_max}], "
               f"threshold={lambda_threshold}, "
               f"query_div={query_diversity_lambda}, adv={adv_lambda}, "
-              f"mmd={mmd_lambda}, ot={ot_lambda}, sinkhorn={sinkhorn_lambda}, "
+              f"ot={ot_lambda}, sinkhorn={sinkhorn_lambda}, "
               f"layer_decay={layer_decay}")
 
     def _get_train_sampler(self, *args: Any, **kwargs: Any) -> Any:
@@ -219,16 +217,6 @@ class WeightedMSETrainer(Trainer):
                 g_tgt = (labels[:, 1] >= 0.5).long()
                 adv = torch.nn.functional.cross_entropy(outputs["adv_logits"], g_tgt)
                 loss = loss + self._adv_lambda * adv
-
-        if self._mmd_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
-            if labels.dim() == 2 and labels.size(1) >= 2:
-                from src.utils.losses import mmd_rbf
-                feats = outputs["features"]
-                g = labels[:, 1]
-                f_mask = g < 0.5
-                m_mask = g >= 0.5
-                mmd = mmd_rbf(feats[f_mask], feats[m_mask])
-                loss = loss + self._mmd_lambda * mmd
 
         if self._ot_lambda > 0 and isinstance(outputs, dict) and "features" in outputs:
             if labels.dim() == 2 and labels.size(1) >= 2:
@@ -613,11 +601,9 @@ def train(
     layer_decay = float(train_cfg.get("layer_decay", 1.0))
 
     feature_fairness = str(train_cfg.get("feature_fairness", "none"))
-    mmd_active = feature_fairness == "mmd"
     dann_active = feature_fairness == "dann"
     ot_active = feature_fairness == "ot"
     ot_method = str(train_cfg.get("ot_method", "sliced"))   # 'sliced' or 'sinkhorn'
-    mmd_lambda = float(train_cfg.get("mmd_lambda", 0.0)) if mmd_active else 0.0
     adv_lambda = float(train_cfg.get("adv_lambda", 0.01)) if dann_active else 0.0
     # Single ot_lambda dispatched to either Sliced-W (default, fast) or Sinkhorn (precise).
     ot_lambda = float(train_cfg.get("ot_lambda", 0.0)) if ot_active else 0.0
@@ -637,7 +623,6 @@ def train(
     train_cfg_logged = dict(train_cfg)
     train_cfg_logged["correction_strength"] = correction_strength
     train_cfg_logged["adv_lambda"] = adv_lambda
-    train_cfg_logged["mmd_lambda"] = mmd_lambda
     train_cfg_logged["ot_lambda"] = ot_lambda
     train_cfg_logged["ot_method"] = ot_method if ot_active else "none"
     train_cfg_logged["sinkhorn_eps"] = sinkhorn_eps if (ot_active and ot_method == "sinkhorn") else 0.0
@@ -718,6 +703,14 @@ def train(
             grid_size=int(model_cfg.get("grid_size", 2)),
             pool_attn_dropout=float(model_cfg.get("pool_attn_dropout", 0.0)),
             pool_proj_dropout=float(model_cfg.get("pool_proj_dropout", 0.0)),
+            # v19: pool bottlenecks + optional MLP head (defaults preserve v18 behavior)
+            # 'none' string sentinel from HPO -> Python None (Optuna categorical-safe)
+            pool_proj_out_dim=(None if str(model_cfg.get("pool_proj_out_dim", "none")).lower() == "none"
+                                  else int(model_cfg.get("pool_proj_out_dim"))),
+            grid_cell_proj_dim=(None if str(model_cfg.get("grid_cell_proj_dim", "none")).lower() == "none"
+                                    else int(model_cfg.get("grid_cell_proj_dim"))),
+            head_type=str(model_cfg.get("head_type", "linear")),
+            head_hidden_dim=int(model_cfg.get("head_hidden_dim", 128)),
             enable_adv_disc=dann_active,
             target_mean=target_mean,
         )
@@ -836,7 +829,6 @@ def train(
         lambda_threshold=float(train_cfg.get("loss_lambda_threshold", 0.0005)),
         query_diversity_lambda=float(train_cfg.get("loss_query_diversity_lambda", 0.0)),
         adv_lambda=adv_lambda,
-        mmd_lambda=mmd_lambda,
         ot_lambda=sliced_lambda,
         sinkhorn_lambda=sinkhorn_lambda,
         sinkhorn_eps=sinkhorn_eps,
@@ -906,7 +898,10 @@ def train(
         #   α>1    → over-correct (extrapolate beyond cal); helps if cal is conservative on
         #            rare high-y bins where the model under-predicts and isotonic can't fully
         #            stretch due to sparse val support. Best (cal,α) selected on val IS-strat.
-        alphas = np.linspace(0.0, 1.5, 16)  # 0.0, 0.1, ..., 1.5
+        # v19: grid resserre [0.6, 1.3] step 0.1 (8 valeurs vs 16 en v18). DB stats
+        # montrent que best_alpha tombe dans cette zone 77% du temps; les valeurs hors
+        # sont exploitees < 5% des trials → economie ~50% des combos eval sans perte.
+        alphas = np.linspace(0.6, 1.3, 8)  # 0.6, 0.7, ..., 1.3
         val_is_eval_scores: Dict[str, float] = {}
         val_combo_scores: Dict[Tuple[str, float], float] = {}
         for cal_name, cal in cals.items():
@@ -956,6 +951,32 @@ def train(
         print(f"  Best (cal, α) (val IS-strat): {best_cal_for_submission}, α={best_alpha_for_submission}  "
               f"→ val_score={val_combo_scores[best_combo]:.5f}")
         print(f"  Best α per cal: {', '.join(f'{c}=α{a:.1f}' for c, a in best_alpha_per_cal.items())}")
+
+        # v19: pickle calibrators dict + best (cal, α) for submit-time apply.
+        # Loaded by predict.py via MLflow run artifacts.
+        import pickle as _pkl
+        try:
+            cal_payload = {
+                "calibrators": cals,
+                "best_cal_name": best_cal_for_submission,
+                "best_alpha": float(best_alpha_for_submission),
+                "best_alpha_per_cal": best_alpha_per_cal,
+                "n_bins": int(N_BINS),
+                "bin_width": float(BIN_WIDTH),
+                "val_score": float(val_combo_scores[best_combo]),
+            }
+            cal_pkl_path = Path(output_dir) / "calibrators.pkl"
+            cal_pkl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cal_pkl_path, "wb") as _f:
+                _pkl.dump(cal_payload, _f)
+            if use_mlflow:
+                if use_client and client and run_id:
+                    client.log_artifact(run_id, str(cal_pkl_path), "calibrators")
+                elif mlflow.active_run():
+                    mlflow.log_artifact(str(cal_pkl_path), "calibrators")
+            print(f"  Pickled calibrators → MLflow artifact calibrators/{cal_pkl_path.name}")
+        except Exception as e_pkl:
+            print(f"  WARNING: failed to pickle calibrators: {e_pkl}")
 
         # === True post-hoc validation on test holdout (predict already done above) ===
         if test_pred_out is not None:

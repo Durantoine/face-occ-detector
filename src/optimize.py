@@ -27,7 +27,7 @@ from src.utils.mlflow_utils import get_or_create_experiment
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
-    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v18"),
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v19"),
     "n_trials": 100,
     "study_name": None,
     "tracking_uri": "sqlite:///mlflow.db",
@@ -44,7 +44,7 @@ _TRAINING_KEYS = {
     "lr_scheduler_type", "gradient_accumulation_steps", "per_device_train_batch_size",
     "augmentation_level",
     "correction_strength", "axis1_power", "axis2_power", "sampler_participation",
-    "feature_fairness", "mmd_lambda", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
+    "feature_fairness", "adv_lambda", "ot_lambda", "ot_method", "sinkhorn_eps",
     "loss_focal_gamma",
     "loss_lambda_init", "loss_lambda_lr", "loss_lambda_max", "loss_lambda_min",
     "loss_lambda_threshold",
@@ -63,9 +63,12 @@ _MODEL_KEYS = {
     "mil_agg", "mil_hidden", "mil_k_top",   # v13: MIL pooling
     "grid_size",                              # v16: grid pooling
     "pool_attn_dropout", "pool_proj_dropout",
+    # v19: pooling bottlenecks + optional MLP head
+    "pool_proj_out_dim", "grid_cell_proj_dim",
+    "head_type", "head_hidden_dim",
 }
 
-_FEATURE_FAIRNESS_CHOICES = ("none", "mmd", "dann", "ot")
+_FEATURE_FAIRNESS_CHOICES = ("none", "dann", "ot")
 
 
 def _apply_trial_param(cfg: Dict[str, Any], name: str, value: Any) -> None:
@@ -236,7 +239,7 @@ def objective(
             optuna_trial=trial,
         )
     except optuna.exceptions.TrialPruned:
-        print(f"Trial {trial.number}: pruned by MedianPruner (intermediate score too high)")
+        print(f"Trial {trial.number}: pruned by HyperbandPruner (intermediate score too high)")
         raise
     except Exception as exc:
         eval_loss, score, err_diff, err_F, err_M = float("inf"), float("inf"), float("inf"), float("inf"), float("inf")

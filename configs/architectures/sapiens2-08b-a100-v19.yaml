@@ -1,10 +1,11 @@
-name: sapiens2-01b-3090-v16
+name: sapiens2-08b-a100-v19
 description: |
-  Sapiens2-0.1B v12 — mirror of dinov3-vitb16 v12.
-  See dinov3-vitb16-3090-v12.yaml for rationale.
+  Sapiens2-0.8B (D=1280, ~840M params) — A100 variant of sapiens2-08b-3090-v19.
+  Larger batch / fewer accumulation steps to leverage A100 80GB.
+  v19 HPO same as 3090 variant.
 
 model:
-  model_name: sapiens2_0.1b
+  model_name: sapiens2_0.8b
   output_dim: 1
   head_dropout: 0.1
   projection_size: null
@@ -35,9 +36,9 @@ data:
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 128
-  per_device_eval_batch_size: 256
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 64    # A100 80GB ample, pas besoin de petit batch
+  per_device_eval_batch_size: 128
+  gradient_accumulation_steps: 1    # 1xA100 no DDP, batch=64 effectif
   num_train_epochs: 13   # PINNED v16 (was HPO). Early stopping decides real duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
@@ -53,16 +54,15 @@ training:
   greater_is_better: false
   bf16: true
   fp16: false
-  gradient_checkpointing: false
+  gradient_checkpointing: false  # A100 80GB n'a pas besoin
   augmentation_level: none
   layer_decay: 0.85
-  ema_decay: 0.999
-  # v16.5 Lagrangien refondu (update per-epoch sur val_err_diff clean)
+  # v17 Lagrangien per-epoch sur val_err_diff (signal CLEAN 15k samples).
   loss_lambda_init: 1.0
-  loss_lambda_lr: 50.0
-  loss_lambda_max: 3.0
-  loss_lambda_min: 1
-  loss_lambda_threshold: 0.0005
+  loss_lambda_lr: 0.2            # log-space gain on log(val_err_diff/threshold)
+  loss_lambda_max: 3.0            # marge haute, log() sature naturellement
+  loss_lambda_min: 1.0            # >= poids metrique (toujours pousser fairness)
+  loss_lambda_threshold: 0.0005   # zone equilibre
   adv_lambda: 0.01
   ot_lambda: 0.1
   save_qualitative_k: 10
@@ -77,30 +77,29 @@ optuna:
       type: categorical
       choices:
         - "sapiens_default"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_50000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000"
-        - "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"
+        # Replace placeholder with cluster MLflow run_id of pretrain_ibot_sapiens2_08b_2x3090.sh.
+        - "ibot:runs:/__FILL_SAPIENS_08B_IBOT_RUN_ID__/encoder"
     pooling_type:
       type: categorical
       choices: [attention_k_query, mil, grid]   # v16: cls retiré
 
     # v16: single-axis correction under H_C (see docs/v16_theory.md §1)
-    correction_strength: {type: float, low: 0.0, high: 1.0}
+    correction_strength: {type: float, low: 0.4, high: 1.0}    # v19: data shows fairness wins concentrate in [0.6, 0.9]; 0.4 = comfortable lower margin
 
     feature_fairness:
       type: categorical
-      choices: [ot, dann]
+      choices: [none, ot, dann]
     ot_lambda:
       type: float
-      low: 0.01
-      high: 1.0
+      low: 0.03   # v19: mlflow.db OT trials (n=29) top med 0.11; rare wins outside [0.03, 0.5]
+      high: 0.5
       log: true
       conditional_on:
         feature_fairness: ot
     adv_lambda:
       type: float
-      low: 0.001
-      high: 0.05
+      low: 0.005   # v19: mlflow.db DANN analysis (n=24): TOP-8 geo-mean 0.064, BOT-8 0.014
+      high: 0.20   # → shift right (was [0.001, 0.05])
       log: true
       conditional_on:
         feature_fairness: dann
@@ -118,13 +117,13 @@ optuna:
         feature_fairness: ot
         ot_method: sinkhorn
 
-    loss_focal_gamma: {type: float, low: 0.0, high: 1.5}
+    loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
 
     # LR cap 2e-4 + layer_decay cap 0.9 (v11 trials sweet spot).
     learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
     # num_train_epochs PINNED at 13, early_stopping_patience=3 decides real duration.
-    min_lr_rate:   {type: float, low: 0.1, high: 0.5}
-    weight_decay:  {type: float, low: 0.05, high: 0.50}
+    min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
+    weight_decay:  {type: float, low: 0.08, high: 0.40}   # v19: top cluster [0.10, 0.30] across all sources
     head_dropout:  {type: float, low: 0.0, high: 0.4}
     backbone_drop_path_rate: {type: float, low: 0.0, high: 0.4}
     layer_decay:   {type: float, low: 0.65, high: 0.9}
@@ -132,13 +131,13 @@ optuna:
     pool_attn_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: mlflow.db v10+v11 — ALL top trials use 0.0
       conditional_on:
         pooling_type: attention_k_query
     pool_proj_dropout:
       type: float
       low: 0.0
-      high: 0.3
+      high: 0.15   # v19: same
       conditional_on:
         pooling_type: attention_k_query
 
@@ -157,26 +156,26 @@ optuna:
         pooling_type: attention_k_query
     tau_diffuse_init:
       type: float
-      low: 0.5   # was 1.0; allow transition focal↔diffuse
-      high: 3.0
+      low: 1.0   # v19: mlflow.db top-10 cluster [1.9, 2.9], <1.5 is bot-biased
+      high: 3.5   # slight margin above top cluster
       conditional_on:
         pooling_type: attention_k_query
     n_focal:
       type: int
       low: 1
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_diffuse:
       type: int
       low: 0   # was 1; allow no diffuse queries (pure focal+free config)
-      high: 4
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
     n_free:
       type: int
       low: 0
-      high: 3
+      high: 2
       conditional_on:
         pooling_type: attention_k_query
 
@@ -198,3 +197,29 @@ optuna:
       choices: [3, 4, 5, 6, 7]   # 7 utile pour ViT (14x14)
       conditional_on:
         pooling_type: grid
+    # v19 per-query bottleneck (Linear D -> P shared across queries). None = no bottleneck.
+    pool_proj_out_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: attention_k_query
+
+    # v19 per-cell bottleneck (Linear D -> P shared across cells) — required for big backbones
+    grid_cell_proj_dim:
+      type: categorical
+      choices: ['none', 32, 64, 128]
+      conditional_on:
+        pooling_type: grid
+    # v19 MLP head (recommended with grid since grid pool has no non-linearity)
+    head_type:
+      type: categorical
+      choices: [linear, mlp]
+      conditional_on:
+        pooling_type: grid
+    head_hidden_dim:
+      type: categorical
+      choices: [64, 128, 256]
+      conditional_on:
+        pooling_type: grid
+        head_type: mlp
+

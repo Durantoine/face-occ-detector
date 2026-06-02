@@ -139,7 +139,7 @@ optuna:
     # LR + LLRD ranges informed by v11 trials analysis:
     # - Sweet spot: LR ∈ [1e-4, 2.1e-4] with layer_decay ∈ [0.75, 0.87]
     # - Hence: cap LR at 2e-4 AND layer_decay at 0.9 (was 1.0)
-    learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
+    learning_rate: {type: float, low: 2.0e-05, high: 1.5e-04, log: true}   # v19: v17 data top cluster [1.1e-4, 1.8e-4] → bump high de 1e-4 à 1.5e-4
     # num_train_epochs PINNED at 13 (max), early_stopping_patience=3 decides real duration.
     # LR scheduler shape decoupled via min_lr_rate HPO.
     min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29

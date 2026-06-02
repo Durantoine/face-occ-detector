@@ -36,9 +36,9 @@ data:
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 64    # A100 80GB ample, pas besoin de petit batch
-  per_device_eval_batch_size: 128
-  gradient_accumulation_steps: 1    # 1xA100 no DDP, batch=64 effectif
+  per_device_train_batch_size: 96    # v19: A100 80GB; sapiens 0.8B bf16 batch 96 ≈ 70GB, marge ~10GB
+  per_device_eval_batch_size: 192
+  gradient_accumulation_steps: 1     # 1xA100 no DDP, batch=96 effectif
   num_train_epochs: 13   # PINNED v16 (was HPO). Early stopping decides real duration.
   learning_rate: 5.0e-05
   weight_decay: 0.10
@@ -120,7 +120,7 @@ optuna:
     loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
 
     # LR cap 2e-4 + layer_decay cap 0.9 (v11 trials sweet spot).
-    learning_rate: {type: float, low: 1.0e-05, high: 1.0e-04, log: true}
+    learning_rate: {type: float, low: 2.0e-05, high: 8.0e-05, log: true}   # v19: batch 96 sur A100, 10× plus gros que 0.1B
     # num_train_epochs PINNED at 13, early_stopping_patience=3 decides real duration.
     min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
     weight_decay:  {type: float, low: 0.08, high: 0.40}   # v19: top cluster [0.10, 0.30] across all sources

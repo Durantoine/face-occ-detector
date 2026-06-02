@@ -44,9 +44,9 @@ data:
   test_split_ratio: 0.05
 
 training:
-  per_device_train_batch_size: 64    # A100 80GB
-  per_device_eval_batch_size: 128
-  gradient_accumulation_steps: 1    # 1xA100
+  per_device_train_batch_size: 128   # v19: A100 80GB ample, 167M fp16 ≈ 28GB → batch 128 + 50GB libre
+  per_device_eval_batch_size: 256
+  gradient_accumulation_steps: 1     # 1xA100
   num_train_epochs: 13
   learning_rate: 5.0e-05
   weight_decay: 0.05
@@ -121,7 +121,7 @@ optuna:
 
     loss_focal_gamma: {type: float, low: 0.5, high: 2.0}   # v19: mlflow.db v4 (ρ=-0.50, p=0.006) — higher gamma = better
 
-    learning_rate: {type: float, low: 1.0e-05, high: 5.0e-05, log: true}
+    learning_rate: {type: float, low: 3.0e-05, high: 1.5e-04, log: true}   # v19: batch 64→128 + linear-scaling rule
     min_lr_rate:   {type: float, low: 0.2, high: 0.4}   # v19: mlflow.db top-25% [0.23, 0.47] med 0.29
     weight_decay:  {type: float, low: 0.03, high: 0.40}   # v19: top cluster [0.10, 0.30] (transformers); extended to 0.40 per user spec
     head_dropout:  {type: float, low: 0.1, high: 0.4}

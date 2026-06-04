@@ -1,0 +1,112 @@
+name: convnextv2-base-3090-v19-focused
+description: |
+  Focused sweep around the v19 best trial T5 (run 839845).
+  T5 score = 0.00124 with pool=attention_k_query + ff=dann + carefully tuned
+  attention params. The general v19 sweep found T5 in 9 attention trials
+  (8 pruned, 1 complete) — very rare to land. This config locks pool and ff
+  and tightens every hyperparameter range around T5's values, so all the
+  compute is spent refining the goldilocks neighborhood instead of
+  re-exploring known-bad regions (gap, mil).
+
+  Target: sub-0.00120 on the same test holdout.
+
+model:
+  model_name: convnextv2_base.fcmae_ft_in22k_in1k
+  output_dim: 1
+  head_dropout: 0.07              # T5 = 0.072
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query  # FIXED (T5 winner)
+  n_focal: 1                       # T5 = 1
+  n_diffuse: 2                     # T5 = 2
+  n_free: 0                        # T5 = 0
+  tau_focal_init: 0.07             # T5 = 0.0707
+  tau_diffuse_init: 3.5            # T5 = 3.46
+  tau_free_init: 1.0
+  learnable_tau: true
+  mil_agg: multi
+  mil_hidden: 128
+  mil_k_top: 30
+  pool_attn_dropout: 0.01          # T5 = 0.011
+  pool_proj_dropout: 0.04          # T5 = 0.039
+  backbone_drop_path_rate: 0.10    # T5 = 0.098
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+  test_split_ratio: 0.05
+
+training:
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 12             # T5 = 12
+  learning_rate: 3.4e-05           # T5
+  weight_decay: 0.27               # T5
+  warmup_ratio: 0.14               # T5
+  lr_scheduler_type: cosine_with_min_lr
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.32              # T5
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 25
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: none         # T5
+  layer_decay: 0.69                # T5
+  loss_lambda_init: 1.0
+  loss_lambda_lr: 0.2
+  loss_lambda_max: 3.0
+  loss_lambda_min: 1.0
+  loss_lambda_threshold: 0.0005
+  adv_lambda: 0.03                 # T5 = 0.0298
+  ot_lambda: 0.1
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 60
+  objective_mode: score
+  rotate_val_seed: false
+  keep_top_n: 5                    # keep more (we want all variants near T5)
+  search_space:
+    # pool LOCKED to attention_k_query, ff LOCKED to dann — not in search_space.
+
+    # Tight ranges centred on T5's values (factor ~2 around the optimum):
+    correction_strength: {type: float, low: 0.80, high: 1.00}            # T5 = 0.97
+    adv_lambda:          {type: float, low: 0.010, high: 0.10, log: true} # T5 = 0.030
+    loss_focal_gamma:    {type: float, low: 0.30, high: 1.00}            # T5 = 0.56
+
+    learning_rate:           {type: float, low: 2.0e-05, high: 6.0e-05, log: true}  # T5 = 3.4e-5
+    min_lr_rate:             {type: float, low: 0.25, high: 0.40}                   # T5 = 0.32
+    weight_decay:            {type: float, low: 0.15, high: 0.40}                   # T5 = 0.27
+    head_dropout:            {type: float, low: 0.02, high: 0.15}                   # T5 = 0.072
+    layer_decay:             {type: float, low: 0.60, high: 0.80}                   # T5 = 0.69
+    backbone_drop_path_rate: {type: float, low: 0.05, high: 0.18}                   # T5 = 0.098
+    num_train_epochs:        {type: int,   low: 11, high: 14}                       # T5 = 12
+    warmup_ratio:            {type: float, low: 0.10, high: 0.18}                   # T5 = 0.14
+
+    augmentation_level:
+      type: categorical
+      choices: [none, light]
+
+    # Attention pooling tight ranges (T5 had n_focal=1, n_diffuse=2, n_free=0):
+    pool_attn_dropout:           {type: float, low: 0.0, high: 0.05}                # T5 = 0.011
+    pool_proj_dropout:           {type: float, low: 0.0, high: 0.08}                # T5 = 0.039
+    loss_query_diversity_lambda: {type: float, low: 0.0, high: 0.05}                # T5 = 0.025
+    tau_focal_init:              {type: float, low: 0.04, high: 0.15, log: true}    # T5 = 0.071
+    tau_diffuse_init:            {type: float, low: 2.5, high: 4.0}                 # T5 = 3.46
+    n_focal:                     {type: int, low: 1, high: 2}                       # T5 = 1
+    n_diffuse:                   {type: int, low: 1, high: 3}                       # T5 = 2
+    n_free:                      {type: int, low: 0, high: 1}                       # T5 = 0
+    pool_proj_out_dim:
+      type: categorical
+      choices: [32, 64, 128]                                                         # T5 = 64

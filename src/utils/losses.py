@@ -105,7 +105,12 @@ class WeightedMSELoss(nn.Module):
             w = w * sample_loss_weight.to(w.device).to(w.dtype)
 
         if self.focal_gamma > 0:
-            w = w * (err.detach() + 0.05).pow(self.focal_gamma)
+            # v26 fix: canonical absolute focal loss (was squared-err + 0.05 offset
+            # in v19). Pivot at 10% error gives weight 1.0; larger errors are
+            # amplified, smaller ones attenuated. See Antoine's v26 commit.
+            diff = (preds - targets).abs()
+            focal_weight = (diff.detach() / 0.1).pow(self.focal_gamma)
+            w = w * focal_weight
 
         if gender is None:
             return (w * err).sum() / w.sum().clamp(min=1e-8)

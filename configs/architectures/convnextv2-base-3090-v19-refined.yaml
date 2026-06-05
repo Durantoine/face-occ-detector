@@ -1,0 +1,133 @@
+name: convnextv2-base-3090-v19-refined
+description: |
+  Refined sweep around T5 of run 839845 (v19 broad sweep, 32 trials).
+  T5 = 0.00124 with pool=attention_k_query + ff=dann; the leaderboard
+  hasn't moved since T14, suggesting T5 sits near a local optimum that
+  Optuna struggles to hit (1 complete out of 9 attention trials = 11%).
+
+  Strategy (data-driven, from v4 + v17 + v19 sweeps):
+
+  LOCKED (proven on all 3 sweeps):
+    pool                 = attention_k_query   (best in v19, beats gap/grid/mil)
+    feature_fairness     = dann                (best in v17 + v19)
+    correction_strength  = 1.0                 (T5 saturated at 0.97)
+    num_train_epochs     = 12                  (T5 value, narrow optimal band)
+    warmup_ratio         = 0.14                (T5 value, low sensitivity)
+
+  TIGHT (T5 ± ~30%) — the regularisation knobs are well-behaved:
+    learning_rate, layer_decay, weight_decay, head_dropout,
+    backbone_drop_path_rate
+
+  WIDER on attention-pool internals — T5 was 1 lucky hit on a narrow valley,
+  so widen n_focal/n_diffuse/n_free/tau ranges so Optuna can find OTHER
+  attention configs that might work, not just neighbours of T5:
+    n_focal: 1..3 (T5 had 1)
+    n_diffuse: 1..4 (T5 had 2)
+    n_free: 0..2 (T5 had 0)
+    tau_focal_init: 0.03..0.20 log (T5 had 0.071 — keep sharp regime)
+    tau_diffuse_init: 2.0..5.0 (T5 had 3.46 — explore extreme highs)
+    pool_proj_out_dim: {32, 64, 128, 256} (T5 had 64)
+
+  Result: 16-dim search vs 21-dim previous focused. Same 60-trial budget,
+  but every trial samples something we genuinely want to know about.
+
+model:
+  model_name: convnextv2_base.fcmae_ft_in22k_in1k
+  output_dim: 1
+  head_dropout: 0.07
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: attention_k_query   # LOCKED — T5 winner
+  n_focal: 1
+  n_diffuse: 2
+  n_free: 0
+  tau_focal_init: 0.07
+  tau_diffuse_init: 3.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  mil_agg: multi
+  mil_hidden: 128
+  mil_k_top: 30
+  pool_attn_dropout: 0.01
+  pool_proj_dropout: 0.04
+  backbone_drop_path_rate: 0.10
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  val_split_ratio: 0.15
+  test_split_ratio: 0.05
+
+training:
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 12              # LOCKED
+  learning_rate: 3.4e-05
+  weight_decay: 0.27
+  warmup_ratio: 0.14                # LOCKED
+  lr_scheduler_type: cosine_with_min_lr
+  lr_scheduler_kwargs:
+    min_lr_rate: 0.32
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 25
+  metric_for_best_model: eval_challenge_score
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: light
+  layer_decay: 0.69
+  correction_strength: 1.0          # LOCKED — T5 saturated
+  feature_fairness: dann            # LOCKED
+  loss_lambda_init: 1.0
+  loss_lambda_lr: 0.2
+  loss_lambda_max: 3.0
+  loss_lambda_min: 1.0
+  loss_lambda_threshold: 0.0005
+  adv_lambda: 0.03
+  ot_lambda: 0.1
+  save_qualitative_k: 10
+
+optuna:
+  n_trials: 60
+  objective_mode: score
+  rotate_val_seed: false
+  keep_top_n: 5
+  search_space:
+    # === TIGHT ranges around T5 (T5 ± ~30%) ===
+    # Regularisation knobs that behaved well — refine the optimum.
+    learning_rate:           {type: float, low: 2.5e-05, high: 4.5e-05, log: true}
+    layer_decay:             {type: float, low: 0.65, high: 0.75}
+    weight_decay:            {type: float, low: 0.20, high: 0.35}
+    head_dropout:            {type: float, low: 0.04, high: 0.12}
+    backbone_drop_path_rate: {type: float, low: 0.05, high: 0.15}
+
+    # === MODERATE ranges (T5 value as centre) ===
+    adv_lambda:              {type: float, low: 0.015, high: 0.060, log: true}
+    loss_focal_gamma:        {type: float, low: 0.3, high: 0.9}
+
+    # === WIDER on attention-pool internals — T5 was one lucky hit ===
+    # Widen so Optuna can discover OTHER attention configurations that
+    # work, not just T5's immediate neighbourhood.
+    n_focal:                     {type: int, low: 1, high: 3}
+    n_diffuse:                   {type: int, low: 1, high: 4}
+    n_free:                      {type: int, low: 0, high: 2}
+    tau_focal_init:              {type: float, low: 0.03, high: 0.20, log: true}
+    tau_diffuse_init:            {type: float, low: 2.0, high: 5.0}
+    pool_attn_dropout:           {type: float, low: 0.0, high: 0.05}
+    pool_proj_dropout:           {type: float, low: 0.0, high: 0.08}
+    loss_query_diversity_lambda: {type: float, low: 0.0, high: 0.05}
+    pool_proj_out_dim:
+      type: categorical
+      choices: [32, 64, 128, 256]
+
+    augmentation_level:
+      type: categorical
+      choices: [none, light]

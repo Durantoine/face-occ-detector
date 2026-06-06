@@ -1,0 +1,36 @@
+# ── Run 2 — CoT + signal dropout ──────────────────────────────────────────────
+# uv run python src/qwen_finetune.py config/qwen_finetune.yaml
+
+data:
+  n_train: 2000          # 0 = tout le dataset
+  n_val:   200
+  seed:    42
+
+model:
+  qwen_repo:    "Qwen/Qwen2.5-VL-7B-Instruct"
+  lora_r:       32        # run 1 = 16
+  lora_alpha:   64        # recommandé : 2 × lora_r
+  lora_dropout: 0.05
+
+signals:
+  blur_threshold  : 80    
+  hair_threshold  : 0.15  
+  pose_threshold  : 0.10  
+  sam2_conf_min   : 0.70 
+
+training:
+  epochs:         3
+  batch_size:     1
+  grad_accum:     8       # batch effectif = 8
+  lr:             5.0e-5  # run 1 = 2e-4
+  max_length:     700     # CoT génère ~300 tokens
+  cot:            true
+  signal_dropout: 0.30    # masquage aléatoire par signal
+  output_dir:              "outputs/checkpoints"   # checkpoints intermédiaires
+  lora_save_path:          "outputs/lora_adapters"  # adapteurs finaux (séparé)
+  resume_from_checkpoint:  "outputs/checkpoints/checkpoint-498"
+
+eval:
+  eval_gen_batch:          1
+  early_stopping_patience: 2   # 0 = désactivé
+  no_challenge_eval:       false

@@ -1,0 +1,21 @@
+# ── Inférence post-fine-tuning ────────────────────────────────────────────────
+# uv run python src/qwen_inference.py config/qwen_inference.yaml
+
+model:
+  lora_path:    "outputs/lora_adapters"
+  no_segformer: false   # true = hair_pct=n/a, économise 400MB VRAM
+
+inference:
+  cot:            true
+  max_new_tokens: 128   # le JSON CoT tient en ~100 tokens
+
+data:
+  test_csv:    "data/test_students.csv"
+  gt_col:      ""                  # laisser vide pour le vrai test set (pas de GT)
+  gender_col:  "gender"
+  image_base:  "/home/matt/Programmation/704_IADATA_ML_avance/datachallenge/DataChallenge2026/occlusion_datasets/raw/Crop_224_5fp_100K"
+  signals_csv: "data/signals_precomputed.csv"
+  output:      "results/predictions_lora.csv"
+  failures_log: "results/parse_failures_lora.csv"
+  n:    0    # 0 = tout le test set
+  seed: 42

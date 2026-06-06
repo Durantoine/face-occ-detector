@@ -253,16 +253,30 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f) or {}
 
 def main() -> None:
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config/qwen_inference.yaml"
-    print(f"Config : {config_path}")
-    cfg = load_config(config_path)
-    lora_path    = str(_get(cfg, "model", "lora_path",          default="outputs/lora_adapters"))
-    no_segformer = bool(_get(cfg, "model", "no_segformer",      default=False))
-    cot          = bool(_get(cfg, "inference", "cot",           default=False))
-    max_new_tokens_cfg = _get(cfg, "inference", "max_new_tokens", default=None)
-    test_csv     = Path(str(_get(cfg, "data", "test_csv",      default="data/test_students.csv")))
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("config", nargs="?", default="config/qwen_inference.yaml")
+    ap.add_argument("--chunk-id",  type=int, default=None)
+    ap.add_argument("--n-chunks",  type=int, default=None)
+    cli, _ = ap.parse_known_args()
+
+    print(f"Config : {cli.config}")
+    cfg = load_config(cli.config)
+
+    # ── Paramètres modèle / inférence ────────────────────────────────────────
+    lora_path    = str(_get(cfg, "model", "lora_path",             default="outputs/lora_adapters"))
+    no_segformer = bool(_get(cfg, "model", "no_segformer",         default=False))
+    cot          = bool(_get(cfg, "inference", "cot",              default=False))
+    max_new_tokens_cfg = _get(cfg, "inference", "max_new_tokens",  default=None)
+
+    # CLI écrase YAML pour chunk_id / n_chunks
+    chunk_id = cli.chunk_id if cli.chunk_id is not None else int(_get(cfg, "inference", "chunk_id", default=0))
+    n_chunks = cli.n_chunks if cli.n_chunks is not None else int(_get(cfg, "inference", "n_chunks", default=1))
+
+    # ── Paramètres données ────────────────────────────────────────────────────
     gt_col       = str(_get(cfg, "data", "gt_col",             default=""))
     gender_col   = str(_get(cfg, "data", "gender_col",         default="gender"))
+    test_csv     = Path(str(_get(cfg, "data", "test_csv",      default="data/test_students.csv")))
     image_base   = Path(str(_get(cfg, "data", "image_base",    default=str(IMAGE_BASE))))
     signals_csv  = Path(str(_get(cfg, "data", "signals_csv",   default=str(SIGNALS_CSV))))
     output       = Path(str(_get(cfg, "data", "output",        default="results/predictions_lora.csv")))
@@ -270,21 +284,30 @@ def main() -> None:
     n_limit      = int(_get(cfg, "data", "n",    default=0))
     seed         = int(_get(cfg, "data", "seed", default=42))
 
+    # Chemins chunk-spécifiques si n_chunks > 1
+    if n_chunks > 1:
+        output      = output.with_name(output.stem + f"_chunk{chunk_id}" + output.suffix)
+        failures_log = failures_log.with_name(failures_log.stem + f"_chunk{chunk_id}" + failures_log.suffix)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if max_new_tokens_cfg is not None:
-        max_new_tokens = int(max_new_tokens_cfg)
-    else:
-        max_new_tokens = 256 if cot else 64
+    max_new_tokens = int(max_new_tokens_cfg) if max_new_tokens_cfg is not None else (256 if cot else 64)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    # ── Chargement CSV + découpage chunk ─────────────────────────────────────
     print(f"Loading {test_csv} ...")
     df = pd.read_csv(test_csv)
-    has_gt     = bool(gt_col) and gt_col in df.columns
-    has_gender = gender_col in df.columns
     if n_limit > 0:
         df = df.sample(n=min(n_limit, len(df)), random_state=seed).reset_index(drop=True)
+
+    if n_chunks > 1:
+        # Round-robin : chaque chunk couvre tous les bins d'occlusion uniformément
+        df = df.iloc[chunk_id::n_chunks].reset_index(drop=True)
+        print(f"  Chunk {chunk_id}/{n_chunks} : {len(df)} images → {output}")
+
+    has_gt     = bool(gt_col) and gt_col in df.columns
+    has_gender = gender_col in df.columns
     print(f"  {len(df)} images  |  GT={has_gt}  |  CoT={cot}  |  max_new_tokens={max_new_tokens}")
 
     done_files: set = set()

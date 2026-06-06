@@ -98,7 +98,7 @@ def compute_signals_live(
         "orientation": orient,
     }
 
-def load_finetuned_model(lora_path: str, device: str = "auto"):
+def load_finetuned_model(lora_path: str, device: str = "auto", lora_dtype: str = "bfloat16"):
     from peft import PeftModel
     from transformers import AutoProcessor, BitsAndBytesConfig
 
@@ -107,10 +107,12 @@ def load_finetuned_model(lora_path: str, device: str = "auto"):
     except ImportError:
         from transformers import Qwen2VLForConditionalGeneration as QwenCls  # type: ignore
 
+    dtype = getattr(torch, lora_dtype)
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=dtype,
         bnb_4bit_use_double_quant=True,
     )
 
@@ -122,13 +124,13 @@ def load_finetuned_model(lora_path: str, device: str = "auto"):
             cfg = json.load(f)
         base_repo = cfg.get("base_model_name_or_path", base_repo)
 
-    print(f"Loading base model {base_repo} in 4-bit …")
+    print(f"Loading base model {base_repo} in 4-bit ({lora_dtype}) …")
     base = QwenCls.from_pretrained(
         base_repo,
         quantization_config=bnb_config,
         device_map=device,
         attn_implementation="eager",
-        torch_dtype=torch.bfloat16,
+        torch_dtype=dtype,
     )
 
     print(f"Applying LoRA adapters from {lora_path} …")
@@ -266,6 +268,7 @@ def main() -> None:
     # ── Paramètres modèle / inférence ────────────────────────────────────────
     lora_path    = str(_get(cfg, "model", "lora_path",             default="outputs/lora_adapters"))
     no_segformer = bool(_get(cfg, "model", "no_segformer",         default=False))
+    torch_dtype  = str(_get(cfg, "model", "torch_dtype",           default="bfloat16"))
     cot          = bool(_get(cfg, "inference", "cot",              default=False))
     max_new_tokens_cfg = _get(cfg, "inference", "max_new_tokens",  default=None)
 
@@ -347,7 +350,7 @@ def main() -> None:
         print("Segformer ready.")
 
     print(f"\nLoading fine-tuned model from {lora_path} ...")
-    model, processor = load_finetuned_model(lora_path)
+    model, processor = load_finetuned_model(lora_path, lora_dtype=torch_dtype)
 
     try:
         import pynvml

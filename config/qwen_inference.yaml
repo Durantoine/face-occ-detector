@@ -4,10 +4,13 @@
 model:
   lora_path:    "outputs/lora_adapters"
   no_segformer: false   # true = hair_pct=n/a, économise 400MB VRAM
+  torch_dtype:  float16  # P100 ne supporte pas bfloat16
 
 inference:
-  cot:            true
-  max_new_tokens: 128   # le JSON CoT tient en ~100 tokens
+  chunk_id    : 0     
+  n_chunks    : 1     
+  cot         : true
+  max_new_tokens : 128
 
 data:
   test_csv:    "data/test_students.csv"

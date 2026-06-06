@@ -2,6 +2,7 @@
 #SBATCH --job-name=qwen_inf_%a
 #SBATCH --output=logs/inference_%a_%j.log
 #SBATCH --error=logs/inference_%a_%j.err
+#SBATCH --partition=P100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -372,11 +373,23 @@ def main() -> None:
         TimeRemainingColumn(),
     )
 
-    DEBUG_N = 3  
+    DEBUG_N = 3
+    total   = len(df)
+    t_start = time.time()
 
     with progress:
-        task = progress.add_task("Inference LoRA", total=len(df))
+        task = progress.add_task("Inference LoRA", total=total)
         for idx, row in enumerate(df.itertuples(index=False)):
+            if idx % 100 == 0 and idx > 0:
+                elapsed = time.time() - t_start
+                eta = elapsed / idx * (total - idx)
+                print(
+                    f"[{idx}/{total}] "
+                    f"elapsed={elapsed/3600:.1f}h "
+                    f"ETA={eta/3600:.1f}h "
+                    f"chunk={chunk_id}",
+                    flush=True,
+                )
             img_path = image_base / row.filename
             try:
                 img = Image.open(img_path).convert("RGB")

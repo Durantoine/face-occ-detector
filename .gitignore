@@ -63,6 +63,11 @@ data/folds/
 data/*.csv
 !data/pretrain/.gitkeep
 !data/extra/.gitkeep
+# synthetic occluder dataset: keep the README (instructions), ignore the heavy
+# regenerable outputs (images + per-run CSV).
+data/synthetic/**/images/
+data/synthetic/**/synthetic.csv
+!data/synthetic/README.md
 
 # Optuna trial configs (generated)
 configs/architectures/optuna_trials/

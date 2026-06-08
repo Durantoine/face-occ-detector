@@ -1,3 +1,5 @@
+import io
+import random
 from typing import Callable
 
 from PIL import Image
@@ -5,6 +7,64 @@ from PIL import Image
 
 def _identity(img: Image.Image) -> Image.Image:
     return img
+
+
+# ---------------------------------------------------------------------------
+# Custom label-preserving (Option A) degradations not covered by torchvision.
+# Each is PIL->PIL, applies its own randomness, and NEVER changes the visible
+# face geometry — so the FaceOcclusion label of the source image is unchanged.
+# They mimic the low-quality / heavily-compressed faces seen in the test set.
+# ---------------------------------------------------------------------------
+
+class RandomPixelate:
+    """Downscale then nearest-upscale to simulate pixelated / very low-res faces."""
+
+    def __init__(self, p: float = 0.12, min_scale: float = 0.12, max_scale: float = 0.5):
+        self.p, self.min_scale, self.max_scale = p, min_scale, max_scale
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        w, h = img.size
+        f = random.uniform(self.min_scale, self.max_scale)
+        small = img.resize((max(1, int(w * f)), max(1, int(h * f))), Image.BILINEAR)
+        return small.resize((w, h), Image.NEAREST)
+
+
+class RandomJPEG:
+    """Re-encode as JPEG at a random low quality to inject compression artefacts."""
+
+    def __init__(self, p: float = 0.20, min_quality: int = 18, max_quality: int = 70):
+        self.p, self.min_quality, self.max_quality = p, min_quality, max_quality
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        q = random.randint(self.min_quality, self.max_quality)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=q)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+
+class RandomColorCast:
+    """Multiply RGB channels by independent random gains — a mild colour filter.
+
+    Kept gentle (gains near 1.0) so it does not destroy the skin-tone cues the
+    gender head relies on; geometry and occluded area are untouched.
+    """
+
+    def __init__(self, p: float = 0.15, strength: float = 0.18):
+        self.p, self.strength = p, strength
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        if random.random() > self.p:
+            return img
+        s = self.strength
+        gains = [1.0 + random.uniform(-s, s) for _ in range(3)]
+        rgb = img.convert("RGB").split()
+        rgb = [c.point(lambda v, g=g: max(0, min(255, int(v * g)))) for c, g in zip(rgb, gains)]
+        return Image.merge("RGB", rgb)
 
 
 def build_train_transform(level: str = "light") -> Callable[[Image.Image], Image.Image]:
@@ -18,8 +78,11 @@ def build_train_transform(level: str = "light") -> Callable[[Image.Image], Image
       - "tier1_safe"   : enriched safe-only ops (NEW). Every op preserves the
                          FaceOcclusion label because it never adds/removes
                          occlusion, never crops the face, never erases pixels.
-                         Designed for the augmentation experiment alongside
-                         the synthetic-occluder dataset (Tier 2).
+                         Includes photometric jitter + degradations that mimic
+                         low-quality test faces (colour cast, JPEG, pixelation,
+                         blur, posterize). Designed for the augmentation
+                         experiment alongside the synthetic-occluder dataset
+                         (Tier 2 = the inpaint/paste occluders).
     """
     if level == "none":
         return _identity
@@ -69,6 +132,13 @@ def build_train_transform(level: str = "light") -> Callable[[Image.Image], Image
         # Posterize (colour quantisation) at low probability — robust to
         # heavy JPEG / low-bit-depth artefacts seen in some test images.
         ops.append(T.RandomPosterize(bits=4, p=0.10))
+
+        # === Degradations matching low-quality test faces (label-preserving) ===
+        # Pixelation (low-res), JPEG compression artefacts, and a mild colour
+        # cast. All keep the face geometry → the FaceOcclusion label is unchanged.
+        ops.append(RandomColorCast(p=0.15, strength=0.18))
+        ops.append(RandomJPEG(p=0.20, min_quality=18, max_quality=70))
+        ops.append(RandomPixelate(p=0.12, min_scale=0.12, max_scale=0.5))
 
         # === No rotation, no crop, no erasing in tier1_safe ===
         # Rationale: rotation can push face pixels out of the 224x224 frame,

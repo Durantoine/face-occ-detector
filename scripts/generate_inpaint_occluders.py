@@ -282,10 +282,12 @@ def build_pipeline(model: str, device: str, dtype):
         pipe = StableDiffusionInpaintPipeline.from_pretrained(model, torch_dtype=dtype, safety_checker=None)
     pipe = pipe.to(device)
     pipe.set_progress_bar_config(disable=True)
-    try:
-        pipe.enable_attention_slicing()
-    except Exception:
-        pass
+    # Memory savings so SDXL@1024 fits a 24GB 3090 (no a100 on this cluster).
+    for fn in ("enable_attention_slicing", "enable_vae_slicing", "enable_vae_tiling"):
+        try:
+            getattr(pipe, fn)()
+        except Exception:
+            pass
     return pipe
 
 

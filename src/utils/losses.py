@@ -65,12 +65,16 @@ class WeightedMSELoss(nn.Module):
         importance_bin_width: float = 0.025,
         gender_class_weights: np.ndarray | None = None,
         cell_class_weights: np.ndarray | None = None,
+        joint_weight_fn=None,
     ) -> None:
         super().__init__()
         self.weight_offset = weight_offset
         self.focal_gamma = focal_gamma
         self.fairness_lambda = fairness_lambda
         self.importance_bin_width = importance_bin_width
+        # Continuous (KDE) per-sample reweighting (continuous cell_joint). When set, it
+        # REPLACES the binned importance_pmf_ratio + gender/cell class weights.
+        self.joint_weight_fn = joint_weight_fn
         if importance_pmf_ratio is not None:
             self.register_buffer(
                 "importance_pmf_ratio",
@@ -105,18 +109,25 @@ class WeightedMSELoss(nn.Module):
         err = (preds - targets) ** 2
         w = self.weight_offset + targets
 
-        if self.importance_pmf_ratio is not None:
-            w = w * importance_weight_of(targets, self.importance_pmf_ratio, self.importance_bin_width)
+        if self.joint_weight_fn is not None:
+            # Continuous cell_joint: one per-sample weight from KDE densities (replaces the
+            # binned importance ratio + gender/cell weights). No grad flows through it.
+            g_np = gender.detach().cpu().numpy() if gender is not None else None
+            wj = self.joint_weight_fn(targets.detach().cpu().numpy(), g_np)
+            w = w * torch.as_tensor(wj, dtype=w.dtype, device=w.device)
+        else:
+            if self.importance_pmf_ratio is not None:
+                w = w * importance_weight_of(targets, self.importance_pmf_ratio, self.importance_bin_width)
 
-        if self.gender_class_weights is not None and gender is not None:
-            g_idx = (gender >= 0.5).long()
-            w = w * self.gender_class_weights[g_idx]
+            if self.gender_class_weights is not None and gender is not None:
+                g_idx = (gender >= 0.5).long()
+                w = w * self.gender_class_weights[g_idx]
 
-        if self.cell_class_weights is not None and gender is not None:
-            n_bins = self.cell_class_weights.shape[1]
-            b_idx = torch.clamp((targets / self.importance_bin_width).long(), 0, n_bins - 1)
-            g_idx = (gender >= 0.5).long()
-            w = w * self.cell_class_weights[g_idx, b_idx]
+            if self.cell_class_weights is not None and gender is not None:
+                n_bins = self.cell_class_weights.shape[1]
+                b_idx = torch.clamp((targets / self.importance_bin_width).long(), 0, n_bins - 1)
+                g_idx = (gender >= 0.5).long()
+                w = w * self.cell_class_weights[g_idx, b_idx]
 
         if self.focal_gamma > 0:
             w = w * (1.0 + err.detach().pow(self.focal_gamma))

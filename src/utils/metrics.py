@@ -25,13 +25,17 @@ def compute_score(
     gender: np.ndarray,
     importance_pmf_ratio: Optional[np.ndarray] = None,
     bin_width: float = 0.025,
+    weight_fn: Optional[Any] = None,
 ) -> Dict[str, float]:
     pred = np.asarray(pred).astype(np.float64).flatten()
     gt = np.asarray(gt).astype(np.float64).flatten()
     gender = np.asarray(gender).astype(np.float64).flatten()
 
     w_imp = None
-    if importance_pmf_ratio is not None:
+    if weight_fn is not None:
+        # Continuous KDE importance weight (per-sample); replaces the binned ratio lookup.
+        w_imp = np.asarray(weight_fn(gt, gender), dtype=np.float64).flatten()
+    elif importance_pmf_ratio is not None:
         ratio = np.asarray(importance_pmf_ratio).astype(np.float64).flatten()
         idx = np.clip((gt / bin_width).astype(int), 0, len(ratio) - 1)
         w_imp = ratio[idx]
@@ -99,7 +103,8 @@ def _r2_weighted(pred: np.ndarray, gt: np.ndarray, weights: Optional[np.ndarray]
     return 1.0 - ss_res / ss_tot
 
 
-def make_compute_metrics(importance_pmf_ratio: Optional[np.ndarray] = None, bin_width: float = 0.025):
+def make_compute_metrics(importance_pmf_ratio: Optional[np.ndarray] = None, bin_width: float = 0.025,
+                         weight_fn: Optional[Any] = None):
     def compute_metrics(p: Any, compute_result: bool = True, **kwargs: Any) -> Dict[str, float]:
         preds_raw = p.predictions
         if isinstance(preds_raw, (tuple, list)):
@@ -114,7 +119,8 @@ def make_compute_metrics(importance_pmf_ratio: Optional[np.ndarray] = None, bin_
             gt = labels.flatten()
             gender = np.zeros_like(gt)
 
-        return compute_score(preds, gt, gender, importance_pmf_ratio=importance_pmf_ratio, bin_width=bin_width)
+        return compute_score(preds, gt, gender, importance_pmf_ratio=importance_pmf_ratio,
+                             bin_width=bin_width, weight_fn=weight_fn)
 
     return compute_metrics
 

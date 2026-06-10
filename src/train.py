@@ -84,6 +84,7 @@ class WeightedMSETrainer(Trainer):
         importance_pmf_ratio: Optional[Any] = None,
         gender_class_weights: Optional[Any] = None,
         cell_class_weights: Optional[Any] = None,
+        joint_weight_fn: Optional[Any] = None,
         query_diversity_lambda: float = 0.0,
         adv_lambda: float = 0.0,
         mmd_lambda: float = 0.0,
@@ -112,8 +113,11 @@ class WeightedMSETrainer(Trainer):
                 importance_pmf_ratio=importance_pmf_ratio,
                 gender_class_weights=gender_class_weights,
                 cell_class_weights=cell_class_weights,
+                joint_weight_fn=joint_weight_fn,
             )
             tags = []
+            if joint_weight_fn is not None:
+                tags.append("continuous_joint=on (KDE P_test/(P_train+lam))")
             if importance_pmf_ratio is not None:
                 tags.append(f"importance_reweight=on (mean={float(importance_pmf_ratio.mean()):.2f})")
             if gender_class_weights is not None:
@@ -496,6 +500,34 @@ def train(
         data_cfg, data_csv, val_data_csv, val_seed or seed,
         val_split_strategy=val_split_strategy,
     )
+
+    # === Pre-rendered augmentation pool appended to TRAIN only (data/aug) ===
+    # aug_csv columns: filename, FaceOcclusion, gender [, source_filename]; images matched by
+    # basename in aug_image_dir. Rows whose source_filename is a val frame are dropped (no leak).
+    aug_csv = data_cfg.get("aug_csv", "")
+    if aug_csv:
+        from pathlib import Path as _Path
+        img_c = data_cfg.get("image_col", DEFAULT_IMAGE_COL)
+        lab_c = data_cfg.get("label_col", DEFAULT_LABEL_COL)
+        gen_c = data_cfg.get("gender_col", "gender")
+        aug_root = _Path(data_cfg.get("aug_image_dir", "data/aug")).resolve()
+        apaths = [p.strip() for p in str(aug_csv).split(",") if p.strip() and _Path(p.strip()).exists()]
+        if apaths:
+            aug = pd.concat([pd.read_csv(p) for p in apaths], ignore_index=True)
+            n0 = len(aug)
+            if "source_filename" in aug.columns:
+                aug = aug[~aug["source_filename"].isin(set(val_data["image_path"]))].copy()
+            rows = pd.DataFrame({
+                "image_path": aug[img_c].map(lambda f: str(aug_root / _Path(str(f)).name)),
+                "FaceOcclusion": aug[lab_c].astype(np.float32),
+                "gender": aug[gen_c].astype(np.float32),
+            })
+            train_data = pd.concat([train_data, rows], ignore_index=True)
+            print(f"[aug] +{len(rows)}/{n0} augmented imgs -> TRAIN only "
+                  f"({len(apaths)} csv, dropped {n0 - len(rows)} val-leak) | aug_dir={aug_root}")
+        else:
+            print(f"[aug] aug_csv set but no existing path found ({aug_csv}) -> skipped")
+
     train_dataset, val_dataset = _build_datasets(
         train_data, val_data, processor, image_base_dir, augmentation_level,
     )
@@ -567,6 +599,25 @@ def train(
             "loss_cell_weights_M_bin0": float(cell_class_weights[1, 0]),
         })
         print(f"Cell reweight (2×20, 1/sqrt(count) normalized): max={cell_class_weights.max():.3f}, min={cell_class_weights.min():.3f}")
+
+    # === Continuous cell_joint (v36 weighting on continuous KDE densities) ===
+    # One regularized importance weight w(y,g)=P_test/(P_train+lam) shared by loss AND eval.
+    # Replaces the binned importance ratio + gender/cell class weights (no tail-clamp artefact).
+    joint_weight_fn = None
+    if train_cfg.get("loss_rw_strategy", "") == "continuous_joint" and loss_type == "weighted_mse" \
+            and "gender" in train_data.columns:
+        from src.utils.continuous_weight import get_joint_weight_fn
+        is_lambda = float(train_cfg.get("is_lambda", 0.10))
+        yv = train_data[label_col].astype(float).values
+        gv = (train_data["gender"].astype(float).values >= 0.5).astype(float)
+        joint_weight_fn = get_joint_weight_fn(yv, gv, target="joint", lam=is_lambda)
+        # the continuous joint weight subsumes the binned reweighting paths
+        importance_pmf_ratio = None
+        gender_class_weights = None
+        cell_class_weights = None
+        compute_metrics = make_compute_metrics(weight_fn=joint_weight_fn)  # eval also continuous
+        ml_log_params(client, run_id, {"loss_rw_strategy": "continuous_joint", "is_lambda": is_lambda})
+        print(f"loss_rw_strategy=continuous_joint: KDE P_test/(P_train+{is_lambda}) joint weight (loss+eval)")
 
     n_train_f = int((train_data["gender"] < 0.5).sum())
     n_train_m = int((train_data["gender"] >= 0.5).sum())
@@ -699,6 +750,7 @@ def train(
         importance_pmf_ratio=importance_pmf_ratio,
         gender_class_weights=gender_class_weights,
         cell_class_weights=cell_class_weights,
+        joint_weight_fn=joint_weight_fn,
         query_diversity_lambda=train_cfg.get("loss_query_diversity_lambda", 0.0),
         adv_lambda=float(train_cfg.get("adv_lambda", 0.0)) if train_cfg.get("loss_adv_debiasing", False) else 0.0,
         mmd_lambda=float(train_cfg.get("mmd_lambda", 0.0)) if train_cfg.get("loss_mmd_alignment", False) else 0.0,

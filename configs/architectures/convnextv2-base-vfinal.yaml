@@ -1,0 +1,79 @@
+name: convnextv2-base-vfinal
+description: |
+  ConvNeXt v2 Base (88M) — FINAL. Reproduces the winning v4 trial-18 recipe
+  (pooling cls, gender batch sampler, light aug, lr 3.1e-5) but replaces the
+  BINNED fairness reweighting (cell_joint) with the CONTINUOUS v36 weighting:
+  a single KDE-based importance ratio w(y,g) = P_test/(P_train+is_lambda),
+  per-gender ("joint"), shared by the loss AND the eval metric — no tail-clamp
+  binning artefact. Pre-rendered occluder augmentations are appended to TRAIN
+  only (data/aug). Fairness mechanic = gender batch sampler + continuous cell_joint.
+
+model:
+  model_name: convnext_v2_base
+  output_dim: 1
+  head_dropout: 0.027558297601961837
+  projection_size: null
+  output_activation: sigmoid
+  pooling_type: cls
+  n_focal: 2
+  n_diffuse: 2
+  n_free: 2
+  tau_focal_init: 0.1
+  tau_diffuse_init: 1.5
+  tau_free_init: 1.0
+  learnable_tau: true
+  num_heads: 4
+  gem_p_init: 3.0
+  pool_attn_dropout: 0.0
+  pool_proj_dropout: 0.0
+  backbone_drop_path_rate: 0.10188128512884109
+  pretrained: true
+  init_backbone_from: null
+
+data:
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  image_base_dir: data/raw
+  data_csv: data/raw/train.csv
+  extra_train_csv: null
+  # Pre-rendered occluder augmentations appended to TRAIN only (basename-matched in aug_image_dir).
+  aug_csv: data/aug/synthetic.csv
+  aug_image_dir: data/aug
+
+training:
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 64
+  gradient_accumulation_steps: 1
+  num_train_epochs: 14
+  learning_rate: 3.109423695529096e-05
+  weight_decay: 0.12055623555621861
+  warmup_ratio: 0.11779918018416258
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+  early_stopping_patience: 3
+  seed: 42
+  logging_steps: 50
+  metric_for_best_model: eval_challenge_score_test_estimated   # now the continuous-reweighted score
+  val_split_strategy: stratified_yg
+  greater_is_better: false
+  bf16: true
+  fp16: false
+  gradient_checkpointing: false
+  augmentation_level: light
+
+  loss_type: weighted_mse
+  loss_focal_gamma: 0.0
+  loss_fairness_lambda: 0.6029051685839941
+
+  # === Fairness mechanic (same as v4, but continuous) ===
+  sampler_strategy: gender          # gender-balanced batch sampler (data-level)
+  loss_rw_strategy: continuous_joint  # continuous cell_joint: KDE w(y,g)=P_test/(P_train+is_lambda), loss+eval
+  is_lambda: 0.10                   # regularization floor on P_train (tames the high-variance tail ratio)
+  eval_importance_reweight: true    # (eval uses the continuous weight_fn when continuous_joint is active)
+
+  ema_decay: 0.9998
+  ema_warmup_steps: 200
+  group_dro_alpha: 0.5
+  layer_decay: 0.6922425226752993
+  save_qualitative_k: 10

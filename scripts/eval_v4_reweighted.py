@@ -12,11 +12,11 @@ support (and its noise) is visible.
 This reuses the v4 framework code (branch cora/convnext-baseline lineage), so the
 model is rebuilt/loaded exactly as trained.
 
-RUN (on a GPU box; full 20k val) — uses the EXACT P_test/P_train ratio to the
-end of the tail (no clamp), unlike v4 which clamped the tail ratio to ~0.067:
+RUN (on a GPU box; full 20k val):
     python scripts/eval_v4_reweighted.py \
-        --weights v4_best_trial18_model.pth \
-        --data-csv data/raw/train.csv --image-dir data/raw
+        --model-uri mlruns/1/models/m-8914eed6b51740e4ad43667735756f13/artifacts \
+        --data-csv data/raw/train.csv --image-dir data/raw \
+        --tail-floor 0.5
 
 Needs on the machine: this repo (branch cora/v4-best-eval), the mlruns model dir
 above, data/raw/train.csv, and the val images under data/raw/. CPU works but is
@@ -38,7 +38,6 @@ import torch
 
 from src.predict import load_model
 from src.data.dataset import load_csv_data, _open_rgb
-from src.models.dinov3_loader import get_image_processor
 
 # Assumed test PMF over 25 occlusion bins of width 0.02 (same H_C used in training).
 N_BINS, BIN_WIDTH = 25, 0.02
@@ -88,11 +87,8 @@ def infer(model, processor, df, image_dir, device, batch_size):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--model-uri", default=None,
+    ap.add_argument("--model-uri", required=True,
                     help="mlflow logged-model dir (e.g. mlruns/1/models/m-8914.../artifacts) or runs:/<id>/model")
-    ap.add_argument("--weights", default=None,
-                    help="ALT to --model-uri: a bare .pth (pickled FaceOccRegressor) loaded via torch.load. "
-                         "Location is free; just point at the file. Needs this branch's code on PYTHONPATH.")
     ap.add_argument("--tracking-uri", default="sqlite:///mlflow.db")
     ap.add_argument("--data-csv", default="data/raw/train.csv")
     ap.add_argument("--image-dir", default="data/raw")
@@ -100,10 +96,8 @@ def main() -> None:
                     help="trial 18 rotated val seed = 42 + 18*13 = 276 (reproduces the exact val).")
     ap.add_argument("--split-ratio", type=float, default=0.2)
     ap.add_argument("--n-buckets", type=int, default=10)
-    ap.add_argument("--tail-floor", type=float, default=0.0,
-                    help="DEFAULT 0 = EXACT P_test/P_train ratio kept to the end of the tail (no clamp). "
-                         ">0 imposes an arbitrary floor — for sensitivity checks only, NOT recommended "
-                         "(over-weights the tail beyond the assumed test distribution).")
+    ap.add_argument("--tail-floor", type=float, default=0.5,
+                    help="Floor on the per-bin importance ratio so the tail keeps weight (0 = no floor).")
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     ap.add_argument("--out", default="results/v4_reweighted_eval.csv")
@@ -125,31 +119,19 @@ def main() -> None:
     p_train = np.bincount(occ_bin(train_df["FaceOcclusion"].astype(float).values), minlength=N_BINS).astype(float)
     p_train = p_train / p_train.sum()
     ratio_bin = TEST_PMF / (p_train + 1e-12)
-    # exact ratio by default; an optional (NOT recommended) floor for sensitivity only
-    ratio_used = np.maximum(ratio_bin, args.tail_floor) if args.tail_floor > 0 else ratio_bin
-    ratio_label = (f"corrected (arbitrary floor >= {args.tail_floor})" if args.tail_floor > 0
-                   else "exact P_test/P_train (no clamp, full tail)")
+    ratio_floored = np.maximum(ratio_bin, args.tail_floor) if args.tail_floor > 0 else ratio_bin
     bins = occ_bin(gt)
 
     # 3) inference on the full val
-    if args.weights:
-        obj = torch.load(args.weights, map_location=device)
-        if isinstance(obj, dict):
-            raise SystemExit("--weights looks like a state_dict, not a full pickled model; "
-                             "use --model-uri with the mlflow model dir instead.")
-        model = obj
-        processor = get_image_processor(getattr(model, "model_name", "convnext_v2_base"))
-    elif args.model_uri:
-        model, processor = load_model(args.model_uri, args.tracking_uri)
-    else:
-        raise SystemExit("provide --weights <model.pth> OR --model-uri <mlflow dir>")
+    model, processor = load_model(args.model_uri, args.tracking_uri)
     model.eval().to(device)
     pred = infer(model, processor, val_df, args.image_dir, device, args.batch_size)
 
     # 4) score under each weighting
     res = {
-        "raw (no importance, w=1/30+y)":      score(pred, gt, gender, None),
-        ratio_label:                          score(pred, gt, gender, ratio_used[bins]),
+        "raw (no importance, w=1/30+y)":        score(pred, gt, gender, None),
+        "test_estimated (v4 original ratio)":   score(pred, gt, gender, ratio_bin[bins]),
+        f"corrected (ratio floored >= {args.tail_floor})": score(pred, gt, gender, ratio_floored[bins]),
     }
     print("\n================ SCORES (val seed {}) ================".format(args.val_seed))
     for k, v in res.items():
@@ -167,17 +149,17 @@ def main() -> None:
             continue
         base_w = (1.0 / 30.0 + gt[mb])
         share_raw = base_w.sum()
-        share_iw = (base_w * ratio_used[b]).sum()
+        share_corr = (base_w * ratio_floored[b]).sum()
         rows.append({"bin": b, "y_lo": round(b * BIN_WIDTH, 3), "n": n,
                      "mse": round(float(sq[mb].mean()), 6),
-                     "ratio_exact": round(float(ratio_bin[b]), 3),
-                     "ratio_used": round(float(ratio_used[b]), 3),
+                     "ratio_orig": round(float(ratio_bin[b]), 3),
+                     "ratio_floored": round(float(ratio_floored[b]), 3),
                      "wshare_raw_%": round(100 * share_raw, 2),
-                     "wshare_iw_%": round(100 * share_iw, 2)})
+                     "wshare_corr_%": round(100 * share_corr, 2)})
     bin_df = pd.DataFrame(rows)
     # normalise weight shares to %
     bin_df["wshare_raw_%"] = (100 * bin_df["wshare_raw_%"] / bin_df["wshare_raw_%"].sum()).round(2)
-    bin_df["wshare_iw_%"] = (100 * bin_df["wshare_iw_%"] / bin_df["wshare_iw_%"].sum()).round(2)
+    bin_df["wshare_corr_%"] = (100 * bin_df["wshare_corr_%"] / bin_df["wshare_corr_%"].sum()).round(2)
     print(bin_df.to_string(index=False))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

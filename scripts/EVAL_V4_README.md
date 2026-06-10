@@ -35,20 +35,22 @@ le **détail par bin** pour rendre visible le (manque de) support en queue.
 ## Lancer (val complète, 20k images)
 ```bash
 python scripts/eval_v4_reweighted.py \
-    --model-uri mlruns/1/models/m-8914eed6b51740e4ad43667735756f13/artifacts \
+    --weights v4_best_trial18_model.pth \
     --data-csv data/raw/train.csv --image-dir data/raw \
-    --val-seed 276 --tail-floor 0.5
+    --val-seed 276
 ```
+- `--weights` : le `.pth` brut (ou `--model-uri <dossier mlflow>` si tu as l'archive complète).
 - `--val-seed 276` reproduit **exactement** la val du trial 18 (= `42 + 18×13`). Ne pas changer.
-- `--tail-floor` : plancher du ratio par bin (0.5 par défaut ; mets `0` pour désactiver, ou
-  une autre valeur pour tester la sensibilité).
+- **Pondération par défaut = ratio `P_test/P_train` EXACT jusqu'au bout de la queue** (pas de clamp,
+  contrairement à v4 qui bridait la queue à ~0.067). `--tail-floor >0` impose un plancher arbitraire
+  → **uniquement pour tester la sensibilité, déconseillé** (sur-pondère la queue au-delà du test supposé).
 - CPU possible (`--device cpu`) mais lent sur 20k images → préférer un GPU.
 
 ## Sortie
-- Tableau **3 pondérations** : `raw` (1/30+y), `test_estimated` (ratio original qui s'effondre),
-  `corrected` (ratio flooré) — avec err_F / err_M / gap / ESS.
-- Détail **par bin** (`results/v4_reweighted_eval.csv`) : n, MSE, ratio original vs flooré,
-  part de poids — pour voir où le score se concentre et où le support manque.
+- Tableau **2 pondérations** : `raw` (1/30+y, sans importance) et `ratio exact` (`P_test/P_train`),
+  avec err_F / err_M / gap / ESS.
+- Détail **par bin** (`results/v4_reweighted_eval.csv`) : n, MSE, **`ratio_exact`**, part de poids —
+  pour voir où le score se concentre et où le support manque (queue = ratio grand, peu de samples → bruité).
 
 ## Limites à garder en tête
 - **C'est la val de sélection** (seed 276, celle sur laquelle le run a early-stoppé) → score

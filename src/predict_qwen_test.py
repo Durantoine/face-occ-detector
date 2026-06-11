@@ -91,7 +91,7 @@ def load_model():
         base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": 0},
         )
         model = PeftModel.from_pretrained(base, str(LORA_PATH))
     else:
@@ -99,7 +99,7 @@ def load_model():
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map={"": 0},
         )
 
     model.eval()

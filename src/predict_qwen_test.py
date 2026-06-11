@@ -30,7 +30,7 @@ import torch
 from PIL import Image
 from qwen_vl_utils import process_vision_info  # type: ignore
 from tqdm import tqdm
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -88,18 +88,19 @@ def load_model():
     if lora_exists:
         print(f"Loading Qwen2.5-VL-7B + LoRA from {LORA_PATH} ...")
         from peft import PeftModel  # type: ignore
-        base = Qwen2VLForConditionalGeneration.from_pretrained(
+        base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
+            device_map="auto",
         )
         model = PeftModel.from_pretrained(base, str(LORA_PATH))
     else:
         print("No LoRA adapter — loading Qwen2.5-VL-7B zero-shot.")
-        model = Qwen2VLForConditionalGeneration.from_pretrained(
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
+            device_map="auto",
         )
-    model = model.to("cuda")
 
     model.eval()
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")

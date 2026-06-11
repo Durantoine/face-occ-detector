@@ -91,7 +91,6 @@ def load_model():
         base = Qwen2VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
-            device_map="auto",
         )
         model = PeftModel.from_pretrained(base, str(LORA_PATH))
     else:
@@ -99,8 +98,8 @@ def load_model():
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             "Qwen/Qwen2.5-VL-7B-Instruct",
             torch_dtype=torch.bfloat16,
-            device_map="auto",
         )
+    model = model.to("cuda")
 
     model.eval()
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")

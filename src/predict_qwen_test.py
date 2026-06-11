@@ -33,8 +33,8 @@ from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TEST_CSV     = Path("data/test_students.csv")
-IMAGE_BASE   = Path("data/raw/Crop_224_5fp_100K")
+TEST_CSV     = Path("data/raw/test_students.csv")
+IMAGE_BASE   = Path("data/raw")
 LORA_PATH    = Path("outputs/lora_adapters")
 OUTPUT_DIR   = Path("results/qwen_test_inference")
 FINAL_OUTPUT = Path("test_predictions.csv")

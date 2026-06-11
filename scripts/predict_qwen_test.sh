@@ -12,9 +12,30 @@ set -euo pipefail
 
 PROJECT_DIR="${HOME}/face-occ-detector"
 VENV_DIR="/tmp/face_occ_venv_${SLURM_JOB_ID}"
+GSUTIL="/home/telecom-paris/tp-adurand-25/google-cloud-sdk/bin/gsutil"
+BUCKET="gs://mon-face-occ-bucket"
 
 cd "${PROJECT_DIR}"
 mkdir -p scripts/logs results/qwen_test_inference
+
+# ── Téléchargement des données depuis le bucket public ────────────────────────
+echo "Téléchargement des données depuis ${BUCKET} ..."
+mkdir -p data/raw
+
+if [ ! -f "data/raw/test_students.csv" ]; then
+    echo "  Downloading test_students.csv ..."
+    ${GSUTIL} cp "${BUCKET}/data/raw/test_students.csv" data/raw/test_students.csv
+fi
+
+for DB in database1 database2 database3; do
+    if [ ! -d "data/raw/${DB}" ]; then
+        echo "  Downloading ${DB} images ..."
+        ${GSUTIL} -m rsync -r "${BUCKET}/data/raw/${DB}" "data/raw/${DB}/"
+    else
+        echo "  ${DB} already present, skipping."
+    fi
+done
+echo "Données prêtes."
 
 echo "========================================"
 echo "Job: $SLURM_JOB_ID  Node: $(hostname)"

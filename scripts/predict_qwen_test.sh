@@ -60,7 +60,7 @@ pip install -q --upgrade pip
 
 # PyPI packages
 pip install -q \
-    "transformers>=4.46.0" \
+    "transformers==4.47.1" \
     accelerate \
     "peft>=0.13.0" \
     pillow pandas numpy tqdm qwen-vl-utils

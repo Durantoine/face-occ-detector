@@ -123,6 +123,7 @@ def predict_batch(model, processor, rows: list[dict]) -> list[float]:
             results.append(0.10)
             continue
 
+        from qwen_vl_utils import process_vision_info  # type: ignore
         messages = [
             {
                 "role": "user",
@@ -135,9 +136,12 @@ def predict_batch(model, processor, rows: list[dict]) -> list[float]:
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        image_inputs, video_inputs = process_vision_info(messages)
         inputs = processor(
             text=[text],
-            images=[image],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
             return_tensors="pt",
         ).to(model.device)
 

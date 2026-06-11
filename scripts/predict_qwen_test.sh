@@ -30,6 +30,7 @@ fi
 for DB in database1 database2 database3; do
     if [ ! -d "data/raw/${DB}" ]; then
         echo "  Downloading ${DB} images ..."
+        mkdir -p "data/raw/${DB}"
         ${GSUTIL} -m rsync -r "${BUCKET}/data/raw/${DB}" "data/raw/${DB}/"
     else
         echo "  ${DB} already present, skipping."

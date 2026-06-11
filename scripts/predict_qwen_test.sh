@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=qwen-predict-test
-#SBATCH --partition=ecole-h100
+#SBATCH --partition=ENSTA-h100
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G

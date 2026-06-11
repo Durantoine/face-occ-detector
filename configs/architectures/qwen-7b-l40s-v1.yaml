@@ -1,0 +1,105 @@
+name: qwen-7b-l40s-v1
+description: |
+  Qwen2.5-VL-7B fine-tuning on ecole-l40s (L40S 48GB × 2 GPU).
+  QLoRA 4-bit + LoRA r=16 — fits in ~22 GB/GPU.
+  Optuna sweep: 20 trials, each ~25 min → full sweep ~9h.
+
+  Data: train.csv (100K labeled) + MS1M synthetic (synthetic_ratio × 100K).
+  Architecture: semantic zone decomposition + adaptive COT vocabulary.
+
+model_id: Qwen/Qwen2.5-VL-7B-Instruct
+mlflow_experiment: qwen-semantic-zone-finetune
+
+# Quantization (L40S: 4-bit to stay comfortable at 22GB/GPU)
+load_in_4bit: true
+load_in_8bit: false
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# Data
+data_csv: data/train.csv
+val_split_ratio: 0.10
+synthetic_ratio: 0.5        # 50K synthetic MS1M samples added to 90K real
+max_seq_len: 512
+
+# Training
+num_epochs: 2
+batch_size: 1               # per GPU
+gradient_accumulation_steps: 16   # effective batch = 32
+learning_rate: 2.0e-4
+zone_lr: 1.0e-3             # zone weights learn faster than LoRA
+weight_decay: 0.01
+
+# Loss weights
+loss_alpha: 1.0             # CE on answer tokens
+loss_beta: 0.5              # zone MSE (when zone GT available)
+loss_gamma: 1.0             # challenge score loss
+loss_lambda_init: 1.0
+loss_lambda_lr: 0.2
+loss_lambda_max: 3.0
+loss_lambda_min: 1.0
+loss_lambda_threshold: 0.0005
+
+# COT adaptive monitor
+cot_window_k: 5
+cot_n_bad: 3
+cot_m_good: 10
+cot_margin: 0.15
+
+# Output
+output_dir: results/qwen_finetune/7b-l40s-v1
+
+# Optuna sweep
+optuna:
+  n_trials: 20
+  storage: sqlite:///optuna_qwen7b_l40s.db
+  search_space:
+    lora_r:
+      type: categorical
+      choices: [8, 16, 32]
+    lora_alpha:
+      type: categorical
+      choices: [16, 32, 64]
+    lora_target_modules:
+      type: categorical
+      choices:
+        - [q_proj, v_proj]
+        - [q_proj, k_proj, v_proj, o_proj]
+        - [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    learning_rate:
+      type: float
+      low: 5.0e-5
+      high: 5.0e-4
+      log: true
+    zone_lr:
+      type: float
+      low: 5.0e-4
+      high: 5.0e-3
+      log: true
+    synthetic_ratio:
+      type: float
+      low: 0.0
+      high: 2.0
+    max_seq_len:
+      type: categorical
+      choices: [512, 1024]
+    loss_alpha:
+      type: float
+      low: 0.5
+      high: 2.0
+    loss_beta:
+      type: float
+      low: 0.0
+      high: 1.0
+    loss_gamma:
+      type: float
+      low: 0.5
+      high: 2.0
+    cot_margin:
+      type: float
+      low: 0.10
+      high: 0.25

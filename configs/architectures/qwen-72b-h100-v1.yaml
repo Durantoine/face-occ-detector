@@ -1,0 +1,59 @@
+name: qwen-72b-h100-v1
+description: |
+  Qwen2.5-VL-72B fine-tuning — run final sur ecole-h100 (4× H100 80GB = 320GB).
+  QLoRA 4-bit + DeepSpeed ZeRO-3.
+  72B × 0.5 bytes (4-bit) = 36GB poids / 4 GPUs = 9GB/GPU — très confortable.
+
+  Best hyperparameters imported from qwen-7b-l40s-v1 Optuna sweep.
+  1 seul run (pas de sweep), budget ~2H100-days.
+  Utilise 2 H100 max pour laisser de la marge aux autres étudiants.
+
+model_id: Qwen/Qwen2.5-VL-72B-Instruct
+mlflow_experiment: qwen-semantic-zone-finetune
+
+# Quantization (H100: 4-bit NF4 + ZeRO-3)
+load_in_4bit: true
+load_in_8bit: false
+
+# LoRA — plus large que 7B (meilleure capacité, VRAM le permet avec ZeRO-3)
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# Data
+data_csv: data/train.csv
+val_split_ratio: 0.10
+synthetic_ratio: 1.0        # 90K réel + 90K MS1M synthétique
+max_seq_len: 1024
+
+# Training (2 H100 × 80GB)
+num_epochs: 3
+batch_size: 2               # par GPU
+gradient_accumulation_steps: 8    # batch effectif = 32
+learning_rate: 1.0e-4       # plus bas que 7B (modèle plus fragile)
+zone_lr: 5.0e-4
+weight_decay: 0.01
+
+# Loss (mêmes poids que meilleur trial L40S — à override manuellement)
+loss_alpha: 1.0
+loss_beta: 0.5
+loss_gamma: 1.0
+loss_lambda_init: 1.0
+loss_lambda_lr: 0.2
+loss_lambda_max: 3.0
+loss_lambda_min: 1.0
+loss_lambda_threshold: 0.0005
+
+# COT adaptive monitor
+cot_window_k: 5
+cot_n_bad: 3
+cot_m_good: 10
+cot_margin: 0.15
+
+# Output
+output_dir: results/qwen_finetune/72b-h100-v1
+
+# Pas de sweep Optuna ici — paramètres fixés depuis le sweep 7B
+optuna:
+  n_trials: 0

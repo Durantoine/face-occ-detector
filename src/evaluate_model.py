@@ -9,7 +9,7 @@ from src.utils.metrics import compute_score
 
 CONFIG: Dict[str, Any] = {
     "model_uri": "runs:/RUN_ID/model",
-    "data_csv": "data/raw/train.csv",
+    "data_csv": "data/train.csv",
     "image_col": "filename",
     "label_col": "FaceOcclusion",
     "gender_col": "gender",

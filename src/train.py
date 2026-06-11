@@ -46,8 +46,13 @@ from src.utils.mlflow_utils import log_params as ml_log_params
 setup_environment()
 
 CONFIG: Dict[str, Any] = {
+<<<<<<< Updated upstream
     "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vits16-face-occ"),
     "data_csv": "data/raw/train.csv",
+=======
+    "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vitb16-3090-v19"),
+    "data_csv": "data/train.csv",
+>>>>>>> Stashed changes
     "val_data_csv": None,
     "output_dir": "./results",
     "tracking_uri": "sqlite:///mlflow.db",

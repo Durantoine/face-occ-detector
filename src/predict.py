@@ -17,7 +17,7 @@ from src.models.dinov3_loader import get_image_processor
 CONFIG: Dict[str, Any] = {
     "model_uri": "runs:/RUN_ID/model",
     "tracking_uri": "sqlite:///mlflow.db",
-    "input_csv": "data/raw/test_students.csv",
+    "input_csv": "data/test_students.csv",
     "output_csv": "test_predictions.csv",
     "image_col": "filename",
     "gender_col": "gender",

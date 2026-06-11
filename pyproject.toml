@@ -67,8 +67,8 @@ torchvision = [
 ]
 
 [[tool.uv.index]]
-#If not use RTX5080, cu126 works 
-name = "pytorch-cu128" 
+#If not use RTX5080, cu126 works
+name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 

@@ -2423,6 +2423,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/10/c0/1b303feea90d296f6176f32a2a70b5ef230f9bdeb3a72bddb0dc922dc137/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d7ad891da111ebafbf7e015d34879f7112832fc239ff0d7d776b6cb685274615", size = 91161, upload-time = "2025-03-07T01:42:23.922Z" },
     { url = "https://files.pythonhosted.org/packages/a2/eb/86626c1bbc2edb86323022371c39aa48df6fd8b0a1647bc274577f72e90b/nvidia_nvtx_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:5b17e2001cc0d751a5bc2c6ec6d26ad95913324a4adb86788c944f8ce9ba441f", size = 89954, upload-time = "2025-03-07T01:42:44.131Z" },
+<<<<<<< Updated upstream
 ]
 
 [[package]]
@@ -2454,6 +2455,8 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/f6/3c645c21358079097201090de7c30d110f5ec3fa01008e3ee81b0a77a354/opencv_contrib_python-4.13.0.92-cp37-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:fc5ee50e2be9d40e913536f7f20cc6f87f25d8e413ebb32a3335ab6edf245d3e", size = 79150872, upload-time = "2026-02-05T10:16:03.465Z" },
     { url = "https://files.pythonhosted.org/packages/90/d7/bf4622e0ed8a93f5a685c76933e287477cf185a160c66478cf144fece489/opencv_contrib_python-4.13.0.92-cp37-abi3-win32.whl", hash = "sha256:f5d02357f4d5575c300eab3ec1c7ecfed3a9a53e55a76927bab7cfc9e0a67b68", size = 36829959, upload-time = "2026-02-05T07:02:22.25Z" },
     { url = "https://files.pythonhosted.org/packages/d9/98/a03f69ff6fb86a67d584ecc990d85a95e6930b96e3f39ad1f8e019cb8ada/opencv_contrib_python-4.13.0.92-cp37-abi3-win_amd64.whl", hash = "sha256:cb694dcf76bb2c8d7fa573fc1a99339e8b6640194d7778381e74cc3445369e45", size = 46486178, upload-time = "2026-02-05T07:02:19.551Z" },
+=======
+>>>>>>> Stashed changes
 ]
 
 [[package]]

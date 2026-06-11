@@ -27,7 +27,7 @@ setup_environment()
 CONFIG: Dict[str, Any] = {
     "architecture": os.environ.get("FACE_OCC_ARCH", "dinov3-vits16-face-occ_optuna_best"),
     "n_folds": 5,
-    "data_csv": "data/raw/train.csv",
+    "data_csv": "data/train.csv",
     "output_dir": "./results/ensemble",
     "tracking_uri": "sqlite:///mlflow.db",
     "mlflow_experiment": "face-occ-ensemble",

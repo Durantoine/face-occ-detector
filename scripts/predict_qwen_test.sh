@@ -65,9 +65,9 @@ pip install -q \
     "peft>=0.13.0" \
     pillow pandas numpy tqdm qwen-vl-utils
 
-# Torch (index séparé pour CUDA 12.6 — driver version sur ce cluster)
+# Torch — index exclusif cu126 pour éviter mismatch avec PyPI
 pip install -q torch torchvision \
-    --extra-index-url https://download.pytorch.org/whl/cu126
+    --index-url https://download.pytorch.org/whl/cu126
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512

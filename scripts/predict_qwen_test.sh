@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=qwen-predict-test
-#SBATCH --partition=ecole-l40s
+#SBATCH --partition=ENSTA-l40s
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -23,12 +23,28 @@ echo "========================================"
 
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-# Setup env (same pattern as existing scripts)
-export UV_PYTHON=python3.12
-export UV_PYTHON_DOWNLOADS=automatic
-export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
-uv sync --no-dev
+# Setup env avec pip (uv non disponible sur ce cluster)
+PYTHON=$(command -v python3.12 || command -v python3 || command -v python)
+echo "Python: $PYTHON ($($PYTHON --version))"
+
+if [ ! -d "${VENV_DIR}" ]; then
+    echo "Création venv dans ${VENV_DIR} ..."
+    $PYTHON -m venv "${VENV_DIR}"
+fi
 source "${VENV_DIR}/bin/activate"
+
+echo "Installation des dépendances ..."
+pip install -q --upgrade pip
+pip install -q \
+    torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
+    transformers>=4.46.0 \
+    accelerate \
+    peft>=0.13.0 \
+    pillow \
+    pandas \
+    numpy \
+    tqdm \
+    qwen-vl-utils
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512

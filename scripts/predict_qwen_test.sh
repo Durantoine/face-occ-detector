@@ -35,16 +35,17 @@ source "${VENV_DIR}/bin/activate"
 
 echo "Installation des dépendances ..."
 pip install -q --upgrade pip
+
+# PyPI packages
 pip install -q \
-    torch torchvision --index-url https://download.pytorch.org/whl/cu128 \
-    transformers>=4.46.0 \
+    "transformers>=4.46.0" \
     accelerate \
-    peft>=0.13.0 \
-    pillow \
-    pandas \
-    numpy \
-    tqdm \
-    qwen-vl-utils
+    "peft>=0.13.0" \
+    pillow pandas numpy tqdm qwen-vl-utils
+
+# Torch (index séparé pour CUDA 12.8)
+pip install -q torch torchvision \
+    --extra-index-url https://download.pytorch.org/whl/cu128
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512

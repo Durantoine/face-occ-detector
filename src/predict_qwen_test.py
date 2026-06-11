@@ -86,21 +86,22 @@ def _parse(raw: str) -> float:
 
 def load_model():
     lora_exists = LORA_PATH.exists() and (LORA_PATH / "adapter_config.json").exists()
+    load_kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        ignore_mismatched_sizes=True,
+    )
     if lora_exists:
         print(f"Loading Qwen2.5-VL-7B + LoRA from {LORA_PATH} ...")
         from peft import PeftModel  # type: ignore
         base = Qwen2VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            "Qwen/Qwen2.5-VL-7B-Instruct", **load_kwargs
         )
         model = PeftModel.from_pretrained(base, str(LORA_PATH))
     else:
         print("No LoRA adapter found — loading Qwen2.5-VL-7B base model (zero-shot).")
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            "Qwen/Qwen2.5-VL-7B-Instruct", **load_kwargs
         )
     model.eval()
     processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")

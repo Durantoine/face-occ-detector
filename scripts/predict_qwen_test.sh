@@ -58,16 +58,16 @@ source "${VENV_DIR}/bin/activate"
 echo "Installation des dépendances ..."
 pip install -q --upgrade pip
 
-# PyPI packages
+# Torch en premier — index exclusif cu126 (évite que qwen-vl-utils installe torch PyPI 13.0)
+pip install -q torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# PyPI packages (torch déjà présent, pip ne le réinstalle pas)
 pip install -q \
     "transformers>=4.52.0" \
     accelerate \
     "peft>=0.13.0" \
     pillow pandas numpy tqdm qwen-vl-utils
-
-# Torch — index exclusif cu126 pour éviter mismatch avec PyPI
-pip install -q torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu126
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512

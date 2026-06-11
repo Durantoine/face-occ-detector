@@ -233,6 +233,7 @@ def merge_and_finalize() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global LORA_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument("--rank",       type=int, default=0)
     ap.add_argument("--world-size", type=int, default=2)
@@ -240,7 +241,6 @@ def main() -> None:
     ap.add_argument("--lora-path",  default=str(LORA_PATH))
     args = ap.parse_args()
 
-    global LORA_PATH
     LORA_PATH = Path(args.lora_path)
 
     if args.merge:

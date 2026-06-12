@@ -133,7 +133,7 @@ fi
 
 echo "Launching training..."
 accelerate launch \
-    --num_processes 2 \
+    --num_processes 1 \
     --mixed_precision bf16 \
     --dynamo_backend no \
     src/qwen_finetune.py \

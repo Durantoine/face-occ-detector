@@ -574,12 +574,8 @@ class QwenFinetuneTrainer:
         self.trial = optuna_trial
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._setup_model()
-        self._setup_data()
-        self._setup_loss()
-        self._setup_optimizer()
 
-        # COT vocab + monitor
+        # COT vocab + monitor — doit être initialisé avant _setup_data
         self.vocab: Dict[str, str] = deepcopy(VOCAB_INIT)
         self.cot_monitor = AdaptiveCOTMonitor(
             window_k=cfg.get("cot_window_k", 5),
@@ -587,6 +583,11 @@ class QwenFinetuneTrainer:
             m_good_relax=cfg.get("cot_m_good", 10),
             disagreement_margin=cfg.get("cot_margin", 0.15),
         )
+
+        self._setup_model()
+        self._setup_data()
+        self._setup_loss()
+        self._setup_optimizer()
 
     def _setup_model(self) -> None:
         from peft import LoraConfig, get_peft_model, TaskType  # type: ignore

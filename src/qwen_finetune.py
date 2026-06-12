@@ -596,7 +596,8 @@ class QwenFinetuneTrainer:
         load_in_8bit = cfg.get("load_in_8bit", False)
 
         logger.info(f"Loading {model_id} (4bit={load_in_4bit}, 8bit={load_in_8bit}) ...")
-        kwargs: Dict[str, Any] = {"device_map": "auto", "torch_dtype": torch.bfloat16}
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        kwargs: Dict[str, Any] = {"device_map": {"": local_rank}, "torch_dtype": torch.bfloat16}
         if load_in_4bit:
             from transformers import BitsAndBytesConfig  # type: ignore
             kwargs["quantization_config"] = BitsAndBytesConfig(

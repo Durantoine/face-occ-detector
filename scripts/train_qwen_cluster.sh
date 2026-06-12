@@ -115,6 +115,22 @@ EOF
 SWEEP_FLAG=""
 $SWEEP && SWEEP_FLAG="--sweep"
 
+# Supprimer mlflow.db si schéma incompatible (évite "duplicate column name: step")
+if [ -f "mlflow.db" ]; then
+    python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('mlflow.db')
+    conn.execute('SELECT step FROM metrics LIMIT 1')
+    conn.close()
+    print('mlflow.db OK')
+except Exception as e:
+    conn.close()
+    import os; os.remove('mlflow.db')
+    print(f'mlflow.db supprimé (schéma corrompu: {e})')
+"
+fi
+
 echo "Launching training..."
 accelerate launch \
     --num_processes 2 \

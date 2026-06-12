@@ -1,0 +1,106 @@
+name: llama-11b-l40s-v1
+description: |
+  Llama 3.2 Vision 11B fine-tuning on ENSTA-l40s (L40S 48GB).
+  bfloat16 + LoRA r=8 — ~24 GB/GPU, confortable sur L40S.
+  Miroir unsloth (pas de HF_TOKEN requis).
+  Optuna sweep: 20 trials, chaque trial ~30 min → sweep complet ~10h.
+
+  Data: train.csv (100K labeled) + MS1M synthetic (synthetic_ratio × 100K).
+  Architecture: même zone decomposition + adaptive COT que Qwen.
+
+model_id: unsloth/Llama-3.2-11B-Vision-Instruct
+mlflow_experiment: llama-semantic-zone-finetune
+
+# Quantization (bitsandbytes instable sur ce cluster)
+load_in_4bit: false
+load_in_8bit: false
+
+# LoRA (r=8 conservateur — Llama 11B pèse déjà 22GB)
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+# Data
+data_csv: data/train.csv
+val_split_ratio: 0.10
+synthetic_ratio: 0.5
+max_seq_len: 512
+
+# Training
+num_epochs: 2
+batch_size: 1
+gradient_accumulation_steps: 16    # effective batch = 16
+learning_rate: 1.0e-4              # plus conservateur que Qwen (modèle plus grand)
+zone_lr: 1.0e-3
+weight_decay: 0.01
+
+# Loss weights
+loss_alpha: 1.0
+loss_beta: 0.5
+loss_gamma: 1.0
+loss_lambda_init: 1.0
+loss_lambda_lr: 0.2
+loss_lambda_max: 3.0
+loss_lambda_min: 1.0
+loss_lambda_threshold: 0.0005
+
+# COT adaptive monitor
+cot_window_k: 5
+cot_n_bad: 3
+cot_m_good: 10
+cot_margin: 0.15
+
+# Output
+output_dir: results/llama_finetune/11b-l40s-v1
+
+# Optuna sweep
+optuna:
+  n_trials: 20
+  storage: sqlite:///optuna_llama11b_l40s.db
+  search_space:
+    lora_r:
+      type: categorical
+      choices: [4, 8, 16]
+    lora_alpha:
+      type: categorical
+      choices: [8, 16, 32]
+    lora_target_modules:
+      type: categorical
+      choices:
+        - [q_proj, v_proj]
+        - [q_proj, k_proj, v_proj, o_proj]
+        - [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    learning_rate:
+      type: float
+      low: 2.0e-5
+      high: 2.0e-4
+      log: true
+    zone_lr:
+      type: float
+      low: 5.0e-4
+      high: 5.0e-3
+      log: true
+    synthetic_ratio:
+      type: float
+      low: 0.0
+      high: 2.0
+    max_seq_len:
+      type: categorical
+      choices: [512, 1024]
+    loss_alpha:
+      type: float
+      low: 0.5
+      high: 2.0
+    loss_beta:
+      type: float
+      low: 0.0
+      high: 1.0
+    loss_gamma:
+      type: float
+      low: 0.5
+      high: 2.0
+    cot_margin:
+      type: float
+      low: 0.10
+      high: 0.25

@@ -53,7 +53,7 @@ from mlflow.tracking import MlflowClient
 from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -609,7 +609,7 @@ class QwenFinetuneTrainer:
             from transformers import BitsAndBytesConfig  # type: ignore
             kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
 
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
         self.processor = AutoProcessor.from_pretrained(model_id)
 
         lora_cfg = LoraConfig(

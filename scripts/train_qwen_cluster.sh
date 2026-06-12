@@ -1,91 +1,108 @@
 #!/bin/bash
-# ─────────────────────────────────────────────────────────────────────────────
-# Qwen fine-tuning — SLURM script for ecole cluster
+# Qwen fine-tuning — SLURM script for ENSTA cluster
 #
 # Usage:
-#   # Optuna sweep on L40S (2 GPU, respectueux des autres étudiants)
-#   sbatch scripts/train_qwen_cluster.sh --partition ecole-l40s --gpus 2 --sweep
-#
-#   # Run final 72B on H100 (2 GPU max)
-#   sbatch scripts/train_qwen_cluster.sh --partition ecole-h100 --gpus 2 --config configs/architectures/qwen-72b-h100-v1.yaml
-#
-# ─────────────────────────────────────────────────────────────────────────────
+#   sbatch scripts/train_qwen_cluster.sh --sweep
+#   sbatch scripts/train_qwen_cluster.sh --config configs/architectures/qwen-7b-l40s-v1.yaml
 
-# ── SLURM defaults (overridable via sbatch args) ──────────────────────────────
 #SBATCH --job-name=qwen-finetune
-#SBATCH --partition=ecole-l40s
+#SBATCH --partition=ENSTA-l40s
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=10:00:00
-#SBATCH --output=logs/qwen_finetune_%j.out
-#SBATCH --error=logs/qwen_finetune_%j.err
+#SBATCH --time=12:00:00
+#SBATCH --output=scripts/logs/qwen_finetune_%j.out
+#SBATCH --error=scripts/logs/qwen_finetune_%j.err
 
 set -euo pipefail
 
-# ── Parse args ────────────────────────────────────────────────────────────────
-PARTITION="ecole-l40s"
-GPUS=2
+PROJECT_DIR="${HOME}/face-occ-detector"
+VENV_DIR="/tmp/face_occ_venv_${SLURM_JOB_ID}"
+GSUTIL="/home/telecom-paris/tp-adurand-25/google-cloud-sdk/bin/gsutil"
+BUCKET="gs://mon-face-occ-bucket"
 CONFIG="configs/architectures/qwen-7b-l40s-v1.yaml"
 SWEEP=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --partition) PARTITION="$2"; shift 2 ;;
-        --gpus)      GPUS="$2";      shift 2 ;;
-        --config)    CONFIG="$2";    shift 2 ;;
-        --sweep)     SWEEP=true;     shift ;;
-        *)           shift ;;
+        --config) CONFIG="$2"; shift 2 ;;
+        --sweep)  SWEEP=true;  shift ;;
+        *)        shift ;;
     esac
 done
 
-# ── Environment ───────────────────────────────────────────────────────────────
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$PROJECT_DIR"
-
-mkdir -p logs results/qwen_finetune
+cd "${PROJECT_DIR}"
+mkdir -p scripts/logs results/qwen_finetune outputs/lora_adapters
 
 echo "========================================"
-echo "Job:       $SLURM_JOB_ID"
-echo "Node:      $(hostname)"
-echo "Partition: $PARTITION"
-echo "GPUs:      $GPUS"
-echo "Config:    $CONFIG"
-echo "Sweep:     $SWEEP"
+echo "Job: $SLURM_JOB_ID  Node: $(hostname)"
+echo "Config: $CONFIG  Sweep: $SWEEP"
+echo "Started: $(date)"
 echo "========================================"
 
-# ── Check GPU ─────────────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-# ── Setup Python env ──────────────────────────────────────────────────────────
-if command -v uv &>/dev/null; then
-    echo "Using uv..."
-    uv sync --frozen
-    PYTHON="uv run python"
-else
-    echo "Using pip venv..."
-    python -m pip install -q peft trl bitsandbytes accelerate
-    PYTHON="python"
+# ── Données depuis le bucket ──────────────────────────────────────────────────
+echo "Téléchargement des données depuis ${BUCKET} ..."
+mkdir -p data/raw
+
+if [ ! -f "data/raw/train.csv" ]; then
+    ${GSUTIL} cp "${BUCKET}/data/raw/train.csv" data/raw/train.csv
+fi
+if [ ! -f "data/raw/test_students.csv" ]; then
+    ${GSUTIL} cp "${BUCKET}/data/raw/test_students.csv" data/raw/test_students.csv
 fi
 
-# ── DeepSpeed config (ZeRO-3 pour 72B, ZeRO-2 pour 7B) ─────────────────────
-if [[ "$CONFIG" == *"72b"* ]]; then
-    DS_STAGE=3
-    OFFLOAD="false"
-else
-    DS_STAGE=2
-    OFFLOAD="false"
-fi
+for DB in database1 database2 database3; do
+    if [ ! -d "data/raw/${DB}" ]; then
+        echo "  Downloading ${DB} images ..."
+        mkdir -p "data/raw/${DB}"
+        ${GSUTIL} -m rsync -r "${BUCKET}/data/raw/${DB}" "data/raw/${DB}/"
+    else
+        echo "  ${DB} already present, skipping."
+    fi
+done
+echo "Données prêtes."
 
-cat > /tmp/ds_config_$SLURM_JOB_ID.json << EOF
+# ── Symlinks pour compatibilité avec le code ──────────────────────────────────
+[ ! -f "data/train.csv" ] && ln -sf raw/train.csv data/train.csv || true
+
+# ── Python env ────────────────────────────────────────────────────────────────
+PYTHON=$(command -v python3.12 || command -v python3)
+echo "Python: $PYTHON ($($PYTHON --version))"
+
+if [ ! -d "${VENV_DIR}" ]; then
+    $PYTHON -m venv "${VENV_DIR}"
+fi
+source "${VENV_DIR}/bin/activate"
+pip install -q --upgrade pip
+
+# Torch en premier (cu126 exclusif — driver CUDA 12.6 sur ce cluster)
+pip install -q torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# Autres dépendances
+pip install -q \
+    "transformers>=4.52.0" \
+    accelerate \
+    "peft>=0.13.0" \
+    "trl>=0.12.0" \
+    "bitsandbytes>=0.44.0" \
+    mlflow optuna pillow pandas numpy tqdm qwen-vl-utils pyyaml
+
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export TOKENIZERS_PARALLELISM=false
+
+# ── DeepSpeed config (ZeRO-2 pour 7B) ────────────────────────────────────────
+cat > /tmp/ds_config_${SLURM_JOB_ID}.json << EOF
 {
   "zero_optimization": {
-    "stage": $DS_STAGE,
+    "stage": 2,
     "overlap_comm": true,
     "contiguous_gradients": true,
     "reduce_bucket_size": 5e8,
-    "offload_optimizer": {"device": "none"},
-    "offload_param": {"device": "none"}
+    "offload_optimizer": {"device": "none"}
   },
   "bf16": {"enabled": true},
   "gradient_clipping": 1.0,
@@ -94,31 +111,21 @@ cat > /tmp/ds_config_$SLURM_JOB_ID.json << EOF
 }
 EOF
 
-# ── Launch ────────────────────────────────────────────────────────────────────
+# ── Lancement ─────────────────────────────────────────────────────────────────
 SWEEP_FLAG=""
-if $SWEEP; then
-    SWEEP_FLAG="--sweep"
-fi
-
-ACCELERATE_CMD="accelerate launch \
-    --num_processes $GPUS \
-    --mixed_precision bf16 \
-    --dynamo_backend no"
-
-# Add DeepSpeed only for 72B (overhead not worth it for 7B with 2 GPU)
-if [[ "$CONFIG" == *"72b"* ]]; then
-    ACCELERATE_CMD="$ACCELERATE_CMD \
-        --use_deepspeed \
-        --deepspeed_config_file /tmp/ds_config_$SLURM_JOB_ID.json"
-fi
+$SWEEP && SWEEP_FLAG="--sweep"
 
 echo "Launching training..."
-$PYTHON -m accelerate.commands.launch \
-    --num_processes "$GPUS" \
+accelerate launch \
+    --num_processes 2 \
     --mixed_precision bf16 \
+    --dynamo_backend no \
     src/qwen_finetune.py \
-    --config "$CONFIG" \
+    --config "${CONFIG}" \
     --mlflow-uri "sqlite:///mlflow.db" \
-    $SWEEP_FLAG
+    ${SWEEP_FLAG}
 
-echo "Done. Job $SLURM_JOB_ID finished."
+echo "========================================"
+echo "Terminé: $(date)"
+echo "LoRA adapter: ${PROJECT_DIR}/outputs/lora_adapters"
+echo "========================================"

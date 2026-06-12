@@ -52,6 +52,7 @@ import yaml
 from mlflow.tracking import MlflowClient
 from PIL import Image
 from torch.utils.data import Dataset
+from qwen_vl_utils import process_vision_info  # type: ignore
 from tqdm import tqdm
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
@@ -431,7 +432,7 @@ class QwenSFTDataset(Dataset):
             "percentage": round(gt_pct, 4),
         }, ensure_ascii=False)
 
-        # Tokenize with processor
+        # Tokenize with processor (process_vision_info required for Qwen2.5-VL)
         messages = [
             {
                 "role": "user",
@@ -445,9 +446,10 @@ class QwenSFTDataset(Dataset):
         text = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
+        image_inputs, _ = process_vision_info(messages)
         enc = self.processor(
             text=[text],
-            images=[sample["image"]],
+            images=image_inputs,
             return_tensors="pt",
             max_length=self.max_seq_len,
             truncation=True,
@@ -470,17 +472,36 @@ class QwenSFTDataset(Dataset):
             if answer_start is not None:
                 labels[:answer_start] = -100  # ignore prompt in loss
 
+        # pixel_values: keep full [N_patches, features] tensor (no [0] indexing)
+        # image_grid_thw: [1, 3] for this image — keep as-is for collate_fn
+        pv = enc["pixel_values"] if "pixel_values" in enc else torch.zeros(0, 1176)
+        thw = enc["image_grid_thw"] if "image_grid_thw" in enc else torch.zeros(0, 3, dtype=torch.long)
+
         return {
             "input_ids":     input_ids,
             "attention_mask": attention_mask,
             "labels":        labels,
-            "pixel_values":  enc.get("pixel_values", torch.zeros(1))[0] if "pixel_values" in enc else torch.zeros(1),
-            "image_grid_thw": enc.get("image_grid_thw", torch.zeros(1, 3, dtype=torch.long))[0] if "image_grid_thw" in enc else torch.zeros(1, 3, dtype=torch.long),
+            "pixel_values":  pv,
+            "image_grid_thw": thw,
             "gt_percentage": torch.tensor(sample["gt_percentage"], dtype=torch.float32),
             "gt_gender":     torch.tensor(sample["gt_gender"],     dtype=torch.float32),
             "gt_zones":      sample["gt_zones"],
             "has_zone_gt":   torch.tensor(float(sample["has_zone_gt"])),
         }
+
+
+# ── Collate ───────────────────────────────────────────────────────────────────
+
+def qwen_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Custom collate for Qwen2.5-VL: pixel_values must be concatenated (not stacked)
+    because each image has a variable number of patches."""
+    stack_keys = ["input_ids", "attention_mask", "labels",
+                  "gt_percentage", "gt_gender", "gt_zones", "has_zone_gt"]
+    result: Dict[str, Any] = {k: torch.stack([b[k] for b in batch]) for k in stack_keys}
+    # Concatenate along patch dimension so the vision encoder sees all patches
+    result["pixel_values"] = torch.cat([b["pixel_values"] for b in batch], dim=0)
+    result["image_grid_thw"] = torch.cat([b["image_grid_thw"] for b in batch], dim=0)
+    return result
 
 
 # ── Loss ──────────────────────────────────────────────────────────────────────
@@ -695,8 +716,8 @@ class QwenFinetuneTrainer:
         batch_size = cfg.get("batch_size", 1)
         grad_accum = cfg.get("gradient_accumulation_steps", 8)
 
-        loader = DataLoader(self.train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        val_loader = DataLoader(self.val_ds, batch_size=batch_size, shuffle=False, num_workers=2)
+        loader = DataLoader(self.train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, collate_fn=qwen_collate_fn)
+        val_loader = DataLoader(self.val_ds, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=qwen_collate_fn)
 
         best_score = float("inf")
         global_step = 0
@@ -723,9 +744,9 @@ class QwenFinetuneTrainer:
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                if pixel_values is not None and pixel_values.numel() > 1:
+                if pixel_values is not None and pixel_values.shape[0] > 0:
                     fwd_kwargs["pixel_values"] = pixel_values.to(self.device)
-                if image_grid_thw is not None and image_grid_thw.numel() > 1:
+                if image_grid_thw is not None and image_grid_thw.shape[0] > 0:
                     fwd_kwargs["image_grid_thw"] = image_grid_thw.to(self.device)
 
                 outputs = self.model(**fwd_kwargs)

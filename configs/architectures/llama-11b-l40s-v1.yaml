@@ -25,7 +25,7 @@ lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 data_csv: data/train.csv
 val_split_ratio: 0.10
 synthetic_ratio: 0.5
-max_seq_len: 512
+max_seq_len: 256
 
 # Training
 num_epochs: 2
@@ -87,7 +87,7 @@ optuna:
       high: 2.0
     max_seq_len:
       type: categorical
-      choices: [512, 1024]
+      choices: [256, 512]
     loss_alpha:
       type: float
       low: 0.5

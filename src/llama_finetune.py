@@ -432,6 +432,11 @@ class LlamaFinetuneTrainer:
         self.model = get_peft_model(self.model, lora_cfg)
         self.model.print_trainable_parameters()
 
+        # Gradient checkpointing : réduit les activations de O(layers) à O(√layers)
+        # Indispensable pour Llama 11B sur L40S (44GB) — sans ça, OOM au forward pass
+        self.model.enable_input_require_grads()
+        self.model.gradient_checkpointing_enable()
+
         from src.utils.zone_weights import ZoneWeights, bounds_from_optuna, DEFAULT_BOUNDS
         bounds = bounds_from_optuna(self.trial) if self.trial is not None else DEFAULT_BOUNDS
         self.zone_weights = ZoneWeights(bounds=bounds).to(self.device)
@@ -633,7 +638,10 @@ def optuna_objective(cfg_path: str, mlflow_tracking_uri: str, parent_run_id: str
             elif spec["type"] == "int":
                 trial_cfg[param] = trial.suggest_int(param, spec["low"], spec["high"])
             elif spec["type"] == "categorical":
-                trial_cfg[param] = trial.suggest_categorical(param, spec["choices"])
+                # Convertir les listes en JSON string pour compatibilité SQLite Optuna
+                choices = [json.dumps(c) if isinstance(c, list) else c for c in spec["choices"]]
+                val = trial.suggest_categorical(param, choices)
+                trial_cfg[param] = json.loads(val) if isinstance(val, str) and val.startswith("[") else val
 
         mlflow.set_tracking_uri(mlflow_tracking_uri)
         client = MlflowClient(mlflow_tracking_uri)

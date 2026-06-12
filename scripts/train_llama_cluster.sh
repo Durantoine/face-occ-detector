@@ -89,7 +89,7 @@ pip install -q \
     mlflow optuna pillow pandas numpy tqdm pyyaml
 
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512,expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 
 # ── Nettoyage bases de données si schéma corrompu ─────────────────────────────

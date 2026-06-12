@@ -515,11 +515,7 @@ class QwenFinetuneLoss(nn.Module):
 
         from src.utils.losses import WeightedMSELoss
         self.challenge_loss = WeightedMSELoss(
-            lambda_init=lambda_init,
-            lambda_lr=lambda_lr,
-            lambda_max=lambda_max,
-            lambda_min=lambda_min,
-            lambda_threshold=lambda_threshold,
+            fairness_lambda=lambda_init,
         )
 
     def forward(

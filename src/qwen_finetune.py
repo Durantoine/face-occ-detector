@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 QWEN_MODEL_ID   = "Qwen/Qwen2.5-VL-7B-Instruct"
 QWEN_72B_ID     = "Qwen/Qwen2.5-VL-72B-Instruct"
-IMAGE_BASE      = Path("data/raw/Crop_224_5fp_100K")
+IMAGE_BASE      = Path("data/raw")
 MS1M_BASE       = Path("data/non_labellisées/archive/ms1m-arcface")
 
 ZONE_NAMES = [

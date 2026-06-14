@@ -1,0 +1,67 @@
+name: convnextv2-large-A100
+description: |
+  ConvNeXt-V2-Large (timm convnextv2_large.fcmae_ft_in22k_in1k, ~198M) on a single A100. v36 pipeline:
+  full train.csv, single regularized ratio w = P_test/(P_train+is_lambda) for sampler+loss (real
+  P_train for the eval metric), augmentation pool appended to train (ratio refit on the pool).
+  Outputs 49 spatial tokens (7x7) -> attention or grid pooling.
+
+model:
+  backbone: convnextv2_large.fcmae_ft_in22k_in1k
+  pooling_type: attention
+  grid_size: 7
+  drop_path: 0.2
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5     # regularized MLP head
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat  # stratified PROPORTIONAL: exact per-stratum counts (lower variance than random)
+  aug_csv: "data/aug/synthetic_all.csv"
+  aug_image_dir: data/aug
+  aug_proportion: 0.0
+  aug_level: medium       # on-the-fly aug (off|light|medium); per-sample intensity scaled by importance w
+
+training:
+  epochs: 14
+  batch_size: 128        # ~198M on A100 80GB
+  lr: 6.0e-05
+  weight_decay: 0.05
+  layer_decay: 0.85
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint        # fixed (metric is gender-aware); not searched
+  is_lambda: 0.10
+  lambda_gap: 1.0
+  lambda_adaptive: true
+  lambda_lr: 0.8
+  lambda_min: 0.0
+  lambda_max: 3.0
+  lambda_threshold: 0.0
+  early_stop_patience: 4
+  seed: 42
+  bf16: true
+  num_workers: 16
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  # v36: trimmed to the 6 levers that reliably matter.
+  n_trials: 80
+  search_space:
+    lr: {type: float, low: 3.0e-05, high: 1.5e-04, log: true}
+    weight_decay: {type: float, low: 0.01, high: 0.3, log: true}
+    layer_decay: {type: float, low: 0.75, high: 0.95}
+    drop_path: {type: float, low: 0.05, high: 0.5}
+    aug_proportion: {type: float, low: 0.0, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light", "medium"]}
+    attn_queries: {type: categorical, choices: [2, 4, 8]}
+    sampler_participation: {type: float, low: 0.5, high: 1.0}
+    lambda_lr: {type: float, low: 0.5, high: 3.0}
+    dropout: {type: float, low: 0.0, high: 0.3}

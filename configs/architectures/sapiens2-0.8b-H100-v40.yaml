@@ -1,0 +1,65 @@
+name: sapiens2-0.8b-H100-v40
+description: |
+  Sapiens-2 0.8B (hidden 1280) on a single H100 (80GB). 
+  v40 pipeline: Sapiens 0.8B adapted to H100, following v39 logic (group_batch, eval_alpha=0.3, asymmetric gap).
+  H100 optimized with batch 128 and bf16.
+
+model:
+  backbone: sapiens2_0.8b
+  pooling_type: attention
+  grid_size: 16
+  drop_path: 0.15
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.10
+  val_mode: ptrain_strat
+  aug_csv: "data/aug/synthetic_all.csv"
+  aug_image_dir: data/aug
+  aug_proportion: 0.0
+  aug_level: medium
+
+training:
+  epochs: 15
+  batch_size: 64
+  lr: 4.0e-05
+  sampler_mode: group_batch
+  weight_decay: 0.05
+  layer_decay: 0.9
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint
+  is_lambda: 0.10
+  eval_alpha: 0.3
+  lambda_gap: 1.0
+  gap_asymmetric: true
+  early_stop_patience: 4
+  seed: 123
+  rotate_seed: true
+  bf16: true
+  num_workers: 8
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  n_trials: 80
+  search_space:
+    is_target: {type: categorical, choices: [hc, joint]}
+    lr: {type: float, low: 1.5e-05, high: 5.0e-05, log: true}
+    weight_decay: {type: float, low: 0.10, high: 0.40}
+    layer_decay: {type: float, low: 0.85, high: 0.95}
+    drop_path: {type: float, low: 0.10, high: 0.40}
+    aug_proportion: {type: float, low: 0.0, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light", "medium"]}
+    attn_queries: {type: categorical, choices: [2, 4, 8]}
+    sampler_participation: {type: float, low: 0.5, high: 1.0}
+    dropout: {type: float, low: 0.0, high: 0.3}
+    lambda_gap: {type: float, low: 0.5, high: 1.5}

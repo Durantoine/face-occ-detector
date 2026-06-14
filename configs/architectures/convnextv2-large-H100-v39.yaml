@@ -1,0 +1,69 @@
+name: convnextv2-large-H100-v39
+description: |
+  ConvNeXt-V2-Large (~198M) on a single H100 (80GB). v39 pipeline: Fresh run.
+  IS-stratified eval/selection on the INTERMEDIATE target.
+  Hyperparameters retuned (2026-06): LR pulled back to the proven ConvNeXt-Large window
+  (3e-5..1.5e-4 log; was up to 3e-4 -> divergence/NaN on the 198M backbone). Runs on the ENSTA
+  L40 partition (48GB; H100 down): batch 256 -> 64 to fit 48GB. Study name kept (H100) so the
+  already-prepared ensemble still finds the trials. Pipeline/architecture left unchanged per Antoine.
+
+model:
+  backbone: convnextv2_large.fcmae_ft_in22k_in1k
+  pooling_type: attention
+  grid_size: 7
+  drop_path: 0.20        # Standard for ConvNeXt-Large
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat
+  aug_csv: "data/aug/synthetic_all.csv"
+  aug_image_dir: data/aug
+  aug_proportion: 0.0
+  aug_level: medium
+
+training:
+  epochs: 15
+  batch_size: 64         # L40 = 48GB (not 80GB); 64 fits safely (A100 80GB ran 128)
+  lr: 6.0e-05            # proven ConvNeXt-Large default (matches A100/3090 configs)
+  sampler_mode: group_batch
+  weight_decay: 0.05
+  layer_decay: 0.85      # Standard for ConvNeXt-Large
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint
+  is_lambda: 0.10
+  eval_alpha: 0.3
+  lambda_gap: 1.0
+  gap_asymmetric: true
+  early_stop_patience: 4
+  seed: 123
+  rotate_seed: true
+  bf16: true
+  num_workers: 16
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  n_trials: 80
+  search_space:
+    is_target: {type: categorical, choices: [hc, joint]}
+    lr: {type: float, low: 3.0e-05, high: 1.5e-04, log: true}  # was 4e-5..3e-4; 3e-4 diverged on Large
+    weight_decay: {type: float, low: 0.05, high: 0.40}
+    layer_decay: {type: float, low: 0.80, high: 0.90}
+    drop_path: {type: float, low: 0.10, high: 0.30}
+    aug_proportion: {type: float, low: 0.4, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light", "medium"]}
+    attn_queries: {type: categorical, choices: [2, 4, 8]}
+    pooling_type: {type: categorical, choices: [attention, grid]}
+    sampler_participation: {type: float, low: 0.3, high: 1.0}
+    dropout: {type: float, low: 0.10, high: 0.40}
+    lambda_gap: {type: float, low: 0.5, high: 1.5}

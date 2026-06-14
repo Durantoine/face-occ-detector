@@ -1,0 +1,57 @@
+name: convnextv2-large-3090-mini
+description: |
+  SMOKE / VALIDATION config for convnextv2-large-3090 — NOT for real results.
+  1 epoch, 1 trial, empty search space (base params), aug_proportion forced to
+  1.0 so the augmented-pool load path is exercised. Purpose: confirm the v36
+  framework builds on Télécom, ConvNeXt-Large fits batch 16 in a 24GB 3090 (no
+  OOM), and data + aug + metric all run end-to-end before the full sweep.
+
+model:
+  backbone: convnextv2_large.fcmae_ft_in22k_in1k
+  pooling_type: attention
+  grid_size: 7
+  drop_path: 0.2
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat
+  aug_csv: "data/synthetic/occluder_inpaint/synthetic.csv"
+  aug_image_dir: data/synthetic/occluder_inpaint/images
+  aug_proportion: 1.0     # forced ON for the smoke test (exercise the aug pool load)
+  aug_level: medium
+
+training:
+  epochs: 1               # smoke
+  batch_size: 16
+  lr: 6.0e-05
+  weight_decay: 0.05
+  layer_decay: 0.85
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint
+  is_lambda: 0.10
+  lambda_gap: 1.0
+  lambda_adaptive: true
+  lambda_lr: 0.8
+  lambda_min: 0.0
+  lambda_max: 3.0
+  lambda_threshold: 0.0
+  early_stop_patience: 4
+  seed: 42
+  bf16: true
+  num_workers: 8
+  save_qualitative_k: 0
+  out_dir: results
+
+optuna:
+  n_trials: 1
+  search_space: {}        # empty -> single run with the base params above

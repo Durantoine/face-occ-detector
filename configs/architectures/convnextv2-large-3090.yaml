@@ -1,0 +1,76 @@
+name: convnextv2-large-3090
+description: |
+  ConvNeXt-V2-Large (timm convnextv2_large.fcmae_ft_in22k_in1k, ~198M) on a single 3090 (24GB).
+  Adapted from Antoine's convnextv2-large-A100.yaml (v36 pipeline) for the Télécom 3090 partition:
+    - batch_size 128 -> 16 (no gradient_checkpointing in this framework; 24GB vs 80GB A100).
+      Effective batch is smaller than the A100 run; the searched LR range still covers it.
+    - num_workers 16 -> 8 (matches --cpus-per-task=8 on the 3090 sbatch).
+  v36 pipeline kept intact: single regularized ratio w = P_test/(P_train+is_lambda) for sampler+loss
+  (real P_train for the eval metric), stratified-proportional val, 49 spatial tokens (7x7) -> attention
+  pooling, augmentation pool searchable.
+
+  Augmentation wired to Cora's synthetic occluder dataset (aug_csv below). aug_proportion/aug_level are
+  HPO-searchable; _append_aug skips missing paths safely, so trials that pick aug_proportion>0 only use
+  it if data/synthetic/occluder_inpaint is present on the node (scp it there to activate).
+
+model:
+  backbone: convnextv2_large.fcmae_ft_in22k_in1k
+  pooling_type: attention
+  grid_size: 7
+  drop_path: 0.2
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5     # regularized MLP head
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat  # stratified PROPORTIONAL: exact per-stratum counts (lower variance than random)
+  # Cora's synthetic occluder pool (inpaint). Safe if absent: _append_aug filters non-existent paths.
+  aug_csv: "data/synthetic/occluder_inpaint/synthetic.csv"
+  aug_image_dir: data/synthetic/occluder_inpaint/images
+  aug_proportion: 0.0
+  aug_level: medium       # on-the-fly aug (off|light|medium); per-sample intensity scaled by importance w
+
+training:
+  epochs: 14
+  batch_size: 16          # 3090 24GB, ~198M, no grad-checkpointing in this framework
+  lr: 6.0e-05
+  weight_decay: 0.05
+  layer_decay: 0.85
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint        # fixed (metric is gender-aware); not searched
+  is_lambda: 0.10
+  lambda_gap: 1.0
+  lambda_adaptive: true
+  lambda_lr: 0.8
+  lambda_min: 0.0
+  lambda_max: 3.0
+  lambda_threshold: 0.0
+  early_stop_patience: 4
+  seed: 42
+  bf16: true
+  num_workers: 8
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  # v36: trimmed to the 6 levers that reliably matter (+ aug, kept searchable).
+  n_trials: 80
+  search_space:
+    lr: {type: float, low: 3.0e-05, high: 1.5e-04, log: true}
+    weight_decay: {type: float, low: 0.01, high: 0.3, log: true}
+    layer_decay: {type: float, low: 0.75, high: 0.95}
+    drop_path: {type: float, low: 0.05, high: 0.5}
+    aug_proportion: {type: float, low: 0.0, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light", "medium"]}
+    attn_queries: {type: categorical, choices: [2, 4, 8]}
+    sampler_participation: {type: float, low: 0.5, high: 1.0}
+    lambda_lr: {type: float, low: 0.5, high: 3.0}
+    dropout: {type: float, low: 0.0, high: 0.3}

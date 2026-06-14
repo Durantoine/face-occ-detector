@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+.envrc
+
+# uv / pip
+.uv_cache/
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML / experiment artifacts
+mlruns/
+mlruns_lyceum/
+mlflow.db
+mlflow.db-*
+optuna.db
+optuna.db-*
+results/
+status/
+*.log
+wandb/
+
+# Datasets (locally cached, regenerable, or large)
+data/raw/
+data/augmented/
+data/pretrain/
+data/extra/
+data/folds/
+data/*.csv
+!data/pretrain/.gitkeep
+!data/extra/.gitkeep
+
+# Optuna trial configs (generated)
+configs/architectures/optuna_trials/
+configs/architectures/*_optuna_best.yaml
+
+# Model weights — large binaries
+src/models/weights/*.pth
+src/models/weights/*.bin
+src/models/weights/*.safetensors
+!src/models/weights/.gitkeep
+# Large archives anywhere in the repo (catches src/models/weights.zip = 11GB)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# DINOv3 vendored repo — keep code, drop caches
+src/models/dinov3_repo/**/__pycache__/
+src/models/dinov3_repo/**/*.pyc
+src/models/dinov3_repo/.DS_Store
+src/models/dinov3_repo/**/.DS_Store
+
+# Temp / scratch
+tmp/
+.tmp/
+*.tmp
+scratch/

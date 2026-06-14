@@ -1,0 +1,71 @@
+name: convnextv2-large-v40
+description: |
+  ConvNeXt-V2-Large (timm convnextv2_large.fcmae_ft_in22k_in1k, ~198M), single H100 (80GB). v40 pipeline:
+  IS reweighting DECOUPLED from training. train_alpha drives loss+sampler (0.0 = natural training, metric
+  weight 1/30+y only, no low-occ collapse); eval_alpha=0.5 drives ONLY selection (IS estimate of the
+  intermediate P_target). Gender-balanced batch sampler kept; marginal P_test alignment left to post-hoc
+  transport (scripts/recover_ptest.py). Per-alpha scores logged every epoch. v40 = same recipe as
+  sapiens.yaml / dino-vitb16.yaml, only the backbone changes -> a diverse ConvNeXt-Large ensemble member.
+  Backbone-forced changes: convnext backbone, grid_size 7 (7x7=49 tokens at 224), batch 128 (Large ~198M
+  on 80GB H100), no pretrained_source search (iBOT encoders are Sapiens/ViT-specific). v40 lr range
+  (4e-5..7e-5) is well below the 3e-4 that diverged on Large in v39, so no divergence risk.
+
+model:
+  backbone: convnextv2_large.fcmae_ft_in22k_in1k
+  pooling_type: attention
+  grid_size: 7            # ConvNeXt-Large @224 -> 7x7 feature map (49 spatial tokens)
+  drop_path: 0.20
+  head_dropout: 0.2
+  head_mlp_ratio: 0.5
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat
+  aug_csv: "data/aug/synthetic_all.csv,data/aug/blend_v3_refined.csv"
+  aug_image_dir: data/aug
+  aug_proportion: 0.0
+  aug_level: medium
+
+training:
+  epochs: 15
+  batch_size: 128        # ConvNeXt-V2-Large (~198M) on H100 80GB (proven on A100 80GB)
+  lr: 5.5e-05
+  sampler_mode: group_batch
+  weight_decay: 0.30
+  layer_decay: 0.92
+  warmup_ratio: 0.1
+  sampler_participation: 0.75
+  is_target: hc
+  is_lambda: 0.10
+  train_alpha: 0.0        # v40: IS weight on the TRAINING loss+sampler decoupled from eval (0.0 = natural)
+  eval_alpha: 0.5         # v40: IS weight drives ONLY selection/early-stop (intermediate P_target proxy)
+  lambda_gap: 0.9
+  gap_asymmetric: true
+  early_stop_patience: 4
+  seed: 123
+  rotate_seed: true       # per-trial seed -> diverse top-K trials for the final ensemble
+  bf16: true
+  num_workers: 16
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  n_trials: 60
+  search_space:
+    # iBOT pretrained_source dropped (Sapiens/ViT-specific); ConvNeXt uses timm ImageNet weights.
+    lr: {type: float, low: 4.0e-05, high: 7.0e-05}
+    weight_decay: {type: float, low: 0.15, high: 0.4}
+    layer_decay: {type: float, low: 0.88, high: 0.95}
+    drop_path: {type: float, low: 0.15, high: 0.4}
+    aug_proportion: {type: float, low: 0.7, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light"]}
+    attn_queries: {type: categorical, choices: [2, 4, 6]}
+    dropout: {type: float, low: 0.15, high: 0.40}
+    lambda_gap: {type: float, low: 0.80, high: 1.50}

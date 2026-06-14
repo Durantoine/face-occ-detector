@@ -1,0 +1,71 @@
+name: sapiens2-0.1b-H100
+description: |
+  Sapiens-2 0.1B (~100M) on a single H100 (80GB). v37 pipeline: IS-stratified eval/selection on the
+  INTERMEDIATE target P_target=(1-eval_alpha)*P_train + eval_alpha*P_test (eval_alpha=0.5, the interim
+  leaderboard sits between train and test), same alpha reweighting the sampler+loss; W_HI_FLOOR keeps
+  high-occlusion weight >= 1. Fixed fairness penalty (adaptive lambda OFF). Tightened, regularization-
+  leaning Optuna ranges. Augmentation pool appended to train (data/aug). H100 = same recipe as the
+  A100 0.1B run, just faster (channels_last is N/A for the ViT backbone; torch.compile applies).
+
+model:
+  backbone: sapiens2_0.1b
+  pooling_type: attention
+  grid_size: 16
+  drop_path: 0.15
+  head_dropout: 0.1
+  head_mlp_ratio: 0.5     # regularized MLP head: Linear(D->D/2)->GELU->Dropout->Linear (dropout+wd)
+
+data:
+  data_csv: data/raw/train.csv
+  remove_csv: data/raw/manual_removals.csv
+  image_dir: data/raw
+  test_csv: data/raw/test_students.csv
+  image_col: filename
+  label_col: FaceOcclusion
+  gender_col: gender
+  val_ratio: 0.15
+  val_mode: ptrain_strat  # stratified PROPORTIONAL: exact per-stratum counts (lower variance than random)
+  aug_csv: "data/aug/synthetic_all.csv"
+  aug_image_dir: data/aug
+  aug_proportion: 0.0
+  aug_level: medium       # on-the-fly aug (off|light|medium); per-sample intensity scaled by importance w
+
+training:
+  epochs: 15
+  batch_size: 512        # fits H100 80GB; kept = A100 recipe (no lr retune needed)
+  lr: 5.0e-05
+  weight_decay: 0.05
+  layer_decay: 0.9
+  warmup_ratio: 0.1
+  sampler_participation: 1.0
+  is_target: joint        # fixed (metric is gender-aware); not searched
+  is_lambda: 0.10
+  eval_alpha: 0.5         # linear intermediate P_target=(1-a)P_train+a*P_test (interim is between train/test)
+  lambda_gap: 1.0          # FIXED fairness penalty (adaptive λ disabled for this run)
+  lambda_adaptive: false
+  lambda_lr: 0.8
+  lambda_min: 0.5
+  lambda_max: 3.0
+  lambda_threshold: 0.0
+  early_stop_patience: 4
+  seed: 42
+  bf16: true
+  num_workers: 16
+  save_qualitative_k: 20
+  out_dir: results
+
+optuna:
+  n_trials: 80
+  search_space:
+    pretrained_source: {type: categorical, choices: ["sapiens_default", "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder_100000", "ibot:runs:/b70b78e861d54a3aae7659c95f9146ad/encoder"]}
+    is_target: {type: categorical, choices: [hc, joint]}
+    # Ranges tightened toward stronger regularization (λ no longer adaptive -> lambda_lr dropped).
+    lr: {type: float, low: 2.0e-05, high: 4.5e-05}
+    weight_decay: {type: float, low: 0.10, high: 0.35}
+    layer_decay: {type: float, low: 0.85, high: 0.95}
+    drop_path: {type: float, low: 0.10, high: 0.35}
+    aug_proportion: {type: float, low: 0.0, high: 1.0}
+    aug_level: {type: categorical, choices: ["off", "light", "medium"]}
+    attn_queries: {type: categorical, choices: [2, 4, 8]}
+    sampler_participation: {type: float, low: 0.5, high: 1.0}
+    dropout: {type: float, low: 0.10, high: 0.30}

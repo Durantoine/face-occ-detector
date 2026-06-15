@@ -20,7 +20,7 @@ data:
   image_col: filename
   label_col: FaceOcclusion
   gender_col: gender
-  val_ratio: 0.10
+  val_ratio: 0.15
   val_mode: ptrain_strat
   aug_csv: "data/aug/synthetic_all.csv"
   aug_image_dir: data/aug
@@ -63,3 +63,4 @@ optuna:
     sampler_participation: {type: float, low: 0.5, high: 1.0}
     dropout: {type: float, low: 0.0, high: 0.3}
     lambda_gap: {type: float, low: 0.5, high: 1.5}
+    gap_asymmetric: {type: categorical, choices: [true, false]}

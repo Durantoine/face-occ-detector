@@ -1,8 +1,9 @@
-name: sapiens2-0.8b-H100-v40
+name: sapiens2-0.8b-H100
 description: |
-  Sapiens-2 0.8B (hidden 1280) on a single H100 (80GB). 
-  v40 pipeline: Sapiens 0.8B adapted to H100, following v39 logic (group_batch, eval_alpha=0.3,
-  asymmetry INTENSITY searched via gap_asym_strength). batch 64 + bf16 (128 starved host RAM -> node DOWN).
+  Sapiens-2 0.8B (hidden 1280) on a single H100 (80GB).
+  SAME recipe as 3.9/v39 (group_batch, eval_alpha=0.3, ptrain_strat val, is_target joint, lambda_gap +
+  asymmetry intensity searched via gap_asym_strength) + the 3.10 addition; only the backbone, lr, and
+  reg ranges are tuned for the 800M model. batch 64 + bf16 (128 starved host RAM -> node DOWN).
 
 model:
   backbone: sapiens2_0.8b

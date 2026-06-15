@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=face-occ-sapiens2-08b-h100-v40-optuna
+#SBATCH --job-name=face-occ-sapiens2-08b-h100-optuna
 #SBATCH --output=scripts/logs/%x_%j.out
 #SBATCH --error=scripts/logs/%x_%j.err
 #SBATCH --partition=ENSTA-h100
@@ -11,7 +11,7 @@
 set -e
 
 echo "================================================================================"
-echo "OPTUNA HPO - Sapiens 0.8B (~800M) - v40 pipeline - single H100"
+echo "OPTUNA HPO - Sapiens 0.8B (~800M) - 3.9/v39 recipe + 3.10 - single H100"
 echo "  Stratified eval (alpha=0.3), group_batch sampler, val-tilted asymmetry"
 echo "================================================================================"
 echo "Node: $(hostname) | Job ID: $SLURM_JOB_ID | GPUs: $CUDA_VISIBLE_DEVICES"
@@ -105,7 +105,7 @@ ulimit -n 65536 || ulimit -n 8192
 mkdir -p scripts/logs results
 
 # Configuration
-CONFIG="sapiens2-0.8b-H100-v40"
+CONFIG="sapiens2-0.8b-H100"
 STORAGE="sqlite:///optuna.db"
 TRACKING="sqlite:///mlflow.db"
 

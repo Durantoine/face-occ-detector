@@ -71,9 +71,11 @@ else
     echo "    data/aug already present -> skip sync ($(ls data/aug | wc -l) entries)"
 fi
 
-# MLflow/Optuna DBs live on NODE-LOCAL disk, NOT on the NFS $HOME: sqlite needs POSIX locks that NFS
-# implements incorrectly -> "database disk image is malformed" on a FRESH db, even with one writer.
-# We do NOT pull the bucket mlflow.db (it was corrupted and re-propagated the corruption every run).
+# MLflow Database
+if [ ! -f mlflow.db ]; then
+    echo "  Syncing mlflow.db..."
+    gsutil cp "${BUCKET_URL}/mlflow.db" mlflow.db || echo "  (mlflow.db not found in bucket, starting fresh)"
+fi
 
 echo "================================================================================"
 echo "Setting up environment..."
@@ -87,6 +89,12 @@ export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
 uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 
+# Fix MLflow Database paths
+if [ -f "mlflow.db" ]; then
+    echo "Checking & fixing MLflow database paths"
+    python3 scripts/fix_mlflow_paths.py mlflow.db --apply
+fi
+
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -96,15 +104,10 @@ ulimit -n 65536 || ulimit -n 8192
 
 mkdir -p scripts/logs results
 
-# Configuration. SPLIT the DBs by corruption risk + monitorability:
-#  - optuna.db stays on $HOME (NFS): Optuna writes only ~2x/trial -> low corruption risk, AND the
-#    login-node Optuna dashboard can read it LIVE (the sweep-monitoring tool we actually care about).
-#  - mlflow.db goes to NODE-LOCAL /tmp: per-step metric INSERTs (~50/epoch) over NFS are what produced
-#    "database disk image is malformed". Off NFS -> no corruption. (MLflow UI won't see it live -> use
-#    the stdout [Optimizer]/[Challenge]/[VALIDATION] logs instead.)
+# Configuration
 CONFIG="sapiens2-0.8b-H100"
 STORAGE="sqlite:///optuna.db"
-TRACKING="sqlite:////tmp/mlflow_sapiens08b_${SLURM_JOB_ID}.db"
+TRACKING="sqlite:///mlflow.db"
 
 # Run optimization
 export FACE_OCC_ARCH="${CONFIG}"

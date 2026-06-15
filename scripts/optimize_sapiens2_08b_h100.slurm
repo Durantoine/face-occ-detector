@@ -96,20 +96,15 @@ ulimit -n 65536 || ulimit -n 8192
 
 mkdir -p scripts/logs results
 
-# Configuration. DBs on NODE-LOCAL /tmp (NFS $HOME corrupts sqlite); snapshotted to results/ below.
+# Configuration. SPLIT the DBs by corruption risk + monitorability:
+#  - optuna.db stays on $HOME (NFS): Optuna writes only ~2x/trial -> low corruption risk, AND the
+#    login-node Optuna dashboard can read it LIVE (the sweep-monitoring tool we actually care about).
+#  - mlflow.db goes to NODE-LOCAL /tmp: per-step metric INSERTs (~50/epoch) over NFS are what produced
+#    "database disk image is malformed". Off NFS -> no corruption. (MLflow UI won't see it live -> use
+#    the stdout [Optimizer]/[Challenge]/[VALIDATION] logs instead.)
 CONFIG="sapiens2-0.8b-H100"
-LOCAL_OPTUNA="/tmp/optuna_sapiens08b_${SLURM_JOB_ID}.db"
-LOCAL_MLFLOW="/tmp/mlflow_sapiens08b_${SLURM_JOB_ID}.db"
-STORAGE="sqlite:///${LOCAL_OPTUNA}"
-TRACKING="sqlite:///${LOCAL_MLFLOW}"
-
-# Snapshot the local DBs to results/ every 30 min (one-shot cp = no concurrent sqlite access -> safe),
-# so a walltime kill / node failure doesn't lose the study. Runs in the background, reaped at exit.
-( while sleep 1800; do
-    cp -f "${LOCAL_OPTUNA}" "results/optuna_sapiens08b.db" 2>/dev/null
-  done ) &
-SNAP_PID=$!
-trap 'kill ${SNAP_PID} 2>/dev/null || true; cp -f "${LOCAL_OPTUNA}" "results/optuna_sapiens08b.db" 2>/dev/null || true' EXIT
+STORAGE="sqlite:///optuna.db"
+TRACKING="sqlite:////tmp/mlflow_sapiens08b_${SLURM_JOB_ID}.db"
 
 # Run optimization
 export FACE_OCC_ARCH="${CONFIG}"

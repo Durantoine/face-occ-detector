@@ -312,7 +312,8 @@ def train(cfg: Config, optuna_trial=None, experiment: str = "faceocc",
 
     base_lrs = [g["lr"] for g in opt.param_groups]
     loss_fn = ChallengeLoss(lambda_gap=cfg.lambda_gap,
-                            asymmetric=getattr(cfg, "gap_asymmetric", False))
+                            asymmetric=getattr(cfg, "gap_asymmetric", False),
+                            asym_max=getattr(cfg, "gap_asym_strength", 0.85))
     use_amp = device.type == "cuda" and cfg.bf16
     best = {"eval_challenge_score": float("inf")}; bad = 0; gstep = 0
 

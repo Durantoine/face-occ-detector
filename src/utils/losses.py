@@ -15,18 +15,20 @@ class ChallengeLoss(nn.Module):
     tilt=0 -> symmetric |err_F-err_M|. tilt>0 -> penalize M-worse more. Set from the VALIDATION gap
     (reliable) via update_tilt(), so per-batch noise can't flip the penalty direction.
     """
-    def __init__(self, lambda_gap: float = 1.0, asymmetric: bool = False) -> None:
+    def __init__(self, lambda_gap: float = 1.0, asymmetric: bool = False,
+                 asym_max: float = ASYM_MAX) -> None:
         super().__init__()
         self.lam = float(lambda_gap)
         self.asymmetric = asymmetric
-        self.tilt = 0.0  # in [-ASYM_MAX, ASYM_MAX]; >0 leans to penalize M-worse
+        self.asym_max = float(asym_max)  # tilt cap = intensity of the asymmetric lean (0 -> symmetric)
+        self.tilt = 0.0  # in [-asym_max, asym_max]; >0 leans to penalize M-worse
 
     def update_tilt(self, val_err_m: float, val_err_f: float) -> float:
         """Lean the fairness penalty toward the gender worse ON VALIDATION (reliable, not per-batch
         noise). tilt = clip(beta * (err_M - err_F) / (|err_M|+|err_F|), -ASYM_MAX, ASYM_MAX)."""
         if self.asymmetric:
             denom = max(abs(val_err_m) + abs(val_err_f), 1e-8)
-            self.tilt = float(max(-ASYM_MAX, min(ASYM_MAX, ASYM_BETA * (val_err_m - val_err_f) / denom)))
+            self.tilt = float(max(-self.asym_max, min(self.asym_max, ASYM_BETA * (val_err_m - val_err_f) / denom)))
         return self.tilt
 
     def forward(self, pred: torch.Tensor, y: torch.Tensor, gender: torch.Tensor,

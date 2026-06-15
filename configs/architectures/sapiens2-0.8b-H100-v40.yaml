@@ -41,6 +41,7 @@ training:
   eval_alpha: 0.3
   lambda_gap: 1.0
   gap_asymmetric: true
+  gap_asym_strength: 0.85
   early_stop_patience: 4
   seed: 123
   rotate_seed: true
@@ -63,4 +64,4 @@ optuna:
     sampler_participation: {type: float, low: 0.5, high: 1.0}
     dropout: {type: float, low: 0.0, high: 0.3}
     lambda_gap: {type: float, low: 0.5, high: 1.5}
-    gap_asymmetric: {type: categorical, choices: [true, false]}
+    gap_asym_strength: {type: float, low: 0.0, high: 0.95}  # 0 = symmetric -> subsumes the on/off flag

@@ -53,6 +53,7 @@ class Config:
     # training
     lambda_gap: float = 1.0  # FIXED fairness weight (adaptive lambda retired in v38)
     gap_asymmetric: bool = False  # v38: tilt the fairness penalty toward the val-worse gender
+    gap_asym_strength: float = 0.85  # max tilt magnitude (intensity of the asymmetric lean); 0 = symmetric
     sampler_participation: float = 1.0 # 1.0=pure sampler, 0.0=pure loss
     sampler_mode: str = "stratified"  # v38: "stratified" (per-sample) | "group_batch" (gender-balanced batches, stable gap)
     is_target: str = "hc" # "hc" or "joint"

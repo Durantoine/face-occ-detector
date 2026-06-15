@@ -7,7 +7,6 @@ description: |
 model:
   backbone: sapiens2_0.8b
   pooling_type: attention
-  grid_size: 16
   drop_path: 0.15
   head_dropout: 0.1
   head_mlp_ratio: 0.5
@@ -32,7 +31,7 @@ training:
   batch_size: 64
   lr: 4.0e-05
   sampler_mode: group_batch
-  weight_decay: 0.05
+  weight_decay: 0.15
   layer_decay: 0.9
   warmup_ratio: 0.1
   sampler_participation: 1.0
@@ -56,12 +55,12 @@ optuna:
     is_target: {type: categorical, choices: [hc, joint]}
     lr: {type: float, low: 1.5e-05, high: 5.0e-05, log: true}
     weight_decay: {type: float, low: 0.10, high: 0.40}
-    layer_decay: {type: float, low: 0.85, high: 0.95}
-    drop_path: {type: float, low: 0.10, high: 0.40}
-    aug_proportion: {type: float, low: 0.0, high: 1.0}
+    layer_decay: {type: float, low: 0.75, high: 0.92}   # plus bas dispo -> protège mieux le backbone 800M
+    drop_path: {type: float, low: 0.15, high: 0.50}      # stochastic depth fort = reg clé pour gros ViT
+    aug_proportion: {type: float, low: 0.4, high: 1.0}   # plancher 0.4 (comme convnext) -> jamais sans aug
     aug_level: {type: categorical, choices: ["off", "light", "medium"]}
     attn_queries: {type: categorical, choices: [2, 4, 8]}
     sampler_participation: {type: float, low: 0.5, high: 1.0}
-    dropout: {type: float, low: 0.0, high: 0.3}
+    dropout: {type: float, low: 0.10, high: 0.40}        # plancher 0.10 (>= convnext) pour un modèle 4x plus gros
     lambda_gap: {type: float, low: 0.5, high: 1.5}
     gap_asym_strength: {type: float, low: 0.0, high: 0.95}  # 0 = symmetric -> subsumes the on/off flag

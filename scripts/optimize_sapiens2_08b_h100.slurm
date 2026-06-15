@@ -71,11 +71,9 @@ else
     echo "    data/aug already present -> skip sync ($(ls data/aug | wc -l) entries)"
 fi
 
-# MLflow Database
-if [ ! -f mlflow.db ]; then
-    echo "  Syncing mlflow.db..."
-    gsutil cp "${BUCKET_URL}/mlflow.db" mlflow.db || echo "  (mlflow.db not found in bucket, starting fresh)"
-fi
+# MLflow/Optuna DBs live on NODE-LOCAL disk, NOT on the NFS $HOME: sqlite needs POSIX locks that NFS
+# implements incorrectly -> "database disk image is malformed" on a FRESH db, even with one writer.
+# We do NOT pull the bucket mlflow.db (it was corrupted and re-propagated the corruption every run).
 
 echo "================================================================================"
 echo "Setting up environment..."
@@ -89,12 +87,6 @@ export UV_PROJECT_ENVIRONMENT="${VENV_DIR}"
 uv sync --no-dev
 source "${VENV_DIR}/bin/activate"
 
-# Fix MLflow Database paths
-if [ -f "mlflow.db" ]; then
-    echo "Checking & fixing MLflow database paths"
-    python3 scripts/fix_mlflow_paths.py mlflow.db --apply
-fi
-
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -104,10 +96,20 @@ ulimit -n 65536 || ulimit -n 8192
 
 mkdir -p scripts/logs results
 
-# Configuration
+# Configuration. DBs on NODE-LOCAL /tmp (NFS $HOME corrupts sqlite); snapshotted to results/ below.
 CONFIG="sapiens2-0.8b-H100"
-STORAGE="sqlite:///optuna.db"
-TRACKING="sqlite:///mlflow.db"
+LOCAL_OPTUNA="/tmp/optuna_sapiens08b_${SLURM_JOB_ID}.db"
+LOCAL_MLFLOW="/tmp/mlflow_sapiens08b_${SLURM_JOB_ID}.db"
+STORAGE="sqlite:///${LOCAL_OPTUNA}"
+TRACKING="sqlite:///${LOCAL_MLFLOW}"
+
+# Snapshot the local DBs to results/ every 30 min (one-shot cp = no concurrent sqlite access -> safe),
+# so a walltime kill / node failure doesn't lose the study. Runs in the background, reaped at exit.
+( while sleep 1800; do
+    cp -f "${LOCAL_OPTUNA}" "results/optuna_sapiens08b.db" 2>/dev/null
+  done ) &
+SNAP_PID=$!
+trap 'kill ${SNAP_PID} 2>/dev/null || true; cp -f "${LOCAL_OPTUNA}" "results/optuna_sapiens08b.db" 2>/dev/null || true' EXIT
 
 # Run optimization
 export FACE_OCC_ARCH="${CONFIG}"

@@ -91,3 +91,7 @@ tmp/
 .tmp/
 *.tmp
 scratch/
+
+# Rapatriated cluster run copies (full project dumps: data + mlruns + results + checkpoints, ~25GB)
+kfoldconvnext/
+*_cluster_dump/
